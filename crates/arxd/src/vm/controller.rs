@@ -152,6 +152,9 @@ pub(crate) enum AdmittedEffect {
         recipe_id: Id,
         digest: [u8; 32],
     },
+    /// An offline TEST snapshot capture or restore copy into its own
+    /// candidate generation (7c 15).
+    Snapshot,
 }
 
 /// Foreground VM-profile metadata. A successful admission commits intent;
@@ -3162,6 +3165,7 @@ impl<C: Clock> VmController<C> {
         worker: &PendingOperation,
         target: super::test_issuer::NativeTarget,
         slots: &[ArtifactSlot],
+        inspection: Option<super::runtime::InspectionBinding>,
     ) -> Result<bool> {
         self.check_worker(worker)?;
         let Some(admitted) = worker.admitted() else {
@@ -3183,6 +3187,18 @@ impl<C: Clock> VmController<C> {
                        WHERE b.id=g.build_id AND b.operation_id=o.operation_id AND b.state='pending'))
                    OR (g.active=0 AND g.vm_id=o.vm AND o.action=1 AND EXISTS(SELECT 1 FROM vm_instances i
                        WHERE i.id=o.vm AND i.principal=o.principal AND i.state=0 AND i.expires_ms>?7))
+                   OR (g.active=0 AND g.vm_id=o.vm AND o.action IN (5,6) AND o.binding_kind='snapshot'
+                       AND EXISTS(SELECT 1 FROM vm_snapshot_work w
+                           WHERE w.activity=o.activity_id AND w.vm=o.vm AND w.static_vm IS NULL
+                             AND w.action=o.action AND w.candidate=g.id AND w.phase='copy'
+                             AND EXISTS(SELECT 1 FROM vm_snapshot_release r
+                                 JOIN vm_generations a ON a.id=r.generation
+                                 WHERE r.generation=w.expected AND r.epoch=w.epoch
+                                   AND a.vm_id=w.vm AND a.active=1
+                                   AND r.disposition IS NOT NULL
+                                   AND (w.action=6 OR r.disposition='clean')))
+                       AND EXISTS(SELECT 1 FROM vm_instances i
+                           WHERE i.id=o.vm AND i.principal=o.principal AND i.state=1 AND i.expires_ms>?7))
                ELSE g.active=1 AND g.vm_id=o.vm AND EXISTS(SELECT 1 FROM vm_instances i
                        WHERE i.id=o.vm AND i.principal=o.principal AND i.expires_ms>?7)
                    AND EXISTS(SELECT 1 FROM vm_snapshot_release r
@@ -3200,6 +3216,43 @@ impl<C: Clock> VmController<C> {
         )? == 1;
         if !owned {
             return Ok(false);
+        }
+        if let Some(inspection) = inspection {
+            let workspace = inspection.workspace;
+            let slot = inspection.slot;
+            if admitted.effect != AdmittedEffect::Snapshot
+                || slot.role != "disk"
+                || slot.generation != workspace.generation
+                || inspection.identity.volume != workspace.workspace.volume
+                || !store::native::bound(
+                    &tx,
+                    store::native::Scope {
+                        generation: workspace.generation,
+                        production: workspace.production,
+                        workspace: workspace.workspace,
+                        lease: workspace.lease,
+                    },
+                )?
+                || store::count(
+                    &tx,
+                    "SELECT count(*) FROM vm_snapshot_work w
+                     JOIN vm_generations g ON g.id=?3 AND g.vm_id=w.vm AND g.static_id IS NULL
+                     JOIN vm_native_slots n ON n.generation=g.id AND n.role='disk'
+                     WHERE w.activity=?1 AND w.candidate=?2 AND w.phase='copy'
+                       AND n.object_key=?4 AND n.file=?5 AND n.disposal IS NULL
+                       AND ((g.id=w.source AND n.state='verified')
+                           OR (g.id=w.candidate AND n.state='identified'))",
+                    params![
+                        worker.activity_id,
+                        target.generation,
+                        slot.generation,
+                        slot.key,
+                        inspection.identity.file,
+                    ],
+                )? != 1
+            {
+                return Ok(false);
+            }
         }
         for slot in slots {
             if slot.generation != target.generation
@@ -3499,7 +3552,17 @@ impl<C: Clock> VmController<C> {
             }
         })
     }
+}
 
+/// Offline snapshot admission and copy settlement. The fixture runtime and,
+/// on Windows x64, the native TEST copy adapter (7c 15) consume it; the
+/// adapter's installation stays closed until 7c 16.
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+)]
+impl<C: Clock> VmController<C> {
     pub(crate) fn active_release_epoch(&self, vm: Id, is_static: bool) -> Result<Option<(Id, Id)>> {
         self.store
             .transact(|db| store::snapshot::active_release_epoch(db, vm, is_static))
@@ -3608,10 +3671,23 @@ impl<C: Clock> VmController<C> {
             let (work, reference) = snapshot::reserve(
                 db, vm, is_static, binding, request, active, source, claim, now,
             )?;
+            // Only a TEST copy carries native effect authority. Static
+            // snapshots and deletions keep their own routes (I22).
+            let admitted = (!is_static && matches!(action, 5 | 6)).then(|| {
+                Box::new(Admitted {
+                    principal: principal.to_owned(),
+                    request: key,
+                    action,
+                    operation: reference.id,
+                    effect: AdmittedEffect::Snapshot,
+                    build: None,
+                })
+            });
             Ok(Ok((
                 work,
                 PendingOperation {
                     activity_id: reference.receipt.activity_id,
+                    admitted,
                     ..worker
                 },
                 reference,
@@ -3644,6 +3720,10 @@ impl<C: Clock> VmController<C> {
             ensure!(
                 store::snapshot::can_copy(db, work, utc(self.clock.now())?)?,
                 "snapshot lease closed"
+            );
+            ensure!(
+                store::snapshot::release_current(db, work)?,
+                "snapshot release is stale"
             );
             let capacity = self
                 .policy

@@ -30,8 +30,8 @@ use super::{
     },
     qualification_record::{Class, Hash, RecipeIdentity, TestRecipes, digest},
     runtime::{
-        InstallerPhase, LaunchAuthority, NativeRefusal, ScriptAuthority, StageAuthority,
-        fresh_observation,
+        InspectionBinding, InstallerPhase, LaunchAuthority, NativeRefusal, OfflineLease,
+        ScriptAuthority, StageAuthority, fresh_observation,
     },
     selection_epoch::{Invalidation, Sample, SelectionEpoch},
 };
@@ -184,7 +184,9 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
         let consistent = match admitted.effect {
             AdmittedEffect::Start => target.writer_epoch == Some(admitted.operation),
             AdmittedEffect::Script { .. } => target.writer_epoch.is_some(),
-            AdmittedEffect::Clone { .. } => target.writer_epoch.is_none(),
+            AdmittedEffect::Clone { .. } | AdmittedEffect::Snapshot => {
+                target.writer_epoch.is_none()
+            }
             AdmittedEffect::Build { recipe_id, digest } => {
                 let recipe = RecipeIdentity {
                     recipe_id,
@@ -323,7 +325,11 @@ pub(crate) struct Intent<'i, S, C> {
 
 impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
     /// Cancellation, then the durable admission, deadline, target and slots.
-    fn guard(&self, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
+    fn guard(
+        &self,
+        slots: &[ArtifactSlot],
+        inspection: Option<InspectionBinding>,
+    ) -> Result<(), NativeRefusal> {
         let target = match slots.first() {
             Some(slot) if matches!(self.effect, AdmittedEffect::Build { .. }) => NativeTarget {
                 generation: slot.generation,
@@ -335,7 +341,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
             || !self
                 .issuer
                 .controller
-                .native_effect_admitted(self.worker, target, slots)
+                .native_effect_admitted(self.worker, target, slots, inspection)
                 .map_err(|_| REFUSED)?
         {
             return Err(REFUSED);
@@ -347,15 +353,27 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
     /// that outlives cancellation, the deadline or the pending row refuses,
     /// and the authority is issued within that observation's freshness.
     fn verify(&self, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
-        self.guard(slots)?;
+        self.verify_launch(slots, None)
+    }
+
+    fn verify_launch(
+        &self,
+        slots: &[ArtifactSlot],
+        inspection: Option<InspectionBinding>,
+    ) -> Result<(), NativeRefusal> {
+        self.guard(slots, inspection)?;
         let captured = self.issuer.refresh()?;
-        self.guard(slots)?;
+        self.guard(slots, inspection)?;
         fresh_observation(captured, Instant::now(), REFUSED)
     }
 
     /// One permit per durable effect.
     fn mint(&self, effect: Effect, slots: &[ArtifactSlot]) -> Result<(), NativeRefusal> {
         self.verify(slots)?;
+        self.remember(effect)
+    }
+
+    fn remember(&self, effect: Effect) -> Result<(), NativeRefusal> {
         let mut minted = self.minted.lock().map_err(|_| REFUSED)?;
         if minted.len() >= MAX_EFFECTS || minted.contains(&effect) {
             return Err(REFUSED);
@@ -396,6 +414,7 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
                 AdmittedEffect::Build { .. } | AdmittedEffect::Clone { .. },
                 PlanKind::Inspect | PlanKind::InspectWritable | PlanKind::Mutate,
             ) => recipe.is_none(),
+            (AdmittedEffect::Snapshot, PlanKind::InspectWritable) => recipe.is_none(),
             _ => false,
         }
     }
@@ -433,10 +452,17 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
             && slots.first().is_some_and(|slot| {
                 slot.role == "verification_overlay" && slot.generation == workspace.generation
             });
-        let expected_generation = if verification {
-            workspace.generation
-        } else {
-            self.target.generation
+        let inspection = target
+            .plan
+            .offline_lease()
+            .and_then(OfflineLease::inspection);
+        let expected_generation = match (self.effect, inspection) {
+            (AdmittedEffect::Snapshot, Some(binding)) if binding.workspace == workspace => {
+                workspace.generation
+            }
+            (AdmittedEffect::Snapshot, _) | (_, Some(_)) => return Err(REFUSED),
+            (_, None) if verification => workspace.generation,
+            (_, None) => self.target.generation,
         };
         let expected_epoch = self.target.writer_epoch.unwrap_or(expected_generation);
         if workspace.generation != expected_generation
@@ -463,12 +489,14 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
             ),
             _ => return Err(REFUSED),
         };
-        self.mint(effect, &slots)?;
+        self.verify_launch(&slots, inspection)?;
+        self.remember(effect)?;
         Ok(Permit {
             intent: self,
             binding,
             expected,
             slots,
+            inspection,
         })
     }
 
@@ -510,15 +538,20 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
     }
 
     /// One copy of exactly this content into the admitted clone's own VARS
-    /// slot (7c 11).
+    /// slot (7c 11), or into one slot of the admitted snapshot copy's own
+    /// candidate pair (7c 15).
     pub(crate) fn copy(
         &self,
         slot: ArtifactSlot,
         content: ArtifactPin,
     ) -> Result<CopyPermit<'_, S, C>, NativeRefusal> {
-        if !matches!(self.effect, AdmittedEffect::Clone { .. })
+        let role_admitted = match self.effect {
+            AdmittedEffect::Clone { .. } => slot.role == "vars",
+            AdmittedEffect::Snapshot => matches!(slot.role, "disk" | "vars"),
+            _ => false,
+        };
+        if !role_admitted
             || self.target.writer_epoch.is_some()
-            || slot.role != "vars"
             || slot.key == [0; 16]
             || slot.generation != self.target.generation
         {
@@ -594,15 +627,22 @@ pub(crate) struct Permit<'p, S, C> {
     binding: LaunchPermitBinding,
     expected: EffectPlan,
     slots: Vec<ArtifactSlot>,
+    inspection: Option<InspectionBinding>,
 }
 
 impl<S: SelectedSource, C: Clock> LaunchPermit for Permit<'_, S, C> {
     fn consume(self, target: LaunchTarget<'_, '_>) -> Result<LaunchAuthority, NativeRefusal> {
-        if self.expected != EffectPlan::from_target(&target)? {
+        if self.expected != EffectPlan::from_target(&target)?
+            || self.inspection
+                != target
+                    .plan
+                    .offline_lease()
+                    .and_then(OfflineLease::inspection)
+        {
             return Err(REFUSED);
         }
         check_installer(self.expected.kind, self.expected.installer)?;
-        self.intent.verify(&self.slots)?;
+        self.intent.verify_launch(&self.slots, self.inspection)?;
         check_installer(self.expected.kind, self.expected.installer)?;
         Ok(LaunchAuthority::new(Minted(()), self.binding))
     }
@@ -657,7 +697,8 @@ impl<S: SelectedSource, C: Clock> CopyPermit<'_, S, C> {
     }
 }
 
-/// Authority for one clone VARS copy; only a consumed permit yields one.
+/// Authority for one clone VARS or snapshot slot copy; only a consumed
+/// permit yields one.
 #[must_use]
 pub(crate) struct CopyAuthority {
     _minted: Minted,

@@ -2887,16 +2887,20 @@ impl StockLaunch<'_> {
                     return Err(NativeRefusal::NetworkFenceUnverified);
                 }
                 _ => {
-                    if artifact.identity() != Some(pin.identity) || pin.mutable != role.writable() {
+                    let inspection = plan.reads_snapshot_disk(role);
+                    let writable = role.writable() && !inspection;
+                    if artifact.identity() != Some(pin.identity) || pin.mutable != writable {
                         return Err(custody);
                     }
-                    if role.writable() {
+                    if writable || inspection {
                         if !workspace_path.contains(path)
                             || pin.identity.volume != workspace.volume()
                         {
                             return Err(custody);
                         }
-                        writers.push(i);
+                        if writable {
+                            writers.push(i);
+                        }
                     } else if artifact.pin().is_none() || artifact.pin() != pin.verified_content {
                         return Err(custody);
                     }
@@ -3470,6 +3474,19 @@ impl From<ChannelError> for InstallerFailureReason {
     }
 }
 
+fn helper_release_deadline(
+    kind: PlanKind,
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let release_by = now + Duration::from_secs(5);
+    if kind == PlanKind::InspectWritable {
+        release_by.min(deadline)
+    } else {
+        release_by
+    }
+}
+
 impl CheckedLaunchCore<'_> {
     fn check_running(
         &self,
@@ -3566,14 +3583,10 @@ impl CheckedLaunchCore<'_> {
             return (result, (StopDisposition::ChargedQuarantine, None));
         }
         let successful = result.is_ok();
+        let release_by = helper_release_deadline(self.kind, tokio::time::Instant::now(), deadline);
         accept_after_release(
             result,
-            self.release_evidence_held(
-                successful,
-                successful,
-                tokio::time::Instant::now() + Duration::from_secs(5),
-                verify_release,
-            ),
+            self.release_evidence_held(successful, successful, release_by, verify_release),
             cancel,
             deadline,
             || std::future::ready(refresh()),

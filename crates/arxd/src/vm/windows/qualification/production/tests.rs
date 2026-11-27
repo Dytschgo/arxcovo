@@ -1947,3 +1947,135 @@ fn production_start_admission_stays_closed_with_an_enabled_profile() {
         Err(NativeRefusal::QualificationMissing)
     );
 }
+
+#[test]
+fn inspection_spawn_skips_writer_origin_and_keeps_the_preparation_fence() {
+    crate::vm::test_issuer::tests::assert_admission_closed();
+    let ready = Instant::now() + Duration::from_secs(60);
+    let expired = Instant::now() - Duration::from_secs(1);
+    let skip_writer = || panic!("a read-only inspection must not record a writer origin");
+    assert_eq!(
+        finish_spawn_preparation(PlanKind::InspectWritable, ready, &|| false, skip_writer),
+        Ok(())
+    );
+    assert!(
+        finish_spawn_preparation(PlanKind::InspectWritable, ready, &|| true, skip_writer).is_err()
+    );
+    assert!(
+        finish_spawn_preparation(PlanKind::InspectWritable, expired, &|| false, skip_writer)
+            .is_err()
+    );
+    assert_eq!(
+        finish_spawn_preparation(PlanKind::Mutate, ready, &|| false, || Err(
+            NativeRefusal::JobUnverified
+        )),
+        Err(NativeRefusal::JobUnverified),
+    );
+}
+
+#[test]
+fn inspection_job_release_budget_stops_at_the_helper_cutoff() {
+    crate::vm::test_issuer::tests::assert_admission_closed();
+    let now = tokio::time::Instant::now();
+    let short = now + Duration::from_millis(1);
+    let long = now + Duration::from_secs(30);
+    let normal = now + Duration::from_secs(5);
+    assert_eq!(
+        helper_release_deadline(PlanKind::InspectWritable, now, short),
+        short
+    );
+    assert_eq!(
+        helper_release_deadline(PlanKind::InspectWritable, now, long),
+        normal
+    );
+    assert_eq!(
+        helper_release_deadline(PlanKind::Mutate, now, short),
+        normal
+    );
+}
+
+#[tokio::test]
+async fn inspection_stock_launch_and_release_bind_a_read_only_disk_with_zero_writers() {
+    use crate::vm::qemu_args::{SnapshotDiskRole, SnapshotInfo, offline_snapshot_info};
+    use crate::vm::runtime::OfflineLease;
+
+    crate::vm::test_issuer::tests::assert_admission_closed();
+    let temp = tempfile::tempdir().unwrap();
+    let (_production, ws, _, _) = held_test_workspace(temp.path(), [0x76; 16]);
+    let root = LocalPath::parse(temp.path().to_str().unwrap()).unwrap();
+    let fixture = inventory::tests::Fixture::with_payload("qemu-img.exe", &vec![0; 2_520_350]);
+    let bundle = fixture
+        .inspect(Instant::now() + Duration::from_secs(30))
+        .unwrap();
+    let image_path = bundle.root.path.join("qemu-img.exe").unwrap();
+    let image = Artifact::new(ArtifactRole::QemuImg, image_path.clone()).unwrap();
+
+    let slot = pair(ws.binding().generation).disk;
+    let path = slot_path(&ws.root.path, slot);
+    let outside = root.join("outside").unwrap();
+    let size = 1_048_576;
+    let header = unbacked_qcow2_header(size);
+    std::fs::write(path.as_str(), &header).unwrap();
+    std::fs::write(outside.as_str(), &header).unwrap();
+    let cwd = root.join("cwd").unwrap();
+    let custody = WorkspaceCustody::production(&ws.root, &ws.lease).unwrap();
+    let verify = |path: &LocalPath, mutable| {
+        let disk_pin = PathPin::open(path, false, mutable).unwrap();
+        let disk = Artifact::new(ArtifactRole::SnapshotStagingDisk, path.clone())
+            .unwrap()
+            .with_identity(disk_pin.identity)
+            .with_pin(pin_for(&header));
+        let lease = OfflineLease::for_inspection(&ws, slot, disk_pin.identity);
+        let info =
+            SnapshotInfo::checked(&disk, SnapshotDiskRole::Staging, &header, None, size).unwrap();
+        let plan = offline_snapshot_info(&lease, &image, &info).unwrap();
+        let pins = [PathPin::open(&image_path, false, false).unwrap(), disk_pin];
+        let writers = StockLaunch::verify_inputs(&bundle, &cwd, &plan, &pins, &custody)?;
+        Ok::<_, NativeRefusal>((pins, writers))
+    };
+
+    let reason = NativeRefusal::PathCustodyUnverified;
+    assert_eq!(verify(&path, true).err(), Some(reason));
+    assert_eq!(verify(&outside, false).err(), Some(reason));
+    let (pins, writers) = verify(&path, false).unwrap();
+    assert!(writers.is_empty());
+    let inputs = [
+        (ArtifactRole::QemuImg, pins[0].identity),
+        (ArtifactRole::SnapshotStagingDisk, pins[1].identity),
+    ];
+    let pins: std::sync::Arc<[PathPin]> = Vec::from(pins).into();
+    let targets = ReleaseTargets::Helper {
+        kind: PlanKind::InspectWritable,
+        inputs: inputs.to_vec(),
+    };
+    let stray_guard = pins[1].reopen_without_writer().unwrap();
+    assert!(
+        ReleasedGeneration::checked(
+            ws.binding(),
+            targets.clone(),
+            custody,
+            (pins.clone(), vec![stray_guard])
+        )
+        .is_none()
+    );
+    let observed = StopEvidence {
+        process_exited: true,
+        job_empty: true,
+        workers_joined: true,
+        guest_shutdown: true,
+        clean_process_exit: true,
+        ..StopEvidence::default()
+    };
+    let (disposition, held) = finish_release_held(
+        observed,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        move || Ok((pins, Vec::new())),
+        || true,
+    )
+    .await;
+    assert_eq!(disposition, StopDisposition::CleanRelease);
+    let held = held.unwrap();
+    assert!(held.1.is_empty());
+    let proof = ReleasedGeneration::checked(ws.binding(), targets, custody, held).unwrap();
+    assert!(proof.matches_helper(ws.binding(), PlanKind::InspectWritable, &inputs));
+}

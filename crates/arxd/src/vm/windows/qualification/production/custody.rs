@@ -315,6 +315,14 @@ impl SlotWriter<'_> {
         self.file.write_all(bytes).map_err(|_| PATH)
     }
 
+    /// The identified object's current length through the writer handle.
+    pub(in crate::vm::windows::qualification) fn len(&self) -> Result<u64, Q> {
+        self.file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|_| PATH)
+    }
+
     pub(in crate::vm::windows::qualification) fn sync(&self) -> Result<(), Q> {
         #[cfg(test)]
         if WRITE_FAULT.get() == Some(WriteFault::Sync) {

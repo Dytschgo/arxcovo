@@ -642,15 +642,16 @@ fn legacy_identify_is_fenced_behind_native_custody() -> Result<()> {
     })
 }
 
-/// A restore candidate's checkpoints need the exact pending restore receipt.
-/// The disposal fence interrupts that receipt, and a snapshot action never
-/// owns a restore candidate.
+/// A snapshot copy candidate's checkpoints need the exact pending receipt of
+/// its own copy action. The disposal fence interrupts that receipt. A capture
+/// candidate is owned by its capture receipt (7c 15), and a receipt of
+/// another action never owns a candidate.
 #[test]
 fn restore_custody_requires_the_pending_restore_receipt() -> Result<()> {
     let dir = private_temp();
     let store = VmStore::open(dir.path(), NOW)?;
     store.transact(|db| {
-        let candidate = |nonce: u8, action: i64| -> Result<(Id, i64, PairSlots)> {
+        let candidate = |nonce: u8, action: i64, receipt: i64| -> Result<(Id, i64, PairSlots)> {
             let vm = [nonce; 16];
             let template = [nonce.wrapping_add(100); 16];
             db.execute(
@@ -678,7 +679,7 @@ fn restore_custody_requires_the_pending_restore_receipt() -> Result<()> {
                 principal: "alice",
                 key: RequestId::parse(&format!("{:032x}", 0x100 + u32::from(nonce))).unwrap(),
                 subject: Subject::Snapshot([nonce; 16], [nonce; 32]),
-                action,
+                action: receipt,
             }
             .record(db, NOW, Some(vm), None)?;
             db.execute(
@@ -698,7 +699,7 @@ fn restore_custody_requires_the_pending_restore_receipt() -> Result<()> {
             )?;
             Ok((staged, operation.receipt.activity_id, pair))
         };
-        let (restore, activity, pair) = candidate(1, 6)?;
+        let (restore, activity, pair) = candidate(1, 6, 6)?;
         let scope = scope(restore);
         assert!(intend_workspace(db, restore, Origin::Build, scope.production).is_err());
         intend_workspace(db, restore, Origin::Restore, scope.production)?;
@@ -716,9 +717,29 @@ fn restore_custody_requires_the_pending_restore_receipt() -> Result<()> {
         )?;
         assert!(identify_slot(db, scope, pair.disk, identity(10)).is_err());
         assert!(intend_slot(db, scope, pair.vars).is_err());
-        // A snapshot-action copy row never owns a restore candidate.
-        let (snapshot, _, _) = candidate(2, 5)?;
-        assert!(intend_workspace(db, snapshot, Origin::Restore, scope.production).is_err());
+        // A capture candidate binds under its pending capture receipt, and
+        // loses custody authority once that receipt is interrupted.
+        let (capture, capture_activity, capture_pair) = candidate(2, 5, 5)?;
+        let capture_scope = Scope {
+            generation: capture,
+            ..scope
+        };
+        db.execute_batch("SAVEPOINT clone_probe")?;
+        assert!(intend_workspace(db, capture, Origin::Clone, scope.production).is_err());
+        db.execute_batch("ROLLBACK TO clone_probe; RELEASE clone_probe")?;
+        intend_workspace(db, capture, Origin::Restore, scope.production)?;
+        super::super::finish(
+            db,
+            capture_activity,
+            crate::vm::Status::Interrupted,
+            NOW,
+            Some(false),
+        )?;
+        assert!(identify_directory(db, capture, capture_scope.workspace).is_err());
+        assert!(intend_slot(db, capture_scope, capture_pair.disk).is_err());
+        // A work row whose receipt names another action owns nothing.
+        let (crossed, _, _) = candidate(3, 6, 5)?;
+        assert!(intend_workspace(db, crossed, Origin::Restore, scope.production).is_err());
         Ok(())
     })
 }

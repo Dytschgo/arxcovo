@@ -432,32 +432,65 @@ impl StopEvidence {
 
 /// Release must be bound to the old generation and pin the slot against reuse.
 /// An observed process exit or fixture receipt cannot produce this lease.
-/// On Windows x64 only a held, ledger-identified helper target produces one
-/// (7c 11), and the checked launch accepts it only for that exact target. It
-/// is a binding, not effect authority: creation still needs a consumed
-/// `LaunchAuthority`.
+/// On Windows x64 it binds either a held mutable helper target or a
+/// read-only snapshot inspection. Creation still needs a consumed permit.
 pub struct OfflineLease {
     #[cfg(not(all(windows, target_arch = "x86_64")))]
     _closed: std::convert::Infallible,
     #[cfg(all(windows, target_arch = "x86_64"))]
-    target: (
+    target: OfflineTarget,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+enum OfflineTarget {
+    Helper(
         super::qualification::WorkspaceBinding,
         super::paths::FileIdentity,
     ),
+    Inspection(InspectionBinding),
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct InspectionBinding {
+    pub workspace: super::qualification::WorkspaceBinding,
+    pub slot: super::ArtifactSlot,
+    pub identity: super::paths::FileIdentity,
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl OfflineLease {
-    /// The only constructor: a held, ledger-identified helper target, which
-    /// only the checked custody code can produce.
+    /// A held, ledger-identified mutable helper target.
     pub(in crate::vm) fn for_helper(target: &super::qualification::HelperTarget<'_>) -> Self {
         Self {
-            target: (target.binding(), target.identity()),
+            target: OfflineTarget::Helper(target.binding(), target.identity()),
         }
     }
 
     pub(in crate::vm) fn binds(&self, target: &super::qualification::HelperTarget<'_>) -> bool {
-        self.target == (target.binding(), target.identity())
+        matches!(self.target, OfflineTarget::Helper(binding, identity)
+            if (binding, identity) == (target.binding(), target.identity()))
+    }
+
+    pub(in crate::vm) fn for_inspection(
+        workspace: &super::qualification::ProductionWorkspace,
+        slot: super::ArtifactSlot,
+        identity: super::paths::FileIdentity,
+    ) -> Self {
+        Self {
+            target: OfflineTarget::Inspection(InspectionBinding {
+                workspace: workspace.binding(),
+                slot,
+                identity,
+            }),
+        }
+    }
+
+    pub(crate) fn inspection(&self) -> Option<InspectionBinding> {
+        match self.target {
+            OfflineTarget::Inspection(binding) => Some(binding),
+            OfflineTarget::Helper(..) => None,
+        }
     }
 }
 
