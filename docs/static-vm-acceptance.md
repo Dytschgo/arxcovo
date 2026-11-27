@@ -35,7 +35,7 @@ Part B2g wires the [Windows owner qualifier](docker-qualification.md) to the nat
 
 Part B2h adds the Windows x64 `SelectedStatic` adapters for qualified template build, independent full copy, checked start and checked stop. It keeps the storage and process authority separate from TEST clones. A checked start attributes QMP, the guest serial pipe and the loopback listener to the held child, then verifies boot-bound HTTPS before settling the start. Compose start publishes the lifecycle and backup sessions together. Restart recovery keeps the same committed generation, volumes and backups and requires the exact workspace lease and writer exclusion on both media files. See [ADR 0077](adr/0077-native-static-lifecycle.md).
 
-The installed guest must include the static origin handshake. Qualify the M4 and Docker dossiers again with that guest build. The guest keeps the generation CA private key and the daemon pins the public DER in the generation workspace at `origin-ca.der`.
+The installed guest must include the static origin handshake. Qualify the M4 and Docker dossiers again with that guest build. The guest keeps the generation CA private key and the daemon pins the public DER at `origin-ca/origin-ca.der` inside the generation workspace.
 
 Part B2i installs the enrolled private routes with publishing off, activates and cleans up Cloudflare on explicit opt-in for the same verified boot, and opens static admission and catalog availability only with live route monitoring and the remaining qualification checks. Until then the foreground boundary stays closed. Native VM boot, Docker, public-only networking, Windows custody, persistence and live Cloudflare publishing remain **unverified on real hardware**.
 
