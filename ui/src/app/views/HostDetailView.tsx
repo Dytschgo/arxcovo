@@ -1,5 +1,8 @@
-import type { Host } from '../../api/types';
+import { useCallback, useState } from 'react';
+import { summarizeCpuHistory } from '../../api/cpuHistory';
+import { ApiError, CPU_HISTORY_RANGES, type ArxApi, type CpuHistoryRange, type Host } from '../../api/types';
 import { useInventory, useResource } from '../context';
+import { CpuTrace, RANGE_WORDS, hasSamples, refreshFor, usePolled } from '../cpuHistory';
 import { allocation } from '../derive';
 import { OS_LABEL, formatAgo, formatBytes, formatDate, percent } from '../format';
 import { Icon } from '../icons';
@@ -8,9 +11,10 @@ import { ArchBadge, BackLink, CapBar, Empty, Facts, HostStatus, Loaded, NullValu
 import { ActivityList } from './ActivityList';
 
 // Host detail as a Night Orbit bento (docs/design/night-orbit/host.html).
-// CPU shows the current sample only: CPU history has no API yet, so there is
-// no trace or time window. Remote desktop and the disk reserve are not in the
-// API either and are not drawn.
+// CPU shows the current sample and, below it, the CPU history trace for a
+// chosen range with avg and peak over the sampled buckets. History loads on its
+// own and never holds up the page. The two-handle time window, remote desktop
+// and the disk reserve are not drawn.
 
 /** A ring for a used/total pair. `role="meter"` only when there is a reading, so null never reads as 0. */
 function Ring({ label, pct }: { label: string; pct: number | null }) {
@@ -23,6 +27,81 @@ function Ring({ label, pct }: { label: string; pct: number | null }) {
   return pct === null
     ? <div className="ring" data-unknown="true" aria-hidden="true">{art}</div>
     : <div className="ring" role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct} aria-valuetext={`${pct}%`}>{art}</div>;
+}
+
+const RANGES = Object.keys(CPU_HISTORY_RANGES) as CpuHistoryRange[];
+const AXIS: Record<CpuHistoryRange, string[]> = {
+  '1h': ['-60 min', '-45', '-30', '-15', 'now'],
+  '6h': ['-6 h', '-4.5 h', '-3 h', '-1.5 h', 'now'],
+  '24h': ['-24 h', '-18 h', '-12 h', '-6 h', 'now'],
+};
+
+/** A percentage readout; null (no sampled bucket) is hatched, never 0. */
+function Readout({ label, value }: { label: string; value: number | null }) {
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>{value === null ? <NullValue reason="usage unavailable" /> : `${Math.round(value)}%`}</dd>
+    </div>
+  );
+}
+
+/**
+ * CPU history for one host: range selector, trace and avg/peak. Each response
+ * is checked against the host and range it was asked for, and a response for
+ * an earlier host or range is dropped (`usePolled`), so rapid switching never
+ * shows a stale trace.
+ */
+export function CpuHistoryPanel({ host }: { host: Host }) {
+  const [range, setRange] = useState<CpuHistoryRange>('24h');
+  const load = useCallback(async (api: ArxApi) => {
+    const history = await api.getCpuHistory(host.id, range);
+    if (history.hostId !== host.id || history.range !== range) throw new ApiError('bad_response', 'CPU history did not match the requested host and range.');
+    return history;
+  }, [host.id, range]);
+  const state = usePolled(`${host.id}:${range}`, load, refreshFor(range));
+  const ready = state.status === 'ready' ? state.data : null;
+  const summary = ready ? summarizeCpuHistory(ready.samples) : null;
+
+  return (
+    <div className="cpu-hist" data-range={range} aria-busy={state.status === 'loading'}>
+      <div className="hist-head">
+        <p className="hist-k">History · {RANGE_WORDS[range]}</p>
+        {summary ? (
+          <dl className="hist-read">
+            <Readout label="avg" value={summary.avg} />
+            <Readout label="peak" value={summary.peak} />
+          </dl>
+        ) : null}
+        <div className="seg" role="group" aria-label="CPU history range">
+          {RANGES.map(r => <button key={r} type="button" aria-pressed={range === r} onClick={() => setRange(r)}>{r}</button>)}
+        </div>
+      </div>
+      {state.status === 'loading' ? (
+        <div className="cpu-chart chart-wait"><p className="hist-note">Loading CPU history…</p></div>
+      ) : state.status === 'error' ? (
+        state.error.code === 'unauthorized' ? null : (
+          <div className="cpu-chart chart-na">
+            <NullValue reason="history unavailable" />
+            <p className="hist-note">{state.error.message}</p>
+          </div>
+        )
+      ) : !hasSamples(state.data) ? (
+        <div className="cpu-chart chart-na">
+          <NullValue reason="no samples" />
+          <p className="hist-note">arxd has no CPU samples for {host.name} in the {RANGE_WORDS[range]}.</p>
+        </div>
+      ) : (
+        <>
+          <CpuTrace history={state.data} os={host.os} className="cpu-chart" grid />
+          <div className="cpu-axis" aria-hidden="true">{AXIS[range].map(t => <span key={t}>{t}</span>)}</div>
+          {summary && summary.missing > 0
+            ? <p className="hist-note"><span className="na" aria-hidden="true" />{summary.missing} of {state.data.samples.length} buckets missing · avg and peak cover sampled buckets only</p>
+            : null}
+        </>
+      )}
+    </div>
+  );
 }
 
 function CpuTile({ host }: { host: Host }) {
@@ -42,6 +121,7 @@ function CpuTile({ host }: { host: Host }) {
           </div>
         </>
       )}
+      <CpuHistoryPanel host={host} />
     </Tile>
   );
 }

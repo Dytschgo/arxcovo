@@ -14,7 +14,8 @@ async function signIn(page: Page, hash = '#/hosts') {
   await expect(page.getByRole('navigation', { name: 'Main' })).toBeVisible();
 }
 
-const shot = (page: Page, name: string) => page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true });
+// Finite entrances (rise, trace reveal) are settled so each shot shows the finished view.
+const shot = (page: Page, name: string) => page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true, animations: 'disabled' });
 
 // Night Orbit is dark only (no light scheme, no theme switch).
 test.use({ viewport: { width: 1280, height: 800 } });
@@ -46,6 +47,60 @@ test('hosts: board columns with arch badges, reachability and VM cards', async (
   await expect(page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Hosts' })).toHaveAttribute('aria-current', 'page');
   expect(await overflowX(page)).toBeLessThanOrEqual(0);
   await shot(page, '02-hosts');
+});
+
+test('hosts: each column head draws a 24 h CPU trace; gaps and a host without samples are hatched', async ({ page }) => {
+  await signIn(page);
+  const cards = page.getByRole('list', { name: 'Hosts' }).getByRole('listitem');
+  for (const name of ['atlas', 'harbor', 'forge']) {
+    const trace = cards.filter({ hasText: name }).locator('.col-h').getByRole('img', { name: /^CPU over the last 24 hours/ });
+    await expect(trace).toBeVisible();
+    expect((await trace.boundingBox())!.height).toBeGreaterThan(20);
+  }
+  // atlas lost samples: hatched gap bands sit inside its trace, painted with the hatch.
+  const gap = cards.filter({ hasText: 'atlas' }).locator('.trace-gap').first();
+  await expect(gap).toBeVisible();
+  expect(await gap.evaluate(el => getComputedStyle(el).backgroundImage)).toContain('repeating-linear-gradient');
+  // The windows host's line uses the windows data colour.
+  expect(await cards.filter({ hasText: 'forge' }).locator('.trace-line').evaluate(el => getComputedStyle(el).stroke)).toBe('rgb(76, 194, 255)');
+  // pebble has no samples: a hatched band, no trace.
+  const pebble = cards.filter({ hasText: 'pebble' });
+  await expect(pebble.getByRole('img', { name: /CPU over/ })).toHaveCount(0);
+  await expect(pebble.locator('.spark-na')).toBeVisible();
+  await expect(pebble.getByText('No CPU samples in the last 24 hours')).toBeAttached();
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
+});
+
+test('host detail: CPU history switches between 1h, 6h and 24h with avg and peak, without page overflow', async ({ page }) => {
+  await signIn(page, '#/hosts/atlas');
+  const tile = page.locator('section.tile', { has: page.getByRole('heading', { level: 2, name: 'CPU' }) });
+  const range = tile.getByRole('group', { name: 'CPU history range' });
+  await expect(tile.getByRole('img', { name: /^CPU over the last 24 hours, 10-minute buckets: average \d+%, peak \d+%/ })).toBeVisible();
+  await expect(range.getByRole('button', { name: '24h' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(tile.locator('dt', { hasText: 'avg' }).locator('+ dd')).toHaveText(/^\d+%$/);
+  await expect(tile.locator('dt', { hasText: 'peak' }).locator('+ dd')).toHaveText(/^\d+%$/);
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
+  await shot(page, '13-host-cpu-24h');
+  await range.getByRole('button', { name: '1h' }).click();
+  await expect(tile.getByRole('img', { name: /last hour, 1-minute buckets: .*6 of 60 buckets missing/ })).toBeVisible();
+  await expect(tile.locator('.trace-gap')).toHaveCount(1);
+  await expect(tile.getByText(/6 of 60 buckets missing/)).toBeVisible();
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
+  await shot(page, '14-host-cpu-1h');
+  await range.getByRole('button', { name: '6h' }).click();
+  await expect(tile.getByRole('img', { name: /last 6 hours, 5-minute buckets/ })).toBeVisible();
+  await expect(range.getByRole('button', { pressed: true })).toHaveText('6h');
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
+
+  // An offline host with no buffer: avg and peak are hatched, and nothing reads 0%.
+  await page.goto('/#/hosts/pebble');
+  const pebbleTile = page.locator('section.tile', { has: page.getByRole('heading', { level: 2, name: 'CPU' }) });
+  await expect(pebbleTile.getByText('no samples')).toBeVisible();
+  await expect(pebbleTile.locator('dt', { hasText: 'avg' }).locator('+ dd')).toHaveText('usage unavailable');
+  await expect(pebbleTile.getByRole('img', { name: /CPU over/ })).toHaveCount(0);
+  expect(await pebbleTile.textContent()).not.toMatch(/\b0%/);
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
+  await shot(page, '15-host-cpu-no-samples');
 });
 
 test('host detail: tools, VMs, activity and terminal entry', async ({ page }) => {
@@ -207,6 +262,10 @@ test('reduced motion: everything shows its finished state', async ({ browser }) 
   expect(await column.evaluate(el => getComputedStyle(el).opacity)).toBe('1');
   expect(await page.locator('.top .logo .lg-c').evaluate(el => getComputedStyle(el).display)).toBe('none');
   expect(await page.locator('.top .logo .lg-a').evaluate(el => Number(getComputedStyle(el).strokeDashoffset.replace('px', '')))).toBe(0);
+  // CPU traces are drawn in full at once: no reveal clip, no running animation.
+  const trace = column.locator('.trace svg');
+  await expect(trace).toBeVisible();
+  expect(await trace.evaluate(el => [getComputedStyle(el).animationName, getComputedStyle(el).clipPath])).toEqual(['none', 'none']);
   await context.close();
 });
 
@@ -301,6 +360,8 @@ for (const motion of ['no-preference', 'reduce'] as const) {
     // PR B views: the board filter, the search jump list, VM table filters and the idle console tile.
     await page.goto('/#/hosts');
     await expect(page.getByRole('list', { name: 'Hosts' })).toBeVisible();
+    await expect(page.getByRole('img', { name: /^CPU over the last 24 hours/ }).first()).toBeVisible();
+    await audit('hosts board with CPU traces');
     await page.getByRole('group', { name: 'Show VMs' }).getByRole('button', { name: 'Static' }).click();
     await expect(page.getByText('No static VMs').first()).toBeVisible();
     await audit('hosts board, static filter pressed');
@@ -315,6 +376,15 @@ for (const motion of ['no-preference', 'reduce'] as const) {
     await expect(page.getByText('No host, VM or tool matches “zzz-nothing”')).toBeVisible();
     await audit('search, no match');
     await search.press('Escape');
+
+    // Host CPU history: the 1h range (a hatched gap and the missing count) and the no-samples state.
+    await page.goto('/#/hosts/atlas');
+    await page.getByRole('group', { name: 'CPU history range' }).getByRole('button', { name: '1h' }).click();
+    await expect(page.getByText(/6 of 60 buckets missing/)).toBeVisible();
+    await audit('host CPU history, 1h range pressed');
+    await page.goto('/#/hosts/pebble');
+    await expect(page.getByText('no samples', { exact: true })).toBeVisible();
+    await audit('host CPU history, no samples');
 
     await page.goto('/#/vms');
     await expect(page.getByText('5 of 5 VMs')).toBeVisible();

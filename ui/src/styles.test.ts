@@ -226,7 +226,7 @@ describe('motion', () => {
 
   test('keyframes never change opacity or colour, except the decorative logo light', () => {
     const blocks = [...css.matchAll(/@keyframes\s+([\w-]+)\s*\{((?:[^{}]*\{[^{}]*\})*)\s*\}/g)];
-    expect(blocks.map(b => b[1]).sort()).toEqual(['draw', 'lgsweep', 'pop', 'rise', 'spin']);
+    expect(blocks.map(b => b[1]).sort()).toEqual(['draw', 'lgsweep', 'pop', 'reveal', 'rise', 'spin']);
     for (const [, name, body] of blocks) {
       if (name === 'lgsweep') continue; // the logo's sweeping light: an aria-hidden SVG stroke, never text
       expect(body, `@keyframes ${name}`).not.toMatch(/(?:^|[{;\s])(opacity|color|background(?:-color)?|fill)\s*:/);
