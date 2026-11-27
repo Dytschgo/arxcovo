@@ -145,6 +145,21 @@ fn refusal_wire(reason: Refusal) -> &'static str {
     }
 }
 
+/// One reaper period: a `vm_snapshot_delete` `cleanup_unconfirmed` refusal
+/// waits only on the retired generation the reaper sweeps on that cadence.
+const SNAPSHOT_DELETE_RETRY_AFTER_MS: u64 = crate::vm::reaper::PERIOD.as_millis() as u64;
+
+/// The wire refusal object. Only `vm_snapshot_delete`'s `cleanup_unconfirmed`
+/// carries a retry hint; every other refusal keeps its exact two-key shape.
+fn refusal_value(snapshot_delete: bool, reason: Fault) -> Value {
+    let mut value = json!({"ok":false,"reason":reason.0});
+    if snapshot_delete && reason.0 == refusal_wire(Refusal::CleanupUnconfirmed) {
+        value["retryable"] = Value::Bool(true);
+        value["retry_after_ms"] = SNAPSHOT_DELETE_RETRY_AFTER_MS.into();
+    }
+    value
+}
+
 /// Stored audit reason codes; an unknown future code is never guessed.
 fn refusal_code(code: i64) -> Option<Refusal> {
     REFUSAL_CODES
@@ -1251,6 +1266,7 @@ impl ServerHandler for VmInventory {
         // on the blocking pool: it can never occupy the scheduler that drives
         // the teardown deadlines. A dispatch the SDK stops awaiting still
         // finishes under the gate, which the close barrier waits for.
+        let snapshot_delete = request.name == ToolName::SnapshotDelete.name();
         let inventory = self.clone();
         let cancelled = context.ct.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -1263,7 +1279,7 @@ impl ServerHandler for VmInventory {
                 object["ok"] = Value::Bool(true);
                 (object, false)
             }
-            Err(reason) => (json!({"ok":false,"reason":reason.0}), true),
+            Err(reason) => (refusal_value(snapshot_delete, reason), true),
         };
         let mut result = CallToolResult::structured(value);
         result.content.clear();
@@ -6381,13 +6397,14 @@ pub(crate) mod tests {
         assert_eq!(page2["entries"][0]["protected"], true);
         assert!(page2["next_cursor"].is_null());
         let delete = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1808)});
+        // Non-retryable delete refusals keep the exact two-key shape.
         assert_eq!(
-            call(&b, "vm_snapshot_delete", delete.clone()).await["reason"],
-            "not_found"
+            call(&b, "vm_snapshot_delete", delete.clone()).await,
+            json!({"ok":false,"reason":"not_found"})
         );
         assert_eq!(
-            call(&a, "vm_snapshot_delete", delete).await["reason"],
-            "static_backup_delete_forbidden"
+            call(&a, "vm_snapshot_delete", delete).await,
+            json!({"ok":false,"reason":"static_backup_delete_forbidden"})
         );
         assert_eq!(call(&a, "vm_snapshot_restore", restore).await, restored);
         assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
@@ -6401,6 +6418,121 @@ pub(crate) mod tests {
         assert_eq!(terminal(&a, &republished).await["state"], "succeeded");
         drop(a);
         drop(b);
+        h.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn only_snapshot_delete_cleanup_unconfirmed_carries_a_retry_hint() {
+        assert_eq!(SNAPSHOT_DELETE_RETRY_AFTER_MS, 5000);
+        assert_eq!(
+            u128::from(SNAPSHOT_DELETE_RETRY_AFTER_MS),
+            crate::vm::reaper::PERIOD.as_millis()
+        );
+        assert_eq!(
+            refusal_value(true, Refusal::CleanupUnconfirmed.into()),
+            json!({"ok":false,"reason":"cleanup_unconfirmed","retryable":true,"retry_after_ms":5000})
+        );
+        assert_eq!(
+            refusal_value(false, Refusal::CleanupUnconfirmed.into()),
+            json!({"ok":false,"reason":"cleanup_unconfirmed"})
+        );
+        let faults = REFUSAL_CODES
+            .into_iter()
+            .filter(|reason| *reason != Refusal::CleanupUnconfirmed)
+            .map(Fault::from)
+            .chain([
+                INVALID,
+                INVALID_CURSOR,
+                SHUTDOWN,
+                NOT_FOUND,
+                STATE_UNAVAILABLE,
+                NOT_READY,
+            ]);
+        for fault in faults {
+            for snapshot_delete in [true, false] {
+                assert_eq!(
+                    refusal_value(snapshot_delete, fault),
+                    json!({"ok":false,"reason":fault.0}),
+                    "{}",
+                    fault.0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_delete_after_restore_hints_one_reaper_period() {
+        let mut h = Harness::start(false, false).await;
+        h.fixture(|fixture| fixture.snapshot_test_media = true);
+        let a = h.client(0).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(1860)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let clone = call(
+            &a,
+            "vm_create",
+            json!({"template_id":template,"request_id":key(1861),"ttl_s":60}),
+        )
+        .await;
+        let vm = terminal(&a, &clone).await["vm_id"].clone();
+        let created = call(
+            &a,
+            "vm_snapshot_create",
+            json!({"vm_id":vm,"request_id":key(1862)}),
+        )
+        .await;
+        let captured = terminal(&a, &created).await;
+        assert_eq!(captured["state"], "succeeded", "{captured}");
+        let point = captured["snapshot_id"].clone();
+        let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(1863)})).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(1864)})).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let restore = call(
+            &a,
+            "vm_snapshot_restore",
+            json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1865)}),
+        )
+        .await;
+        let restored = terminal(&a, &restore).await;
+        assert_eq!(restored["state"], "succeeded", "{restored}");
+        assert_eq!(restored["cleanup"], "cleanup_unconfirmed");
+        let unknown = json!({"vm_id":vm,"snapshot_id":key(1866),"request_id":key(1867)});
+        assert_eq!(
+            call(&a, "vm_snapshot_delete", unknown).await,
+            json!({"ok":false,"reason":"not_found"})
+        );
+        // Before the reaper sweeps the retired generation, the refusal says
+        // when to retry: one production reaper period.
+        let delete = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1868)});
+        let refused = call(&a, "vm_snapshot_delete", delete.clone()).await;
+        assert_eq!(
+            refused,
+            json!({"ok":false,"reason":"cleanup_unconfirmed","retryable":true,
+                "retry_after_ms":crate::vm::reaper::PERIOD.as_millis() as u64})
+        );
+        assert_eq!(refused["retry_after_ms"], 5000);
+        // The same reason from another tool keeps the two-key shape.
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm,"request_id":key(1869)})
+            )
+            .await,
+            json!({"ok":false,"reason":"cleanup_unconfirmed"})
+        );
+        h.sweep().await;
+        // The refusal bound nothing: the same request now deletes the point.
+        let deleted = call(&a, "vm_snapshot_delete", delete.clone()).await;
+        assert_eq!(terminal(&a, &deleted).await["state"], "succeeded");
+        assert_eq!(call(&a, "vm_snapshot_delete", delete).await, deleted);
+        drop(a);
         h.shutdown().await.unwrap();
     }
 
