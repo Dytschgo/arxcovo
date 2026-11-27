@@ -1,7 +1,8 @@
 # Onboarding the Mac mini and the Linux host (owner runbook)
 
-Status: 2026-11-27, written against main `4eb24e29` plus the launchd parser in
-this change. It covers the two hosts arriving around 2026-12-01: an Apple
+Status: 2026-11-27, written against main `4eb24e29` plus the launchd parser,
+updated for the Linux cluster owner commands (`service cluster-config` and the
+`service configure` cluster options). It covers the two hosts arriving around 2026-12-01: an Apple
 Silicon **Mac mini (macOS)** and an **x86_64 Linux host (Ubuntu or Debian with
 systemd 254 or newer)**. Every command was checked against the source named
 next to it. None of them has been run on either machine yet: real Mac mini and
@@ -22,7 +23,7 @@ local values; do not commit them.
 | Local MCP (`arxd mcp-stdio`) to the installed service | Implemented | Implemented | `main.rs` |
 | Agent commands as the dedicated build account (installed service) | Not available: the installed executor is inert and reports `execution.available: false` | Not available: no macOS UID-sweep executor; post-v1 | `service/executor.rs` (`Execution::configured`) |
 | Cluster join (join code, cluster CA, mutual TLS, Raft) | Implemented in source for Linux; foreground and supervised worker; container-tested only | **Not available**: the cluster runtime is Linux-only, and macOS refuses a `cluster` service setting | `service/cluster_runtime.rs`, `cluster/consensus/bound_start.rs`, `service/config.rs` |
-| Owner CLI that writes the cluster installation file or the service `cluster` setting | **Missing**; see Linux step 6 | n/a | `service/config.rs` (`from_request` writes `cluster: None`) |
+| Owner CLI that writes the cluster installation file and the service `cluster` setting | Implemented and unit tested (`service cluster-config`, `service configure --cluster-config --cluster-intent`); run the daemon in the foreground until a follow-up ADR resolves the drop-in capability boundary (Linux step 6d) | Refused (`cluster-config-unsupported`, `service-config`) | `service/cluster_install.rs`, `cluster_runtime/install.rs`, `config.rs` |
 | Test VMs (QEMU/KVM on Linux, HVF on Mac) | M4 is Windows/WHPX first; Linux KVM path unverified | QEMU HVF and Apple Virtualization.framework guests: post-v1 | KICKOFF, ROADMAP |
 | Installed boot behaviour, real launchd/systemd output on these machines | **unverified on real hardware** | **unverified on real hardware** | ADR 0014 |
 
@@ -48,7 +49,9 @@ reports `running`, and Claude Code reaches it through `mcp-stdio` with
    Over the LAN, use `ping <other-host-lan-address>`. Cluster peer and
    enrollment ports come from the private cluster file (Linux step 6); once
    they are chosen, check them with `nc -vz <other-host-address> <port>`.
-   Do not open those ports to the internet.
+   Do not open those ports to the internet. A cluster join needs both Linux
+   hosts on one LAN subnet; Tailscale addresses cannot satisfy the join route
+   check (Linux step 6c).
 
 ## Linux host (x86_64, systemd 254 or newer)
 
@@ -68,9 +71,14 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`):
    `/home`, because the drop-in hides `/home` from builds):
 
    ```sh
-   sudo useradd --system --create-home --home-dir /var/lib/arxcovo-build --shell /usr/sbin/nologin arxcovo
+   sudo useradd --create-home --home-dir /var/lib/arxcovo-build --shell /bin/sh arxcovo
    sudo -u arxcovo mkdir /var/lib/arxcovo-build/work
    ```
+
+   Do not use `--system` or a `nologin` shell. The native account lookup
+   (`service/native_unix.rs` `account`) accepts only UIDs of 1000 or more with
+   a login shell, so `service configure` would refuse such an account with
+   `service-identity`. The password stays locked; never add a sudo rule.
 
 3. **(admin)** Install the binary and register the service. Install never
    starts the daemon and leaves it off at boot.
@@ -101,37 +109,189 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`):
    CARGO_HOME=...` and `--env RUSTUP_HOME=...` once tools are installed for
    `arxcovo`.
 
-6. **Cluster join (not owner-ready yet).** The Linux cluster runtime exists in
-   source with these exact entry points:
+6. **Cluster setup (Linux only).** The cluster runtime is Linux-only, so the
+   first Linux host creates the cluster (the *founder*). A later Linux host
+   joins it (a *joiner*). The Mac mini and Windows refuse every cluster
+   command and setting. Four distinct local accounts are involved (ADR 0046):
 
-   - Foreground daemon: `arxd --cluster-config <FILE> --cluster-intent <INTENT>`
-     with `INTENT` one of `create-founder`, `join`, `recover-founder`,
-     `recover-joiner`, plus optional `--inherit-listeners`
-     (`service/cluster_runtime.rs` `entry`; ADR 0047).
-   - Join code: on an existing member, the operator account runs
-     `arxd service cluster-control mint --socket <SOCKET> --daemon-uid <UID>`.
-     The join envelope appears only on that controlling terminal.
-   - Paste: on the new host, with its daemon started with intent `join`, the
-     operator runs `arxd service cluster-control join --socket <SOCKET> --daemon-uid <UID>`
-     and pastes the envelope at the hidden prompt, then presses Enter. The
-     envelope carries the cluster CA pin and checksum; the new node gets its
-     mutual-TLS identity and enters Raft through admission (ADR 0040, 0042,
-     0046).
+   | Role | Account in this guide | Rule enforced in source |
+   | --- | --- | --- |
+   | Daemon | `arxd-cluster` (fixed name) | own primary group, not in `sudo`/`wheel` (`Child::spawn`) |
+   | Operator | `arxd-operator` | member of the control group `arxd-control` |
+   | Agent (local MCP) | `<your-login>` | not in `arxd-control` |
+   | Build | `arxcovo` | not in `arxd-control`, not an administrator |
 
-   `<SOCKET>` is the `owner_socket` path in the cluster file: absolute, at
-   most 100 bytes, only `A-Z a-z 0-9 / _ - .`, and not directly under `/`.
-   `<UID>` is the numeric UID of the local `arxd-cluster` daemon account.
+   Every account needs a UID of 1000 or more and a login shell. The native
+   account lookup (`service/native_unix.rs` `account`) refuses system accounts
+   and `nologin`/`false` shells. `useradd` leaves the password locked unless
+   you set one.
 
-   What is missing before you can do this on the new host: there is no owner
-   command that writes the private cluster installation file (`workspace`,
-   `state`, `credentials`, `wrap`, `custody`, `history`, `owner_socket`,
-   `peer`, `enrollment` and the owner, daemon, agent and build UIDs/GIDs in
-   `service/cluster_runtime.rs` `Settings`), creates the `arxd-cluster` and
-   operator accounts and control group, or adds the `cluster` launch setting
-   to the service config. `service configure` writes the config without that
-   setting. Do not hand-edit `/etc/arxcovo/arxd.json`. Joining has only been
-   exercised in the three-container CI acceptance; installed multi-host join is
-   **unverified on real hardware**.
+   a. **(admin)** Create the control group and the two cluster accounts:
+
+      ```sh
+      sudo groupadd arxd-control
+      sudo useradd --user-group --create-home --shell /bin/sh arxd-cluster
+      sudo useradd --user-group --create-home --shell /bin/bash --groups arxd-control arxd-operator
+      ```
+
+   b. **(admin)** Create the private layout. Keep it outside `/home`, because
+      the service drop-in hides `/home`. Keep it outside `/etc/arxcovo` and
+      `/var/lib/arxcovo`, because the cluster paths must stay disjoint from the
+      service roots and from the build workspace.
+
+      ```sh
+      sudo install -d -o root -g root -m 0755 /etc/arxcovo-cluster /var/lib/arxcovo-cluster
+      sudo install -d -o arxd-cluster -g arxd-cluster -m 0700 \
+        /var/lib/arxcovo-cluster/workspace /var/lib/arxcovo-cluster/state \
+        /var/lib/arxcovo-cluster/credentials /var/lib/arxcovo-cluster/wrap \
+        /var/lib/arxcovo-cluster/history /var/lib/arxcovo-cluster/pki
+      sudo install -d -o arxd-cluster -g arxd-cluster -m 0700 /var/lib/arxcovo-cluster/pki/custody
+      sudo install -d -o arxd-cluster -g arxd-control -m 2710 /var/lib/arxcovo-cluster/control
+      stat -c '%a %U:%G' /var/lib/arxcovo-cluster/control
+      ```
+
+      The last command must print `2710 arxd-cluster:arxd-control`. If the
+      setgid bit is missing, run
+      `sudo chmod 2710 /var/lib/arxcovo-cluster/control` and check again.
+      Do not add POSIX ACLs to these directories.
+
+   c. **(admin)** Write the private installation file. Pick a LAN address of
+      this host and two free TCP ports, for example `7400` (peer) and `7401`
+      (enrollment). On the founder:
+
+      ```sh
+      sudo /usr/local/libexec/arxcovo/arxd service cluster-config \
+        --out /etc/arxcovo-cluster/cluster.json --role founder \
+        --workspace /var/lib/arxcovo-cluster/workspace --state /var/lib/arxcovo-cluster/state \
+        --credentials /var/lib/arxcovo-cluster/credentials --wrap /var/lib/arxcovo-cluster/wrap \
+        --custody /var/lib/arxcovo-cluster/pki/custody --history /var/lib/arxcovo-cluster/history \
+        --owner-socket /var/lib/arxcovo-cluster/control/owner.sock \
+        --peer <this-host-lan-ip>:7400 --enrollment <this-host-lan-ip>:7401 \
+        --operator-account arxd-operator --control-group arxd-control \
+        --agent-account <your-login> --build-account arxcovo
+      ```
+
+      On a joiner, use `--role joiner` and add
+      `--issuer-peer <founder-lan-ip>:7400` (the founder's peer address).
+      The command prints `daemon-uid=<UID>`, the `arxd-cluster` UID used by
+      `cluster-control` below. It never replaces an existing file: delete the
+      old file yourself first if you must start over.
+
+      What the command checks before it writes (`service/cluster_install.rs`,
+      `service/cluster_runtime/install.rs`):
+      - it runs as root, and resolves the four accounts and the group. The
+        operator must be in `arxd-control`; the agent and build accounts must
+        not be;
+      - every path is absolute and canonical, and the paths do not overlap.
+        `--owner-socket` is at most 100 bytes, uses only
+        `A-Z a-z 0-9 / _ - .` and is not directly under `/`;
+      - `--peer` and `--enrollment` use the same address and different ports.
+        The address is a private IPv4 address, `100.64.0.0/10` or an IPv6
+        unique-local address, and it is on an up interface of this host;
+      - a joiner's issuer lies inside the subnet of that interface. Joining
+        therefore needs both hosts on one LAN subnet. A Tailscale address is a
+        `/32` interface, which cannot contain the founder's address;
+      - the complete layout passes the runtime's own loader
+        (`Settings::vetted`) with the installed service roots as ordinary
+        roots: directory owners and modes as in step b, no symlinks, disjoint
+        objects. A founder file gets a fresh random cluster ID;
+      - the output directory (`/etc/arxcovo-cluster`, `root:root 0755` in
+        step b) is owned by root and writable by nobody else, sticky or not.
+        Its ancestors are owned by root or `arxd-cluster` and are not
+        writable by others unless root-owned and sticky. The command walks
+        them without following symlinks before it creates anything;
+      - `arxd-cluster` can search every directory leading to the file, to
+        each private directory and to the control directory. The operator
+        can search every directory leading to the control directory. Root
+        could open a layout that these accounts cannot reach, so the
+        command checks their owner, group and other search bits itself.
+        It refuses any access or default POSIX ACL on those directories and
+        on the file, so the bits alone decide. `arxd-cluster` is checked
+        with its primary group only, because the service worker clears
+        supplementary groups (ADR 0047). The operator is checked with its
+        current groups, including `arxd-control`. `service configure`
+        repeats the daemon check before it records a cluster setting. Step
+        b grants this through the `0755` parents and the `2710` control
+        directory.
+
+      It then writes the content as an unnamed file in the output directory
+      (Linux `O_TMPFILE`, available on ext4, XFS, Btrfs and tmpfs), owned by
+      `arxd-cluster` with mode `0600`. It checks that file with the runtime
+      loader, then links it once at the final name. The link never replaces
+      an existing file. A refusal before the link leaves nothing behind. On
+      a filesystem without `O_TMPFILE` the command refuses with
+      `cluster-config-io`.
+      Refusals print `arxd: <token>` with a fixed exit code:
+      `cluster-config-argument`, `cluster-config-account`,
+      `cluster-config-address` and `cluster-config-layout` exit 3;
+      `cluster-config-owner-required` exits 4; `cluster-config-exists` and
+      `cluster-config-io` exit 1; `cluster-config-unsupported` exits 7 on
+      macOS and Windows. A malformed command line prints `arxd: usage`
+      (exit 2).
+
+   d. **Run the cluster daemon in the foreground.** On a standard-rights
+      host this is the supported route today. Run it as the daemon account in
+      a terminal or `tmux` session that stays open:
+
+      ```sh
+      sudo -u arxd-cluster /usr/local/libexec/arxcovo/arxd \
+        --cluster-config /etc/arxcovo-cluster/cluster.json --cluster-intent create-founder
+      ```
+
+      On a joiner, use `--cluster-intent join`. The create and join intents
+      are for the first start only. After the founder's first successful
+      start, or the joiner's join, restart with `recover-founder` or
+      `recover-joiner` (`m3_activation_linux.rs` restarts with the recover
+      intents). The daemon refuses an intent that does not fit the file's
+      role. Stop it with Ctrl-C (SIGINT); ADR 0047 covers the graceful close.
+      This is the form the CI acceptance exercises: the daemon runs directly
+      as the daemon account.
+
+      **Do not add the service `cluster` setting on a standard-rights host
+      yet.** `service configure --cluster-config FILE --cluster-intent
+      INTENT` is implemented for the time a follow-up ADR resolves the
+      capability boundary. The standard-rights drop-in limits the root
+      service to `CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN`.
+      Without `CAP_DAC_READ_SEARCH` the root parent can neither read the
+      `0600` file owned by `arxd-cluster` nor search the `0700` custody
+      parent. This was found by reading the source; nobody has run it. A
+      `service start` with that setting would enable start at boot first and
+      then fail. The daemon would log `arxd: service-config` and exit 3, which
+      `journalctl -u arxd` shows. The owner command would print
+      `arxd: service-manager` and exit 1 because the systemd start failed. If
+      that happens, run `sudo /usr/local/libexec/arxcovo/arxd service stop`,
+      which also turns off start at boot. Then repeat your step 5 `configure`
+      without the two cluster options, which removes the setting.
+
+      What `configure` with the cluster options does, once the boundary is
+      resolved: it resolves `arxd-cluster` itself. Before it changes anything,
+      it repeats the checks the service runs at every start: account, file,
+      layout, role and intent pairing, and separation from the service
+      workspace. A refusal prints `service-config` (exit 3) and changes
+      nothing.
+
+   e. **Mint and join.** On the founder, log in as the operator (for example
+      `sudo -iu arxd-operator`) and run:
+
+      ```sh
+      /usr/local/libexec/arxcovo/arxd service cluster-control mint --socket /var/lib/arxcovo-cluster/control/owner.sock --daemon-uid <founder-daemon-uid>
+      ```
+
+      The join envelope appears only on that controlling terminal. On the
+      joiner, with its daemon started with intent `join`, the operator runs:
+
+      ```sh
+      /usr/local/libexec/arxcovo/arxd service cluster-control join --socket /var/lib/arxcovo-cluster/control/owner.sock --daemon-uid <joiner-daemon-uid>
+      ```
+
+      Paste the envelope at the hidden prompt, then press Enter. The envelope
+      carries the cluster CA pin and checksum. The new node gets its
+      mutual-TLS identity and enters Raft through admission (ADR 0040, 0042,
+      0046). Never paste the envelope into chat, an issue or a log.
+
+   Joining has been exercised only in the three-container CI acceptance.
+   Installed service activation, real Linux host onboarding and installed
+   multi-host join are **unverified on real hardware**.
 
 ## Mac mini (Apple Silicon, macOS)
 

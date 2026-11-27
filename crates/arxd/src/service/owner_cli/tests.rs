@@ -194,6 +194,7 @@ fn marker_args() -> ConfigureArgs {
             ("marker-one".into(), "a".repeat(64)),
             ("marker-two".into(), "b".repeat(64)),
         ],
+        cluster: None,
     }
 }
 #[test]
@@ -389,6 +390,11 @@ impl OwnerOps for RecordingOps {
         self.call("client")?;
         Ok("a".repeat(64))
     }
+    fn cluster_config(&mut self, a: &cluster_install::Request) -> Result<u32, CliError> {
+        assert!(*a == cluster_install::tests::request(Role::Joiner));
+        self.call("cluster-config")?;
+        Ok(1100)
+    }
 }
 #[test]
 fn dispatch_each_verb_and_fixed_outputs() {
@@ -414,6 +420,11 @@ fn dispatch_each_verb_and_fixed_outputs() {
             ]),
             "client",
             format!("test={}\n", "a".repeat(64)),
+        ),
+        (
+            cluster_config_argv(Role::Joiner),
+            "cluster-config",
+            "daemon-uid=1100\n".into(),
         ),
     ] {
         let mut ops = RecordingOps {
@@ -448,6 +459,7 @@ fn exhaustive_errors_have_fixed_tokens_and_codes() {
             "--out",
             "/private/file",
         ]),
+        cluster_config_argv(Role::Joiner),
     ] {
         let services = [
             (Error::Config, "service-config", 3),
@@ -496,6 +508,23 @@ fn exhaustive_errors_have_fixed_tokens_and_codes() {
             (ClientError::Partial, "client-config-partial", 1),
         ] {
             cases.push((CliError::Client(e), t, c));
+        }
+        for (e, t, c) in [
+            (InstallError::Argument, "cluster-config-argument", 3),
+            (InstallError::Account, "cluster-config-account", 3),
+            (InstallError::Address, "cluster-config-address", 3),
+            (InstallError::Layout, "cluster-config-layout", 3),
+            (
+                InstallError::OwnerRequired,
+                "cluster-config-owner-required",
+                4,
+            ),
+            (InstallError::Exists, "cluster-config-exists", 1),
+            (InstallError::Io, "cluster-config-io", 1),
+            (InstallError::Unsupported, "cluster-config-unsupported", 7),
+        ] {
+            assert_eq!(t, e.to_string());
+            cases.push((CliError::Cluster(e), t, c));
         }
         for (e, t, c) in cases {
             let mut ops = RecordingOps {
@@ -580,6 +609,12 @@ fn unix_full_previous_validation_and_no_agent_merge() {
                 &l,
                 &ctx,
                 &config_args(),
+                |new| {
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&new.serialized(false).unwrap()).unwrap();
+                    assert!(v.get("cluster").is_none());
+                    Ok(())
+                },
                 |p| {
                     executed = true;
                     let op = p
@@ -654,6 +689,7 @@ fn unix_full_previous_validation_and_no_agent_merge() {
                 &l,
                 &ctx,
                 &config_args(),
+                |_| Ok(()),
                 |_| panic!("no mutation")
             ),
             Err(Error::Config)
@@ -902,4 +938,365 @@ fn windows_configure_fully_parses_previous_before_batch() {
         Err(CliError::Service(Error::Config))
     ));
     assert_eq!(session.calls, ["read"]);
+}
+
+fn cluster_config_argv(role: Role) -> Vec<OsString> {
+    let r = cluster_install::tests::request(role);
+    let mut a = argv(&[
+        "service",
+        "cluster-config",
+        "--out",
+        &r.out,
+        "--role",
+        if role == Role::Founder {
+            "founder"
+        } else {
+            "joiner"
+        },
+        "--workspace",
+        &r.workspace,
+        "--state",
+        &r.state,
+        "--credentials",
+        &r.credentials,
+        "--wrap",
+        &r.wrap,
+        "--custody",
+        &r.custody,
+        "--history",
+        &r.history,
+        "--owner-socket",
+        &r.owner_socket,
+        "--peer",
+        &r.peer,
+        "--enrollment",
+        &r.enrollment,
+        "--operator-account",
+        &r.operator_account,
+        "--control-group",
+        &r.control_group,
+        "--agent-account",
+        &r.agent_account,
+        "--build-account",
+        &r.build_account,
+    ]);
+    if let Some(issuer) = &r.issuer_peer {
+        a.extend(argv(&["--issuer-peer", issuer]));
+    }
+    a
+}
+
+fn parsed_cluster(a: &[OsString]) -> Option<cluster_install::Request> {
+    match parse(a) {
+        Ok(Command::ClusterConfig(r)) => Some(r),
+        _ => None,
+    }
+}
+
+#[test]
+fn cluster_config_parser_maps_every_flag_exactly_once() {
+    for role in [Role::Founder, Role::Joiner] {
+        let parsed = parsed_cluster(&cluster_config_argv(role)).unwrap();
+        assert!(parsed == cluster_install::tests::request(role));
+        // Flag order is free.
+        let mut reversed = cluster_config_argv(role);
+        let pairs = reversed.split_off(2);
+        let mut chunks = pairs.chunks(2).collect::<Vec<_>>();
+        chunks.reverse();
+        reversed.extend(chunks.into_iter().flatten().cloned());
+        assert!(parsed_cluster(&reversed).unwrap() == cluster_install::tests::request(role));
+        // Every flag except the joiner-only issuer is required.
+        let full = cluster_config_argv(role);
+        for index in (2..full.len()).step_by(2) {
+            let mut a = full.clone();
+            let flag = a[index].clone();
+            a.drain(index..index + 2);
+            let parsed = parsed_cluster(&a);
+            assert_eq!(parsed.is_some(), flag == "--issuer-peer", "{flag:?}");
+        }
+        // Duplicates, unknown or abbreviated flags, flag-like or empty values
+        // and a dangling flag are usage errors.
+        for extra in [
+            ["--out", "/etc/arxcovo-cluster/other.json"],
+            ["--role", "founder"],
+            ["--daemon-account", "arxd-cluster"],
+            ["--owner_socket", "/a/b"],
+            ["--Out", "/a/b"],
+            ["--cluster-config", "/a/b"],
+            ["--founder-cluster", "07"],
+        ] {
+            let mut a = full.clone();
+            a.extend(argv(&extra));
+            assert!(parse(&a).is_err(), "{extra:?}");
+        }
+        for value in ["", "--peer"] {
+            let mut a = full.clone();
+            a[3] = value.into();
+            assert!(parse(&a).is_err());
+        }
+        let mut a = full.clone();
+        a.push("--peer".into());
+        assert!(parse(&a).is_err());
+    }
+    let mut a = cluster_config_argv(Role::Founder);
+    a.extend(argv(&["--issuer-peer", "192.168.1.10:7400"]));
+    assert!(parsed_cluster(&a).unwrap().issuer_peer.is_some());
+    for role in ["Founder", "member", "create-founder", "join"] {
+        let mut a = cluster_config_argv(Role::Founder);
+        a[5] = role.into();
+        assert!(parse(&a).is_err(), "{role}");
+    }
+    for a in [
+        argv(&["service", "cluster-config"]),
+        argv(&["service", "cluster-configure"]),
+        argv(&["service", "cluster"]),
+    ] {
+        assert!(parsed_cluster(&a).is_none());
+    }
+}
+
+#[test]
+fn cluster_config_dispatch_checks_arguments_before_native_authority() {
+    let mut a = cluster_config_argv(Role::Joiner);
+    let index = a.iter().position(|v| v == "--owner-socket").unwrap() + 1;
+    a[index] = "/owner.sock".into();
+    let mut ops = RecordingOps {
+        calls: vec![],
+        fail: None,
+        report: RightReport::NotRecorded,
+    };
+    let (mut out, mut err) = (vec![], vec![]);
+    assert_eq!(
+        dispatch(parse(&a).ok().unwrap(), &mut ops, &mut out, &mut err),
+        3
+    );
+    assert!(ops.calls.is_empty());
+    assert!(out.is_empty());
+    assert_eq!(err, b"arxd: cluster-config-argument\n");
+}
+
+#[test]
+fn configure_cluster_flags_come_as_a_pair() {
+    let mut a = configure();
+    a.extend(argv(&[
+        "--cluster-config",
+        "/etc/arxcovo-cluster/cluster.json",
+        "--cluster-intent",
+        "create-founder",
+    ]));
+    let Command::Configure(c) = parse(&a).ok().unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        c.cluster,
+        Some((
+            "/etc/arxcovo-cluster/cluster.json".into(),
+            "create-founder".into()
+        ))
+    );
+    let request = c.request();
+    let cluster = request.cluster.as_ref().unwrap();
+    assert_eq!(cluster.config, "/etc/arxcovo-cluster/cluster.json");
+    assert_eq!(cluster.intent, "create-founder");
+    assert!(config_args().cluster.is_none());
+    assert!(config_args().request().cluster.is_none());
+    for extra in [
+        &["--cluster-config", "/etc/arxcovo-cluster/cluster.json"][..],
+        &["--cluster-intent", "join"],
+        &[
+            "--cluster-config",
+            "/a/b",
+            "--cluster-intent",
+            "join",
+            "--cluster-intent",
+            "join",
+        ],
+        &[
+            "--cluster-config",
+            "/a/b",
+            "--cluster-config",
+            "/a/c",
+            "--cluster-intent",
+            "join",
+        ],
+        &["--cluster-config", "--cluster-intent"],
+    ] {
+        let mut a = configure();
+        a.extend(argv(extra));
+        assert!(parse(&a).is_err(), "{extra:?}");
+    }
+    // client-config never accepts cluster flags.
+    assert!(
+        parse(&argv(&[
+            "client-config",
+            "new",
+            "--principal",
+            "test",
+            "--out",
+            "/private/file",
+            "--cluster-config",
+            "/a/b",
+        ]))
+        .is_err()
+    );
+}
+
+struct ClusterAccounts;
+impl Resolver for ClusterAccounts {
+    fn account(&self, n: &str) -> Result<Account, Error> {
+        Ok(Account {
+            identity: match n {
+                "builder" => "1002",
+                "arxd-cluster" => "1100",
+                other => other,
+            }
+            .into(),
+            gid: Some(if n == "arxd-cluster" { 1100 } else { 1002 }),
+            kind: AccountKind::User,
+            administrative: false,
+        })
+    }
+    fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+        Ok(true)
+    }
+}
+
+#[test]
+fn unix_configure_vets_cluster_launch_before_reading_or_mutating() {
+    let mut args = config_args();
+    args.cluster = Some(("/etc/arxcovo-cluster/cluster.json".into(), "join".into()));
+    let l = Layout::for_test(Platform::Linux);
+    let ctx = OwnerContext {
+        admin: true,
+        running_binary: l.binary(),
+    };
+    let mut written = None;
+    unix_configure(
+        || Ok(None),
+        &ClusterAccounts,
+        &l,
+        &ctx,
+        &args,
+        |new| {
+            let v: serde_json::Value =
+                serde_json::from_slice(&new.serialized(false).unwrap()).unwrap();
+            assert_eq!(
+                v["cluster"],
+                serde_json::json!({
+                    "config": "/etc/arxcovo-cluster/cluster.json",
+                    "intent": "join",
+                    "daemon_uid": 1100,
+                    "daemon_gid": 1100,
+                })
+            );
+            Ok(())
+        },
+        |p| {
+            written = p.operations().iter().find_map(|o| match o {
+                Operation::AtomicConfig { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            });
+            Ok(())
+        },
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&written.unwrap()).unwrap();
+    assert_eq!(v["cluster"]["intent"], "join");
+    // A refused cluster preflight reads and mutates nothing.
+    assert_eq!(
+        unix_configure(
+            || panic!("no previous read"),
+            &ClusterAccounts,
+            &l,
+            &ctx,
+            &args,
+            |_| Err(Error::Config),
+            |_| panic!("no mutation"),
+        ),
+        Err(Error::Config)
+    );
+    // macOS refuses the cluster setting before preflight.
+    let l = Layout::for_test(Platform::Macos);
+    assert_eq!(
+        unix_configure(
+            || panic!("no previous read"),
+            &ClusterAccounts,
+            &l,
+            &ctx,
+            &args,
+            |_| panic!("no preflight"),
+            |_| panic!("no mutation"),
+        ),
+        Err(Error::Config)
+    );
+}
+
+#[test]
+fn flag_free_configure_replaces_a_legacy_stored_launch() {
+    let l = Layout::for_test(Platform::Linux);
+    let ctx = OwnerContext {
+        admin: true,
+        running_binary: l.binary(),
+    };
+    let mut legacy = config_args();
+    legacy.cluster = Some(("/etc/arxcovo-cluster/cluster.json".into(), "join".into()));
+    let previous = ServiceConfig::from_request(&legacy.request(), &l, &ClusterAccounts)
+        .unwrap()
+        .serialized(false)
+        .unwrap();
+    // A stored path with a redundant internal slash, which the start-time
+    // component walk accepts but the strict owner spelling rule refuses.
+    let mut value: serde_json::Value = serde_json::from_slice(&previous).unwrap();
+    value["cluster"]["config"] = "/etc//arxcovo-cluster/cluster.json".into();
+    let previous = serde_json::to_vec(&value).unwrap();
+    assert!(ServiceConfig::parse(&previous, &l, &ClusterAccounts).is_ok());
+    let mut replaced = None;
+    unix_configure(
+        || Ok(Some(previous.clone())),
+        &ClusterAccounts,
+        &l,
+        &ctx,
+        &config_args(),
+        |_| Ok(()),
+        |p| {
+            replaced = p.operations().iter().find_map(|o| match o {
+                Operation::AtomicConfig {
+                    bytes, expected, ..
+                } => Some((bytes.clone(), expected.clone())),
+                _ => None,
+            });
+            Ok(())
+        },
+    )
+    .unwrap();
+    let (bytes, expected) = replaced.unwrap();
+    // The plan expects the previous file exactly as the reader parsed it,
+    // including the legacy spelling.
+    let canonical = ServiceConfig::parse(&previous, &l, &ClusterAccounts)
+        .unwrap()
+        .serialized(false)
+        .unwrap();
+    assert_eq!(expected.as_ref(), Some(&canonical));
+    let old: serde_json::Value = serde_json::from_slice(&expected.unwrap()).unwrap();
+    assert_eq!(
+        old["cluster"]["config"],
+        "/etc//arxcovo-cluster/cluster.json"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(v.get("cluster").is_none());
+    // New owner input keeps the strict canonical spelling.
+    let mut strict = config_args();
+    strict.cluster = Some(("/etc//arxcovo-cluster/cluster.json".into(), "join".into()));
+    assert_eq!(
+        unix_configure(
+            || panic!("no previous read"),
+            &ClusterAccounts,
+            &l,
+            &ctx,
+            &strict,
+            |_| panic!("no preflight"),
+            |_| panic!("no mutation"),
+        ),
+        Err(Error::Config)
+    );
 }
