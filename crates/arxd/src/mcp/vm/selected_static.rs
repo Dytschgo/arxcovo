@@ -133,6 +133,15 @@ impl SelectedStatic {
     }
 
     #[cfg(test)]
+    pub(super) fn revive_fixture_network(&self) {
+        match &self.0 {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            Source::Native(_) => panic!("expected fixture selection"),
+            Source::Fixture(fixture) => fixture.network_live.store(true, Ordering::Release),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn fixture_evidence(&self) -> Option<&VerifiedDockerEvidence> {
         match &self.0 {
             #[cfg(all(windows, target_arch = "x86_64"))]

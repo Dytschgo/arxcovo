@@ -87,6 +87,7 @@ struct TestObservation {
     witness_udp_arrivals: u64,
 }
 
+#[allow(clippy::too_many_arguments)] // Each independently pinned seal and the enrolled targets.
 pub(super) fn verify(
     bytes: &[u8],
     docker_seal: Hash,
@@ -95,6 +96,7 @@ pub(super) fn verify(
     policy_hash: Hash,
     executable: Hash,
     policy: &PublicEgressPolicy,
+    enrolled: PublicTargets,
 ) -> Result<PublicTargets, NativeRefusal> {
     if bytes.len() as u64 > MAX_BYTES || docker_seal == test_seal {
         return Err(NETWORK);
@@ -109,6 +111,10 @@ pub(super) fn verify(
         public_dns_target: observed.dns_target,
     };
     public_targets.verify(policy)?;
+    // The reviewed run must have exercised exactly the enrolled sockets.
+    if public_targets != enrolled {
+        return Err(NETWORK);
+    }
     if receipt.version != 1
         || !matches(&receipt.qualification_sha256, docker_seal)
         || !matches(&receipt.m4_qualification_sha256, test_seal)
@@ -203,7 +209,9 @@ mod tests {
             "test":{"network_class":"restricted","tcp_target":"8.8.8.8:443","dns_target":"9.9.9.9:53",
                 "public_tcp_connected":false,"udp_dns_answer":false,"witness_tcp_arrivals":0,"witness_udp_arrivals":0}
         });
-        let check = |receipt: &serde_json::Value| {
+        let profile = br#"{"public_tcp_target":"8.8.8.8:443","public_dns_target":"9.9.9.9:53"}"#;
+        let expected = PublicTargets::parse(profile, &policy).unwrap();
+        let check_against = |receipt: &serde_json::Value, enrolled| {
             verify(
                 &serde_json::to_vec(receipt).unwrap(),
                 [1; 32],
@@ -212,16 +220,30 @@ mod tests {
                 [4; 32],
                 [5; 32],
                 &policy,
+                enrolled,
             )
         };
-        let profile = br#"{"public_tcp_target":"8.8.8.8:443","public_dns_target":"9.9.9.9:53"}"#;
-        let expected = PublicTargets::parse(profile, &policy).unwrap();
+        let check = |receipt: &serde_json::Value| check_against(receipt, expected);
         assert_eq!(check(&receipt), Ok(expected));
+        // A consistent receipt for another TCP port, or another DNS socket,
+        // is refused against the enrolled targets.
         let mut different_port = receipt.clone();
         for role in ["static", "test"] {
             different_port[role]["tcp_target"] = json!("8.8.8.8:8443");
         }
-        assert_ne!(check(&different_port).unwrap(), expected);
+        assert_eq!(check(&different_port), Err(NETWORK));
+        let moved = PublicTargets::parse(
+            br#"{"public_tcp_target":"8.8.8.8:8443","public_dns_target":"9.9.9.9:53"}"#,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(check_against(&different_port, moved), Ok(moved));
+        assert_eq!(check_against(&receipt, moved), Err(NETWORK));
+        let mut different_dns = receipt.clone();
+        for role in ["static", "test"] {
+            different_dns[role]["dns_target"] = json!("9.9.9.10:53");
+        }
+        assert_eq!(check(&different_dns), Err(NETWORK));
         let mut missing_loopback = receipt.clone();
         missing_loopback["static"]["denied"]
             .as_array_mut()

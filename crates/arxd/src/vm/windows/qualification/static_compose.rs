@@ -129,9 +129,7 @@ impl PreparedStaticDossier {
             &m4.held,
             &recipe,
         )?;
-        if held.m4_seal() != m4.seal_sha256() {
-            return Err(REFUSAL);
-        }
+        let enrolled = held.bound_targets(m4.seal_sha256())?;
         let public_targets = reviewed_network::verify(
             &held_bytes(&reviewed, reviewed_network::MAX_BYTES)?,
             self.selection.seal_sha256,
@@ -140,11 +138,9 @@ impl PreparedStaticDossier {
             measured(&held.policy)?,
             held.patched.review.qemu.sha256,
             &held.parsed_policy,
-        )?;
-        if public_targets != held.public_targets()? {
-            return Err(NativeRefusal::NetworkFenceUnverified);
-        }
-        let public_targets = public_targets.addresses();
+            enrolled,
+        )?
+        .addresses();
         let (dependencies, watch) = held.measure_live(&public_targets)?;
         let fresh = DockerFresh {
             now: boot::now(),
@@ -827,8 +823,16 @@ impl<'a> HeldDockerInputs<'a> {
         })
     }
 
-    pub(super) fn m4_seal(&self) -> Hash {
-        self.m4_seal
+    /// Binds these inputs to the separately selected M4 seal before any live
+    /// measurement, then returns the enrolled public targets.
+    pub(super) fn bound_targets(
+        &self,
+        selected_m4: Hash,
+    ) -> Result<reviewed_network::PublicTargets, NativeRefusal> {
+        if self.m4_seal != selected_m4 {
+            return Err(REFUSAL);
+        }
+        self.public_targets()
     }
 
     pub(super) fn stock_boot_inputs(&self) -> Result<StockBootInputs<'_>, NativeRefusal> {

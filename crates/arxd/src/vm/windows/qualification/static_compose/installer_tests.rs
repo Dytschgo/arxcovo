@@ -535,3 +535,47 @@ fn held_docker_inputs_measure_rechecks_boot_files_and_receipt() {
         }
     });
 }
+
+/// Standards P2 (PR #402 review 1): the `--full-docker` preflight and the
+/// foreground selection both bind held inputs to the selected M4 seal before
+/// any live measurement, and a refusal claims nothing in the output directory.
+#[test]
+fn docker_inputs_bind_the_selected_m4_seal_before_live_measurement() {
+    with_fixture(|f| {
+        let env = MeasureEnv::new();
+        let evidence = env.dir.path().join("evidence");
+        fs::create_dir(&evidence).unwrap();
+        let held = f.hold().unwrap();
+        let mut inputs = env.inputs(&held);
+        let selected = inputs.m4_seal;
+        let mut substituted = selected;
+        substituted[0] ^= 1;
+        // The seal binding precedes even the target profile parse.
+        assert_eq!(
+            inputs.bound_targets(substituted).err(),
+            Some(NativeRefusal::QualificationMissing)
+        );
+        assert_eq!(
+            inputs.bound_targets(selected).err(),
+            Some(NativeRefusal::NetworkFenceUnverified)
+        );
+        inputs.fixture[1] = env.hold_named(
+            "fixture-targets.json",
+            br#"{"public_tcp_target":"8.8.8.8:443","public_dns_target":"9.9.9.9:53"}"#,
+        );
+        assert_eq!(
+            inputs.bound_targets(selected).unwrap().addresses(),
+            [
+                std::net::Ipv4Addr::new(8, 8, 8, 8),
+                std::net::Ipv4Addr::new(9, 9, 9, 9)
+            ]
+        );
+        for seal in [substituted, [0; 32], [0x64; 32]] {
+            assert_eq!(
+                inputs.bound_targets(seal).err(),
+                Some(NativeRefusal::QualificationMissing)
+            );
+        }
+        assert_eq!(fs::read_dir(&evidence).unwrap().count(), 0);
+    });
+}

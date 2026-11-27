@@ -379,6 +379,10 @@ pub(crate) struct Supervisor {
     /// Blocks the next sweep.
     #[cfg(test)]
     stall_sweep: Mutex<Option<tests::StallHook>>,
+    /// Retires the fixture static network once, after the next Compose or
+    /// backup dispatch looked up its session and before its transaction.
+    #[cfg(test)]
+    retire_static_after_lookup: AtomicBool,
     /// Blocks the next early owner revocation after its transition recorded
     /// the stop obligations and before their runners are spawned.
     #[cfg(test)]
@@ -573,6 +577,8 @@ impl Supervisor {
             stall_admission: Mutex::new(None),
             #[cfg(test)]
             stall_sweep: Mutex::new(None),
+            #[cfg(test)]
+            retire_static_after_lookup: AtomicBool::new(false),
             #[cfg(test)]
             stall_revoked: Mutex::new(None),
             #[cfg(test)]
@@ -940,6 +946,26 @@ impl Supervisor {
         match self.selected_static.as_ref()? {
             Ok(selected) => selected.refusal(),
             Err(reason) => Some(*reason),
+        }
+    }
+
+    /// Re-samples the static selection at a fresh-intent boundary. A session
+    /// looked up earlier may outlive a route watch that has since retired.
+    fn fence_fresh_intent(&self, fenced: &std::cell::Cell<Option<NativeRefusal>>) -> bool {
+        let refusal = self.static_refusal();
+        fenced.set(refusal);
+        refusal.is_some()
+    }
+
+    #[cfg(test)]
+    fn after_static_lookup(&self) {
+        if self
+            .retire_static_after_lookup
+            .swap(false, Ordering::AcqRel)
+        {
+            self.static_selection()
+                .expect("fixture static selection")
+                .retire_fixture_network();
         }
     }
 
@@ -2678,6 +2704,9 @@ impl VmInventory {
         } else {
             None
         };
+        #[cfg(test)]
+        self.supervisor.after_static_lookup();
+        let fenced = std::cell::Cell::new(None);
         if tool == ToolName::ComposeStatus {
             args.end()?;
             let mut status = store
@@ -2760,6 +2789,9 @@ impl VmInventory {
             if !compose::deployment_preserves_routes(tx, &request)? {
                 return Ok(Err(compose::Fault::Busy));
             }
+            if self.supervisor.fence_fresh_intent(&fenced) {
+                return Ok(Err(compose::Fault::NotReady));
+            }
             db::admit(
                 tx,
                 &self.principal,
@@ -2779,7 +2811,10 @@ impl VmInventory {
             }
             Err(compose::Fault::NotFound) => return Err(NOT_FOUND),
             Err(compose::Fault::NotReady) => {
-                return Err(static_refusal.map_or(NOT_READY, |r| Fault::new(native_reason(r))));
+                return Err(fenced
+                    .get()
+                    .or(static_refusal)
+                    .map_or(NOT_READY, |r| Fault::new(native_reason(r))));
             }
             Err(compose::Fault::Busy) => return Err(Refusal::Busy.into()),
             Err(compose::Fault::StaleKey) => return Err(Refusal::StaleKey.into()),
@@ -2795,6 +2830,8 @@ impl VmInventory {
             .filter(|s| s.generation == intent.generation && (repair || s.wire_boot == intent.boot))
             && (repair || intent.receipt.is_none())
             && (repair || intent.closed.is_none())
+            // A replay never drives guest I/O through a retired selection.
+            && self.supervisor.static_refusal().is_none()
         {
             let active = gate.compose_active.clone();
             let id = intent.id;
@@ -2897,6 +2934,9 @@ impl VmInventory {
         } else {
             None
         };
+        #[cfg(test)]
+        self.supervisor.after_static_lookup();
+        let fenced = std::cell::Cell::new(None);
         let custody_present = self.supervisor.compose_backup.custody().is_some();
 
         let admission = store.transact(|tx| {
@@ -2921,6 +2961,9 @@ impl VmInventory {
             {
                 return Ok(Err(BackupFault::NotReady));
             }
+            if self.supervisor.fence_fresh_intent(&fenced) {
+                return Ok(Err(BackupFault::NotReady));
+            }
             db::admit_backup(
                 tx,
                 &self.principal,
@@ -2943,7 +2986,10 @@ impl VmInventory {
             Ok(intent) => intent,
             Err(BackupFault::NotFound) => return Err(NOT_FOUND),
             Err(BackupFault::NotReady) => {
-                return Err(static_refusal.map_or(NOT_READY, |r| Fault::new(native_reason(r))));
+                return Err(fenced
+                    .get()
+                    .or(static_refusal)
+                    .map_or(NOT_READY, |r| Fault::new(native_reason(r))));
             }
             Err(BackupFault::Busy) => return Err(Refusal::Busy.into()),
             Err(BackupFault::BackupLimit) => return Err(Refusal::BackupLimit.into()),
@@ -2962,6 +3008,7 @@ impl VmInventory {
             }
         }
         if intent.status == BackupOpStatus::Pending
+            && self.supervisor.static_refusal().is_none()
             && let Some(session) =
                 session.filter(|s| s.generation == intent.generation && s.wire_boot == intent.boot)
         {
@@ -16990,6 +17037,141 @@ pub(crate) mod tests {
             })
             .unwrap()
             .unwrap()
+    }
+
+    /// Spec P2 (PR #402 review 1): a route watch that retires after the
+    /// dispatcher looked up its session still closes fresh Compose and backup
+    /// admission inside the store transaction, while replay of an existing
+    /// receipt keeps answering without driving guest I/O.
+    #[tokio::test]
+    async fn static_retirement_after_session_lookup_refuses_fresh_compose_and_backup_intents() {
+        use crate::store::vm::compose as db;
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.static_compose = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let (vm, vm_id, generation, target, _root, _managed) =
+            setup_compose_backup_project(&h, &a, 6100, 64 * 1024).await;
+        let (second, _) = enroll_backup_project(&h, vm_id, "calm-two", [0x62; 16], 64 * 1024);
+        let boot = 6101;
+        let supervisor = h.supervisor();
+        let mut backup_peer = backup_test_peer(&h, vm_id, generation, boot).await;
+        let (host_io, mut compose_peer) = tokio::io::duplex(64 * 1024);
+        let (channel, ()) = tokio::join!(
+            crate::vm::guest::ComposeChannel::negotiate(host_io, boot, &supervisor.cancel),
+            fake_compose_hello(&mut compose_peer, boot)
+        );
+        let store = supervisor.controller.compose_store();
+        supervisor
+            .compose
+            .attach(
+                store,
+                vm_id,
+                compose::Session::new(generation, channel.unwrap()),
+            )
+            .unwrap();
+        let selection = supervisor.static_selection().unwrap();
+        assert!(supervisor.static_refusal().is_none());
+        let rows = || {
+            store
+                .read_only(|db| {
+                    Ok([
+                        "vm_operations",
+                        "vm_compose_operations",
+                        "vm_compose_backup_ops",
+                    ]
+                    .map(|table| {
+                        crate::store::vm::count(db, &format!("SELECT count(*) FROM {table}"), [])
+                            .unwrap()
+                    }))
+                })
+                .unwrap()
+        };
+        let before = rows();
+        let args = |project: &str, n| json!({"vm_id":vm,"project_id":project,"request_id":key(n)});
+
+        // Both sessions are live and admissible; the watch retires only after
+        // each dispatcher sampled the selection and looked up its session.
+        for (tool, n) in [("compose_start", 6120), ("compose_backup", 6121)] {
+            selection.revive_fixture_network();
+            supervisor
+                .retire_static_after_lookup
+                .store(true, Ordering::Release);
+            let refused = call(&a, tool, args("calm-life", n)).await;
+            assert_eq!(
+                refused["reason"], "network_fence_unverified",
+                "{tool}: {refused}"
+            );
+            assert!(
+                !supervisor
+                    .retire_static_after_lookup
+                    .load(Ordering::Acquire),
+                "{tool} reached the hook"
+            );
+            assert_eq!(rows(), before, "{tool} wrote a fresh intent row");
+        }
+
+        // Existing receipts on two projects, admitted while the selection is live.
+        selection.revive_fixture_network();
+        let session = supervisor.compose.session(vm_id).unwrap();
+        let start = compose::Mutation {
+            target: target.clone(),
+            kind: compose::Kind::Start,
+            key: RequestId::parse(&key(6130)).unwrap(),
+            release: None,
+        };
+        let now = supervisor.controller.compose_now().unwrap();
+        let prior = store
+            .transact(|tx| {
+                Ok(db::admit(
+                    tx,
+                    "alpha",
+                    &start,
+                    session.generation,
+                    session.wire_boot,
+                    now,
+                )?
+                .unwrap())
+            })
+            .unwrap();
+        let backup = admit_test_backup(&h, &second, 6131);
+        let admitted = rows();
+
+        // Replays answer from their receipts even when the watch retires
+        // after the session lookup, and never drive the cached session.
+        for (tool, project, n, id) in [
+            ("compose_start", "calm-life", 6130, prior.id),
+            ("compose_backup", "calm-two", 6131, backup.id),
+        ] {
+            selection.revive_fixture_network();
+            supervisor
+                .retire_static_after_lookup
+                .store(true, Ordering::Release);
+            let replay = call(&a, tool, args(project, n)).await;
+            assert_eq!(replay["operation_id"], hex::encode(id), "{tool}: {replay}");
+            assert_eq!(replay["state"], "pending", "{tool}: {replay}");
+            assert!(
+                supervisor.static_refusal().is_some(),
+                "{tool} reached the hook"
+            );
+        }
+        assert_eq!(rows(), admitted);
+        // Neither replay drove guest I/O through the retired selection: a
+        // spawned drive registers its intent before the dispatch returns.
+        assert!(
+            supervisor
+                .lock()
+                .unwrap()
+                .compose_active
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_no_queued_frame(&mut compose_peer).await;
+        assert_no_queued_frame(&mut backup_peer).await;
+        drop(a);
+        h.shutdown().await.unwrap();
     }
 
     async fn drive_test_backup(

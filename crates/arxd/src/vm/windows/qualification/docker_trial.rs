@@ -88,10 +88,9 @@ pub(super) fn preflight(
     }
     let recipe = enrollment.recipe.hold(&m4.held, &m4.recipes, [1; 16])?;
     let inputs = enrollment.hold_inputs(&evidence, mode, &m4.held, &recipe)?;
-    if inputs.m4_seal() != selected.selection().seal_sha256 {
-        return Err(NativeRefusal::QualificationMissing);
-    }
-    let targets = inputs.public_targets()?.addresses();
+    let targets = inputs
+        .bound_targets(selected.selection().seal_sha256)?
+        .addresses();
     let (_dependencies, watch) = inputs.measure_live(&targets)?;
     m4.require_current()?;
     // A complete input check grants no native effects or evidence claim.
