@@ -1,5 +1,6 @@
 use super::super::{
     Binding, VmStore, cancel_untouched_build, forget_generation, open_sqlite, reserve_build,
+    static_vm,
 };
 use super::*;
 use crate::service::application::tests::private_temp;
@@ -88,8 +89,11 @@ DROP TRIGGER vm_native_writer_reservation;
 DROP TABLE vm_native_writer;
 ";
 
-fn assert_v17_writer_schema(db: &Connection) -> Result<()> {
-    assert_eq!(count(db, "PRAGMA user_version", [])?, 17);
+fn assert_current_writer_schema(db: &Connection) -> Result<()> {
+    assert_eq!(
+        count(db, "PRAGMA user_version", [])?,
+        i64::from(super::super::VM_SCHEMA_VERSION)
+    );
     assert_eq!(
         count(db, "SELECT count(*) FROM pragma_foreign_key_check", [])?,
         0
@@ -119,6 +123,60 @@ fn assert_v17_writer_schema(db: &Connection) -> Result<()> {
 }
 
 #[test]
+fn v18_upgrade_preserves_v17_rows_and_infers_no_static_custody() -> Result<()> {
+    use super::super::backup_owner_fixture;
+    use crate::vm::static_web::StaticState;
+
+    let (dir, store, target, generation) = backup_owner_fixture()?;
+    let before = store.transact(|db| {
+        db.execute(
+            "UPDATE vm_static_instances SET state=1 WHERE id=?1",
+            [target.vm],
+        )?;
+        let pair = static_vm::active_pair(db, "alice", target.vm)?.unwrap();
+        assert_eq!(pair.0.disk.generation, generation);
+        Ok((
+            pair,
+            static_vm::origin_generation(db, target.vm)?,
+            dump(db)?,
+        ))
+    })?;
+    drop(store);
+
+    let db = open_sqlite(&dir.path().join("activity.sqlite3"))?;
+    db.execute_batch(static_vm::DROP_V18)?;
+    db.pragma_update(None, "user_version", 17)?;
+    drop(db);
+
+    for _ in 0..2 {
+        let store = VmStore::open(dir.path(), NOW)?;
+        store.transact(|db| {
+            assert_current_writer_schema(db)?;
+            assert_eq!(dump(db)?, before.2);
+            assert_eq!(
+                static_vm::active_pair(db, "alice", target.vm)?,
+                Some(before.0)
+            );
+            assert_eq!(static_vm::origin_generation(db, target.vm)?, before.1);
+            assert_eq!(
+                count(
+                    db,
+                    "SELECT count(*) FROM vm_compose_volumes WHERE vm=?1",
+                    [target.vm]
+                )?,
+                1
+            );
+            assert_eq!(count(db, "SELECT count(*) FROM vm_static_custody", [])?, 0);
+            assert!(
+                static_vm::native::custody(db, "alice", target.vm, StaticState::Stopped)?.is_none()
+            );
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
 fn v17_upgrade_preserves_v16_custody_without_inventing_writer_provenance() -> Result<()> {
     let dir = private_temp();
     let store = VmStore::open(dir.path(), NOW)?;
@@ -136,6 +194,7 @@ fn v17_upgrade_preserves_v16_custody_without_inventing_writer_provenance() -> Re
     drop(store);
 
     let db = open_sqlite(&dir.path().join("activity.sqlite3"))?;
+    db.execute_batch(static_vm::DROP_V18)?;
     db.execute_batch(DROP_V17)?;
     db.pragma_update(None, "user_version", 16)?;
     drop(db);
@@ -143,7 +202,7 @@ fn v17_upgrade_preserves_v16_custody_without_inventing_writer_provenance() -> Re
     for _ in 0..2 {
         let store = VmStore::open(dir.path(), NOW)?;
         store.transact(|db| {
-            assert_v17_writer_schema(db)?;
+            assert_current_writer_schema(db)?;
             assert!(bound(db, scope)?);
             assert_eq!(
                 leaf(db, slot)?,
@@ -180,6 +239,7 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
     // Run recovery once before taking the baseline for the upgrade.
     let before = VmStore::open(dir.path(), NOW)?.transact(|db| dump(db))?;
     let db = open_sqlite(&dir.path().join("activity.sqlite3"))?;
+    db.execute_batch(static_vm::DROP_V18)?;
     db.execute_batch(DROP_V17)?;
     db.execute_batch(
         "DROP TRIGGER vm_native_artifact_identity;
@@ -190,7 +250,7 @@ fn v16_upgrade_preserves_v15_rows_and_infers_no_native_binding() -> Result<()> {
 
     let store = VmStore::open(dir.path(), NOW)?;
     store.transact(|db| {
-        assert_v17_writer_schema(db)?;
+        assert_current_writer_schema(db)?;
         assert_eq!(dump(db)?, before);
         assert_eq!(
             count(

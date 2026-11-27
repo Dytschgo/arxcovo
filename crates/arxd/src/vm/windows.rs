@@ -3092,13 +3092,13 @@ impl<'a> CheckedLaunchCore<'a> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
         // build, policy custody and route evidence have native qualification.
-        if kind == PlanKind::StaticWebBoot
-            || matches!(
-                kind,
-                PlanKind::PublicEgressBoot
-                    | PlanKind::StaticComposeInstaller
-                    | PlanKind::StaticComposeDetached
-            ) && !docker
+        if matches!(
+            kind,
+            PlanKind::StaticWebBoot
+                | PlanKind::PublicEgressBoot
+                | PlanKind::StaticComposeInstaller
+                | PlanKind::StaticComposeDetached
+        ) && !docker
         {
             return Err(NativeRefusal::NetworkFenceUnverified.into());
         }
@@ -3166,20 +3166,27 @@ impl<'a> CheckedLaunchCore<'a> {
         }
         if matches!(
             kind,
-            PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall) | PlanKind::Boot
+            PlanKind::InstallerBoot(InstallerPhase::UbuntuInstall)
+                | PlanKind::StaticComposeInstaller
+                | PlanKind::Boot
         ) {
             // The foreground preparation pins the initial stock VARS bytes,
             // or an installed boot pins its authorized VARS copy. Retain
             // writer exclusion until QEMU opens its writable copy.
+            let vars_role = if kind == PlanKind::StaticComposeInstaller {
+                ArtifactRole::StaticVars
+            } else {
+                ArtifactRole::Vars
+            };
             if let Some((_, vars)) = inputs
                 .plan
                 .inputs()
                 .iter()
-                .find(|(role, _)| *role == ArtifactRole::Vars)
+                .find(|(role, _)| *role == vars_role)
                 && let Some(digest) = vars.pin()
             {
                 let path = vars
-                    .path_for(ArtifactRole::Vars)
+                    .path_for(vars_role)
                     .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
                 let index = inputs
                     .pins
@@ -3237,6 +3244,7 @@ impl<'a> CheckedLaunchCore<'a> {
                 let program = if matches!(
                     kind,
                     PlanKind::Boot
+                        | PlanKind::StaticWebBoot
                         | PlanKind::InstallerBoot(_)
                         | PlanKind::PublicEgressBoot
                         | PlanKind::StaticComposeInstaller

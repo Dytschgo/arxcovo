@@ -585,6 +585,48 @@ impl BootRecipe<'_> {
         Ok(plan)
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) fn provision_static(
+        &self,
+        generation: super::Id,
+        public_dns: Option<std::net::Ipv4Addr>,
+    ) -> Result<CommandPlan<'_>, InvalidPath> {
+        let consistent = matches!(
+            (&self.boot, public_dns),
+            (
+                BootPurpose::InstalledStaticWeb(_, StaticNetwork::PublicEgress(_)),
+                Some(_)
+            ) | (
+                BootPurpose::InstalledStaticWeb(_, StaticNetwork::RestrictedOrigin),
+                None
+            )
+        );
+        if generation == [0; 16] || !consistent {
+            return Err(InvalidPath);
+        }
+        let mut plan = self.plan()?;
+        if public_dns.is_some() {
+            let nic = plan
+                .args
+                .iter_mut()
+                .find(|arg| arg.as_str() == "virtio-net-pci,netdev=arxnet0")
+                .ok_or(InvalidPath)?;
+            nic.push_str(",mac=52:54:00:12:34:56");
+        }
+        plan.args.extend([
+            "-fw_cfg".into(),
+            format!(
+                "name={},string={}",
+                arx_guest::static_origin::FW_CFG,
+                public_dns.map_or_else(
+                    || hex::encode(generation),
+                    |dns| format!("{}:{dns}", hex::encode(generation))
+                )
+            ),
+        ]);
+        Ok(plan)
+    }
+
     fn plan_with_medium<'a>(
         &'a self,
         medium: Option<&'a Artifact>,
@@ -1085,6 +1127,31 @@ mod tests {
         assert!(recipe.plan().is_err());
         recipe.disk_header = qualified_header;
         assert_eq!(recipe.plan().unwrap().kind(), PlanKind::PublicEgressBoot);
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let resolver = "8.8.8.8".parse().unwrap();
+            assert!(recipe.provision_static([0; 16], Some(resolver)).is_err());
+            assert!(recipe.provision_static([1; 16], None).is_err());
+            let production = recipe.provision_static([1; 16], Some(resolver)).unwrap();
+            let expected = format!(
+                "name={},string={}:8.8.8.8",
+                arx_guest::static_origin::FW_CFG,
+                "01".repeat(16)
+            );
+            assert!(
+                production
+                    .args()
+                    .windows(2)
+                    .any(|pair| pair == ["-fw_cfg", &expected])
+            );
+            assert!(
+                production
+                    .args()
+                    .iter()
+                    .any(|arg| arg == "virtio-net-pci,netdev=arxnet0,mac=52:54:00:12:34:56")
+            );
+            assert!(!recipe.plan().unwrap().args().contains(&expected));
+        }
 
         recipe.boot = BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::RestrictedOrigin);
         recipe.image = &image;

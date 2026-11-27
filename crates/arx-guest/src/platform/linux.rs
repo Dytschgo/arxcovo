@@ -22,6 +22,7 @@ use arx_guest::compose_backup::{
 use arx_guest::{MAX_SCRIPT, ScriptExecution, ScriptExecutor, ScriptOutcome, serve_with_compose};
 
 mod docker_trial;
+mod static_origin;
 
 const PORT: &str = "org.arxcovo.agent.0";
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
@@ -48,10 +49,12 @@ pub(crate) fn serve_virtio() -> Result<(), &'static str> {
         )
         .map_err(|_| "Compose trial bootstrap failed");
     }
-    let compose = match compose_finalized() {
-        Ok(false) => None,
-        Ok(true) => Some(qualify_compose().ok_or("Compose guest qualification failed")?),
-        Err(_) => return Err("Compose guest marker refused"),
+    let is_compose = compose_finalized().map_err(|_| "Compose guest marker refused")?;
+    static_origin::prepare(&port, is_compose).map_err(|_| "static origin refused")?;
+    let compose = if is_compose {
+        Some(qualify_compose().ok_or("Compose guest qualification failed")?)
+    } else {
+        None
     };
     // Design §3: the script runner shares the guest network namespace and has
     // no ingress-isolation witness for UID/GID 65534, so legacy scripts stay
@@ -3016,6 +3019,42 @@ mod compose_tests {
             run("/nonexistent/arx-docker", &[], TEST_HANG_GUARD),
             RunResult::LaunchFailed
         );
+    }
+
+    #[test]
+    fn static_origin_requires_all_docker_boot_conditions_before_admission() -> io::Result<()> {
+        let scratch = Scratch::new();
+        let units = scratch.0.join("units");
+        let run = scratch.0.join("run");
+        fs::create_dir(&units)?;
+        fs::create_dir(&run)?;
+        let units_handle = File::open(&units)?;
+        let run_handle = File::open(&run)?;
+        let blocked = units.join("docker.socket.d");
+        fs::write(&blocked, b"not a directory")?;
+
+        let admit = || {
+            static_origin::install_docker_boot_gate(
+                &units_handle,
+                run_handle.as_fd(),
+                effective_uid(),
+            )
+        };
+        assert!(admit().is_err());
+        assert!(!run.join("docker-admitted").exists());
+        assert_eq!(fs::read(&blocked)?, b"not a directory");
+
+        fs::remove_file(&blocked)?;
+        admit()?;
+        for unit in ["containerd.service", "docker.socket", "docker.service"] {
+            let config = units.join(format!("{unit}.d/90-arx-static-origin.conf"));
+            assert_eq!(
+                fs::read(config)?,
+                b"[Unit]\nConditionPathExists=/run/arx-static-origin/docker-admitted\n"
+            );
+        }
+        assert_eq!(fs::read(run.join("docker-admitted"))?, b"admitted\n");
+        Ok(())
     }
 
     struct Scratch(PathBuf);

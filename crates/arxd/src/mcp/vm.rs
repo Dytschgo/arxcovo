@@ -328,6 +328,8 @@ pub(crate) struct Supervisor {
     // TEST, A2 web and the separately selected Compose class share a page.
     recipes: [Option<Recipe>; 4],
     selected_static: Option<Result<selected_static::SelectedStatic, NativeRefusal>>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    static_runs: owned_worker::Registry<Arc<selected_static::Run>>,
     native_refusal: NativeRefusal,
     /// The runtime profile also serves the independent legacy candidate.
     runtime: Option<VmRuntimeProfile>,
@@ -546,6 +548,8 @@ impl Supervisor {
                 None,
             ],
             selected_static: None,
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            static_runs: Default::default(),
             native_refusal,
             runtime,
             publisher: Publication::default(),
@@ -939,6 +943,10 @@ impl Supervisor {
                 "static Compose recipe ID conflicts with an existing entry"
             );
             self.recipes[3] = Some((recipe.recipe_id, Some(recipe.recipe_sha256)));
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if let Some(web_digest) = selection.native_web_digest() {
+                self.recipes[1] = Some((WEB_RECIPE_ID, Some(web_digest)));
+            }
         }
         self.selected_static = Some(selected);
         Ok(())
@@ -1921,12 +1929,27 @@ impl VmInventory {
         request: Mutation,
         digest: Option<[u8; 32]>,
     ) -> Outcome<Value> {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if matches!(request.work, Work::Stop)
+            && let Some(selected) = self.supervisor.static_selection()
+            && self
+                .supervisor
+                .static_runs
+                .with_entry(request.id, |run| run.is_some())?
+        {
+            // A watch that has already retired cannot block an owned stop.
+            return selected.dispatch(self, gate, action, request);
+        }
         if let Some(reason) = self.supervisor.static_refusal() {
             return self.refuse(action, request.vm(), Fault::new(native_reason(reason)));
         }
         #[cfg(test)]
         if let Some(fixture) = &mut gate.fixture {
             return fixture.admit(self, action, request, digest);
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(selected) = self.supervisor.static_selection() {
+            return selected.dispatch(self, gate, action, request);
         }
         let _ = (gate, digest);
         self.refuse(
@@ -2020,6 +2043,13 @@ impl VmInventory {
                 return refuse(Refusal::NotReady);
             }
             let origin: Option<Origin> = supervisor.candidate().publication_origin(vm);
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            let origin = supervisor
+                .static_runs
+                .with_entry(vm, |run| run.and_then(|run| run.origin().cloned()))
+                .ok()
+                .flatten()
+                .or(origin);
             #[cfg(test)]
             let origin = gate
                 .fixture

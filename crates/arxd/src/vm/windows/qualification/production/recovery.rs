@@ -137,6 +137,44 @@ impl<'a> NativeRecovery<'a> {
         })
     }
 
+    /// The store lock excludes an earlier daemon, and the workspace lease and
+    /// exact media writer exclusions rule out a surviving writer. No path in
+    /// this proof can remove or replace a file.
+    pub(crate) fn with_static_release(
+        &self,
+        claim: crate::store::vm::static_vm::StaticRecovery,
+        deadline: Instant,
+        settle: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        let held = || -> Result<_, NativeRefusal> {
+            let path = NativeRefusal::PathCustodyUnverified;
+            self.files.origin(self.store, boot::marker()?)?;
+            let (scope, slots, evidence) = self
+                .store
+                .read_only(|db| crate::store::vm::static_vm::native::recovery(db, claim))
+                .map_err(|_| path)?
+                .ok_or(path)?;
+            let workspace = hold_workspace_under(
+                &self.production,
+                self.owner.sid(),
+                disposal::binding_from_scope(scope),
+            )?;
+            let [disk, vars] = [slots.disk, slots.vars].map(|slot| {
+                let index = usize::from(slot == slots.vars);
+                let pin = workspace.pin_slot(slot, evidence[index].identity, false)?;
+                if !has_exact_leaf(&pin.leaf, &disposal::leaf_name(slot))
+                    || !sink::held_private(&pin.leaf, self.owner.sid())
+                {
+                    return Err(path);
+                }
+                pin.reopen_without_writer().map_err(|_| path)
+            });
+            Ok((workspace, disk?, vars?))
+        };
+        let Ok(_held) = held() else { return false };
+        Instant::now() < deadline && settle()
+    }
+
     fn recover(
         &self,
         work: &CleanupWork,
@@ -288,6 +326,79 @@ impl ArtifactCustody for NativeRecovery<'_> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn static_restart_requires_exact_lease_and_writer_exclusions_without_deleting_media()
+    -> anyhow::Result<()> {
+        use crate::store::vm::{backup_owner_fixture, static_vm};
+        use rusqlite::params;
+        use std::fs::{self, OpenOptions};
+
+        let (root, store, target, generation) = backup_owner_fixture()?;
+        let path = |p: &std::path::Path, is_dir| {
+            PathPin::open(&local(p.to_str().unwrap()).unwrap(), is_dir, false).unwrap()
+        };
+        let production = path(root.path(), true);
+        let directory = root.path().join(hex::encode(generation));
+        fs::create_dir(&directory)?;
+        crate::dashboard::tests::set_owner_private(&directory);
+        let workspace = path(&directory, true);
+        let lease = directory.join(GENERATION_LEASE);
+        fs::write(&lease, [])?;
+        crate::dashboard::tests::set_owner_private(&lease);
+        let lease_id = path(&lease, false).identity;
+        let binding = WorkspaceBinding {
+            generation,
+            production: production.identity,
+            workspace: workspace.identity,
+            lease: lease_id,
+        };
+        let (slots, _) = store.transact(|db| {
+            db.execute(
+                "UPDATE vm_static_instances SET state=1 WHERE id=?1",
+                [target.vm],
+            )?;
+            Ok(static_vm::active_pair(db, "alice", target.vm)?.unwrap())
+        })?;
+        let leaves = [slots.disk, slots.vars].map(|slot| directory.join(disposal::leaf_name(slot)));
+        for (leaf, bytes) in leaves.iter().zip([b"disk", b"vars"]) {
+            fs::write(leaf, bytes)?;
+            crate::dashboard::tests::set_owner_private(leaf);
+        }
+        let file_ids = leaves.each_ref().map(|leaf| path(leaf, false).identity);
+        let [claim]: [_; 1] = store.transact(|db| {
+            for (slot, id) in [slots.disk, slots.vars].into_iter().zip(file_ids) {
+                db.execute(
+                    "UPDATE vm_artifacts SET volume_id=?1,directory_id=?2,file_id=?3 WHERE object_key=?4",
+                    params![id.volume.to_be_bytes(), workspace.identity.file, id.file, slot.key],
+                )?;
+            }
+            static_vm::native::bind(db, custody::scope(binding))?;
+            db.execute("UPDATE vm_static_instances SET state=2 WHERE id=?1", [target.vm])?;
+            static_vm::native::runtime_lost(db, target.vm, 100)?;
+            Ok(static_vm::recovery_claims(db)?.try_into().unwrap())
+        })?;
+        let guards = GenerationGuards::default();
+        let recovery = NativeRecovery::open(&store, root.path(), &guards).expect("private store");
+        let deadline = || Instant::now() + Duration::from_secs(2);
+        let owned = hold_workspace_under(&production, recovery.owner.sid(), binding)
+            .expect("owned workspace");
+        assert!(!recovery.with_static_release(claim, deadline(), &mut || panic!("live lease")));
+        drop(owned);
+        let writer = OpenOptions::new().write(true).open(&leaves[0])?;
+        assert!(!recovery.with_static_release(claim, deadline(), &mut || panic!("live writer")));
+        drop(writer);
+        assert!(recovery.with_static_release(claim, deadline(), &mut || {
+            assert!(OpenOptions::new().write(true).open(&leaves[1]).is_err());
+            store
+                .transact(|db| static_vm::settle_recovery(db, claim, true, 100))
+                .unwrap()
+        }));
+        assert_eq!(fs::read(&leaves[0])?, b"disk");
+        assert_eq!(fs::read(&leaves[1])?, b"vars");
+        assert!(lease.is_file());
+        Ok(())
+    }
 
     #[test]
     fn production_recovery_requires_token_user_on_the_exact_store() {

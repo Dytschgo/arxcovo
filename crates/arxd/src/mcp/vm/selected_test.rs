@@ -601,6 +601,15 @@ pub(super) struct TestCleanup<'a> {
 }
 
 impl ReaperRuntime for TestCleanup<'_> {
+    fn with_static_release(
+        &self,
+        claim: crate::store::vm::static_vm::StaticRecovery,
+        deadline: Instant,
+        settle: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        self.custody.with_static_release(claim, deadline, settle)
+    }
+
     fn quiesce(&self, work: &CleanupWork, join_by: Instant) -> Quiesced {
         let supervisor = self.supervisor;
         let vm = work.kind.subject();

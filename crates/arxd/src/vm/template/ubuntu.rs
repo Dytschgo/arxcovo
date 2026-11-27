@@ -421,7 +421,7 @@ chmod 0600 "$file"
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
 const TEST_RECIPE_DIGEST_BUILD_ID: Id = [0; 16];
 
-fn nocloud_meta(build_id: Id) -> String {
+pub(super) fn nocloud_meta(build_id: Id) -> String {
     format!(
         "instance-id: arx-install-{}\nlocal-hostname: arxcovo\n",
         hex::encode(build_id),

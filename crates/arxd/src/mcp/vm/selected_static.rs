@@ -5,6 +5,11 @@ use super::selected_test::SelectedTest;
 use super::*;
 use crate::vm::qualification_record::{Hash, RecipeIdentity, VerifiedDockerEvidence};
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod native;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(super) use native::Run;
+
 pub(super) struct SelectedStatic(Source);
 
 enum Source {

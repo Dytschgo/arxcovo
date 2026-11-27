@@ -109,7 +109,7 @@ CREATE TABLE vm_disk_claims (
 ) STRICT;
 PRAGMA user_version=5;";
 
-const VM_SCHEMA_VERSION: u32 = 17;
+const VM_SCHEMA_VERSION: u32 = 18;
 
 // Activity IDs also serve as audit order and as references from cleanup and
 // tombstone rows. Copy them verbatim and carry the AUTOINCREMENT high-water.
@@ -571,6 +571,9 @@ impl VmStore {
         }
         if version < 17 {
             tx.execute_batch(native::recovery::MIGRATE_V17)?;
+        }
+        if version < 18 {
+            tx.execute_batch(static_vm::MIGRATE_V18)?;
         }
         recover(&tx, now)?;
         check_size(&tx)?;
@@ -3309,6 +3312,7 @@ mod tests {
             )?
             .unwrap();
             compose::settle_backup_failed(db, &intent, "interrupted", true, false, NOW)?;
+            db.execute_batch(static_vm::DROP_V18)?;
             db.execute_batch(
                 "DROP TRIGGER vm_native_writer_reservation; DROP TABLE vm_native_writer;
                  DROP TRIGGER vm_native_artifact_identity;
@@ -5036,6 +5040,64 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn native_static_recovery_keeps_committed_pair_volume_and_backup_across_reopen() -> Result<()> {
+        let (dir, store, target, generation) = backup_owner_fixture()?;
+        let vm = target.vm;
+        let identity = |file| FileIdentity {
+            volume: 0,
+            file: [file; 16],
+        };
+        let scope = native::Scope {
+            generation,
+            production: identity(0xaa),
+            workspace: identity(0xdd),
+            lease: identity(0xcc),
+        };
+        store.transact(|db| {
+            // Existing rows carry no implicit native writer protocol.
+            assert!(static_vm::native::custody(db, "alice", vm, StaticState::Running)?.is_none());
+            db.execute("UPDATE vm_static_instances SET state=1 WHERE id=?1", [vm])?;
+            db.execute("UPDATE vm_artifacts SET directory_id=?2 WHERE generation_id=?1",
+                params![generation, scope.workspace.file])?;
+            static_vm::native::bind(db, scope)?;
+            let before = static_vm::native::custody(db, "alice", vm, StaticState::Stopped)?;
+            assert_eq!(before.unwrap().0, scope);
+            assert!(static_vm::native::custody(db, "bob", vm, StaticState::Stopped)?.is_none());
+            assert!(db.execute("UPDATE vm_static_custody SET lease=?1", [[0xbb_u8; 16]]).is_err());
+            db.execute(
+                "INSERT INTO vm_compose_backups
+                 (id,operation_id,principal,vm,project,generation,boot,revision,volume,database,state,
+                  host_staging_charge,guest_staging_charge,retained_charge,size_bytes,sha256,created_ms,settled_ms)
+                 VALUES(?1,?2,'alice',?3,?4,?5,1,1,'data','app.sqlite3','settled',0,0,4,4,?6,?7,?7)",
+                params![[1_u8; 16], [2_u8; 16], vm, target.project, generation, [3_u8; 32], NOW],
+            )?;
+            db.execute("UPDATE vm_static_instances SET state=2 WHERE id=?1", [vm])?;
+            static_vm::native::runtime_lost(db, vm, NOW)?;
+            Ok(())
+        })?;
+        drop(store);
+
+        let store = VmStore::open(dir.path(), NOW)?;
+        store.transact(|db| {
+            let [claim] = static_vm::recovery_claims(db)?.try_into().unwrap();
+            assert!(static_vm::native::recovery(db, static_vm::StaticRecovery {
+                generation: [4; 16], ..claim
+            })?.is_none());
+            let held = static_vm::native::recovery(db, claim)?.unwrap();
+            assert_eq!(held.0, scope);
+            assert!(!static_vm::settle_recovery(db, claim, false, NOW)?);
+            assert_eq!(static_vm::native::recovery(db, claim)?, Some(held));
+            assert!(static_vm::settle_recovery(db, claim, true, NOW)?);
+            assert_eq!(static_vm::native::custody(db, "alice", vm, StaticState::Stopped)?, Some(held));
+            for table in ["vm_compose_volumes", "vm_compose_backups"] {
+                assert_eq!(count(db, &format!("SELECT count(*) FROM {table} WHERE vm=?1"), [vm])?, 1);
+            }
+            assert_eq!(count(db, "SELECT count(*) FROM vm_compose_backups WHERE state='settled' AND size_bytes=4 AND sha256=?1", [[3_u8; 32]])?, 1);
+            Ok(())
+        })
     }
 
     #[test]

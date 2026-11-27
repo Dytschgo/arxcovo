@@ -135,6 +135,22 @@ impl IsoPoolManifest<'_> {
     }
 }
 
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+pub(crate) fn rebind_seed(seed: &[u8], generation: Id) -> Result<Vec<u8>, RecipeError> {
+    if generation == [0; 16] {
+        return Err(RecipeError::Unqualified);
+    }
+    let mut files = cidata_files(seed).ok_or(RecipeError::Unqualified)?;
+    let meta = super::ubuntu::nocloud_meta(generation);
+    files[5] = meta.as_bytes();
+    let mut output = Vec::new();
+    Image::new(files)
+        .ok_or(RecipeError::Unqualified)?
+        .write(&mut output)
+        .map_err(|error| RecipeError::Write(error.kind()))?;
+    Ok(output)
+}
+
 fn valid_token(value: &str, max: usize, allowed: impl Fn(u8) -> bool) -> bool {
     (1..=max).contains(&value.len()) && value.bytes().all(allowed)
 }
@@ -297,6 +313,10 @@ impl<'a> UbuntuWebRecipe<'a> {
     /// Run on a detached verification boot, in addition to the base health
     /// contract. This inspects the inert configuration without a private key.
     pub fn detached_health(&self) -> String {
+        self.detached_health_with_packages(self.package_checks("").trim_end())
+    }
+
+    fn detached_health_with_packages(&self, verify: &str) -> String {
         let mut hashes = String::new();
         for (path, bytes) in [
             ("nginx.conf", NGINX_CONFIG),
@@ -312,20 +332,35 @@ impl<'a> UbuntuWebRecipe<'a> {
         }
         DETACHED_PROFILE
             .replace("{pins}", hashes.trim_end())
-            .replace("{verify}", self.package_checks("").trim_end())
+            .replace("{verify}", verify)
+    }
+
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    pub(crate) fn detached_checks(&self) -> Vec<String> {
+        let mut checks = vec![super::ubuntu::DETACHED_HEALTH.to_owned()];
+        checks.extend(self.manifest.packages.chunks(8).map(|packages| {
+            let verify = packages
+                .iter()
+                .map(|package| Self::package_check(package, ""))
+                .collect::<String>();
+            self.detached_health_with_packages(verify.trim_end())
+        }));
+        checks
     }
 
     fn package_checks(&self, root: &str) -> String {
         self.manifest
             .packages
             .iter()
-            .map(|package| {
-                VERIFY_LINE
-                    .replace("{root}", root)
-                    .replace("{name}", package.name)
-                    .replace("{version}", package.version)
-            })
+            .map(|package| Self::package_check(package, root))
             .collect()
+    }
+
+    fn package_check(package: &PoolPackage<'_>, root: &str) -> String {
+        VERIFY_LINE
+            .replace("{root}", root)
+            .replace("{name}", package.name)
+            .replace("{version}", package.version)
     }
 }
 
@@ -680,4 +715,87 @@ fn cidata_reader_follows_relocated_root_and_rejects_differing_extent_copies() {
     assert_eq!(cidata_files(&seed), Some(files));
     seed[root_record + 6] ^= 1;
     assert_eq!(cidata_files(&seed), None);
+}
+
+#[cfg(test)]
+mod static_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn static_seed_rebinds_metadata_and_preserves_other_installer_bytes() {
+        let files = [b"a", b"b", b"c", b"d", b"e", b"f", b"g"].map(<[u8; 1]>::as_slice);
+        let mut seed = Vec::new();
+        Image::new(files).unwrap().write(&mut seed).unwrap();
+        assert!(rebind_seed(&seed, [0; 16]).is_err());
+        assert!(rebind_seed(b"invalid media", [23; 16]).is_err());
+
+        let rebound = rebind_seed(&seed, [23; 16]).unwrap();
+        let metadata = super::super::ubuntu::nocloud_meta([23; 16]);
+        let mut expected = files;
+        expected[5] = metadata.as_bytes();
+        assert_eq!(cidata_files(&rebound), Some(expected));
+        assert_eq!(cidata_files(&seed), Some(files));
+    }
+
+    #[test]
+    fn static_web_health_keeps_every_package_check_within_the_guest_script_bound() {
+        let base = UbuntuRecipe::default();
+        let names = (0..MAX_PACKAGES)
+            .map(|n| format!("package-{n:02}-{}", "x".repeat(45)))
+            .collect::<Vec<_>>();
+        let version = format!("1.0+{}", "a".repeat(120));
+        let artifact = ArtifactPin {
+            size: 1,
+            sha256: [1; 32],
+        };
+        let packages = names
+            .iter()
+            .map(|name| PoolPackage {
+                name,
+                version: &version,
+                relative_path: "pool/package.deb",
+                artifact,
+            })
+            .collect::<Vec<_>>();
+        let manifest = IsoPoolManifest {
+            iso: AssetPin {
+                length: 1,
+                sha256: UbuntuRecipe::ISO_SHA256,
+            },
+            signed_metadata: artifact,
+            packages: &packages,
+        };
+        let recipe = UbuntuWebRecipe {
+            base: &base,
+            manifest: &manifest,
+            digest: [1; 32],
+        };
+        let checks = recipe.detached_checks();
+        assert_eq!(checks[0], super::super::ubuntu::DETACHED_HEALTH);
+        assert!(checks.len() > 2);
+        let scripts = &checks[1..];
+        assert!(scripts.iter().all(|script| {
+            script.len() <= arx_guest::MAX_SCRIPT
+                && script.contains("verify_package()")
+                && script.contains("sha256sum --check --strict")
+        }));
+        for name in &names {
+            let check = format!("verify_package \"\" '{name}' '{version}'");
+            assert_eq!(
+                scripts
+                    .iter()
+                    .filter(|script| script.contains(&check))
+                    .count(),
+                1,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            scripts
+                .iter()
+                .map(|script| script.matches("verify_package \"\" '").count())
+                .sum::<usize>(),
+            MAX_PACKAGES
+        );
+    }
 }

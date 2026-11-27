@@ -27,21 +27,42 @@ pub(super) async fn probe(
     remaining: Duration,
     cancel: &Shutdown,
 ) -> Result<(), NativeRefusal> {
+    probe_exact(
+        port,
+        &challenge.origin_name(),
+        &challenge.origin_health(),
+        der,
+        der,
+        remaining,
+        cancel,
+    )
+    .await
+}
+
+pub(in crate::vm::windows::qualification) async fn probe_exact(
+    port: u16,
+    name: &str,
+    body: &str,
+    ca: &[u8],
+    der: &[u8],
+    remaining: Duration,
+    cancel: &Shutdown,
+) -> Result<(), NativeRefusal> {
     if cancel.is_cancelled() || remaining.is_zero() {
         return Err(REFUSED);
     }
     let leaf = CertificateDer::from(der.to_vec());
-    let name = challenge.origin_name();
-    let server = ServerName::try_from(name.clone()).map_err(|_| REFUSED)?;
+    let server = ServerName::try_from(name.to_owned()).map_err(|_| REFUSED)?;
     let mut roots = RootCertStore::empty();
-    roots.add(leaf.clone()).map_err(|_| REFUSED)?;
+    roots
+        .add(CertificateDer::from(ca.to_vec()))
+        .map_err(|_| REFUSED)?;
     let config =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(|_| REFUSED)?
             .with_root_certificates(roots)
             .with_no_client_auth();
-    let body = challenge.origin_health();
     let request =
         format!("GET {ORIGIN_HEALTH_PATH} HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n");
     let check = async {

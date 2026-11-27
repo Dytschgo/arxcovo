@@ -1382,6 +1382,8 @@ impl FinalizedPair {
 }
 
 mod build;
+mod static_runtime;
+pub(crate) use static_runtime::{StaticMachine, StaticRecipe};
 mod clone;
 mod selected;
 #[cfg(test)]
