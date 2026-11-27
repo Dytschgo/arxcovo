@@ -383,8 +383,12 @@ impl Run {
             }
         }
         self.cancel.cancel();
-        self.retry.notify_one();
         Ok(())
+    }
+
+    /// Wake settlement once the caller has released the stop admission gate.
+    pub(super) fn notify_retry(&self) {
+        self.retry.notify_one();
     }
 
     fn project(&self, supervisor: &Supervisor, mut row: Value) -> Value {
@@ -455,7 +459,11 @@ impl VmInventory {
 
     /// This exact route runs under the foreground gate before the generic
     /// lifecycle state check and before the fresh-admission shutdown fence.
-    pub(super) fn stop_subject(&self, args: Option<&Map<String, Value>>) -> Option<Outcome<Value>> {
+    /// On success, the caller wakes the owner after releasing the gate.
+    pub(super) fn stop_subject(
+        &self,
+        args: Option<&Map<String, Value>>,
+    ) -> Option<Outcome<(Value, Arc<Run>)>> {
         let mut args = Args::new(args?.clone());
         let request = Mutation::parse(ToolName::Stop, &mut args).ok()?;
         let owner = match self
@@ -512,9 +520,9 @@ impl VmInventory {
                             );
                         }
                     }
-                    OwnedStop::Replay => owner.retry.notify_one(),
+                    OwnedStop::Replay => {}
                 }
-                Ok(receipt(operation, None))
+                Ok((receipt(operation, None), owner))
             }
             Err(reason) => self.refuse(action, request.vm(), reason.into()),
         })())

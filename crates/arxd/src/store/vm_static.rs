@@ -399,7 +399,7 @@ pub(crate) fn name_occupied(db: &Connection, name: &StaticName) -> Result<bool> 
     )? != 0)
 }
 
-#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+#[cfg(test)]
 pub(crate) fn source(
     db: &Connection,
     template: Id,
@@ -443,8 +443,7 @@ pub(crate) fn source(
         .optional()?)
 }
 
-#[cfg(any(test, all(windows, target_arch = "x86_64")))]
-#[allow(dead_code, reason = "consumed by the Part B static create admission")]
+#[cfg(test)]
 pub(crate) fn compose_source(
     db: &Connection,
     template: Id,

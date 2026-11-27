@@ -20,6 +20,7 @@ use crate::vm::{
         ubuntu_web::{ExpectedIso, IsoPoolManifest, IsoPoolVerifier, PROFILE_PIN, UbuntuWebRecipe},
     },
 };
+use std::sync::Arc;
 
 const REFUSAL: NativeRefusal = NativeRefusal::QualificationMissing;
 const MAX_METADATA: u64 = 64 * 1024 * 1024;
@@ -29,20 +30,84 @@ const MAX_GUEST: u64 = 64 * 1024 * 1024;
 const MAX_FIRMWARE: u64 = 16 * 1024 * 1024;
 const MAX_KEYRING: u64 = 1024 * 1024;
 
-pub(super) struct StaticDossier {
-    _root: foreground::ReadDossier,
+/// Read-only handles acquired before foreground store composition. The
+/// pinned seal digest alone grants no qualification or runtime authority.
+pub(crate) struct PreparedStaticDossier {
+    root: Arc<foreground::ReadDossier>,
+    enrollment: PathPin,
+    _seal: File,
+    selection: DockerSelection,
+}
+
+impl PreparedStaticDossier {
+    pub(crate) fn hold(
+        path: &LocalPath,
+        expected: &crate::config::ExpectedVmStore,
+        enrollment: &LocalPath,
+        selection: DockerSelection,
+    ) -> Result<Self, NativeRefusal> {
+        let custody = NativeRefusal::PathCustodyUnverified;
+        let user = current_user().map_err(|_| NativeRefusal::IdentityUnverified)?;
+        let owner = user_sid(&user);
+        let pin = PathPin::open(path, true, false)?;
+        expected.verify_directory(&pin.leaf).map_err(|_| custody)?;
+        if !sink::held_private_protected(&pin.leaf, owner) {
+            return Err(custody);
+        }
+        let enrollment = PathPin::open(enrollment, false, false)?;
+        if !sink::held_private(&enrollment.leaf, owner) {
+            return Err(custody);
+        }
+        docker_trial::require_enrollment(
+            &read_bounded(&enrollment.leaf, MAX_ENROLLMENT_BYTES).map_err(|_| REFUSAL)?,
+        )?;
+        let root = Arc::new(foreground::ReadDossier::open(pin, owner)?);
+        let seal = root.seal()?;
+        let length = seal.metadata().map_err(|_| REFUSAL)?.len();
+        let bytes =
+            crate::vm::qualification_record::read_bounded(&seal, length).map_err(|_| REFUSAL)?;
+        if digest(&bytes) != selection.seal_sha256 {
+            return Err(REFUSAL);
+        }
+        let held = Self {
+            root,
+            enrollment,
+            _seal: seal,
+            selection,
+        };
+        held.verify()?;
+        Ok(held)
+    }
+
+    pub(crate) fn verify(&self) -> Result<(), NativeRefusal> {
+        let custody = NativeRefusal::PathCustodyUnverified;
+        self.root.verify().map_err(|_| custody)?;
+        inventory::binding(&self.enrollment).map_err(|_| custody)?;
+        require_held_private(&self.enrollment.leaf).map_err(|_| custody)
+    }
+
+    pub(crate) fn select(
+        &self,
+        fresh: Result<DockerFresh<'_>, NativeRefusal>,
+    ) -> Result<StaticDossier, NativeRefusal> {
+        self.verify()?;
+        StaticDossier::open(self.root.clone(), &self.selection, &fresh?)
+    }
+}
+
+pub(crate) struct StaticDossier {
+    _root: Arc<foreground::ReadDossier>,
     _rows: Vec<File>,
-    pub(super) evidence: VerifiedDockerEvidence,
+    pub(crate) evidence: VerifiedDockerEvidence,
+    pub(crate) seal_sha256: Hash,
 }
 
 impl StaticDossier {
     pub(super) fn open(
-        path: &LocalPath,
-        owner: PSID,
+        root: Arc<foreground::ReadDossier>,
         selection: &DockerSelection,
         fresh: &DockerFresh<'_>,
     ) -> Result<Self, NativeRefusal> {
-        let root = foreground::ReadDossier::open(PathPin::open(path, true, false)?, owner)?;
         let (evidence, rows) = root
             .read_selected_docker(selection, fresh)
             .map_err(|_| REFUSAL)?;
@@ -50,6 +115,7 @@ impl StaticDossier {
             _root: root,
             _rows: rows,
             evidence,
+            seal_sha256: selection.seal_sha256,
         })
     }
 }

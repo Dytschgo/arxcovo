@@ -2,6 +2,7 @@
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod native_run;
 mod owned_worker;
+mod selected_static;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod selected_test;
 mod vault_test;
@@ -324,8 +325,9 @@ pub(crate) struct Supervisor {
     cancel: Shutdown,
     cursor_key: hmac::Key,
     host_id: Id,
-    // Two TEST recipes and the independent A2 web recipe share one page.
-    recipes: [Option<Recipe>; 3],
+    // TEST, A2 web and the separately selected Compose class share a page.
+    recipes: [Option<Recipe>; 4],
+    selected_static: Option<Result<selected_static::SelectedStatic, NativeRefusal>>,
     native_refusal: NativeRefusal,
     /// The runtime profile also serves the independent legacy candidate.
     runtime: Option<VmRuntimeProfile>,
@@ -414,6 +416,12 @@ impl Supervisor {
         let policy = profile.policy();
         let recipe = profile.recipe()?;
         custody.verify()?;
+        let selected_static = profile
+            .has_static_compose()
+            .then(|| selected_static::SelectedStatic::open(&custody));
+        if selected_static.is_some() {
+            custody.verify()?;
+        }
         let mut supervisor = Self::new(
             root,
             policy,
@@ -437,7 +445,9 @@ impl Supervisor {
                 crate::vm::compose_secrets::Dpapi::new(custody.clone()),
             ));
         }
-        if !profile.compose_releases.is_empty() {
+        // Static release/backup enrollment waits for the selected live
+        // runtime. The legacy profile retains its existing enrollment path.
+        if selected_static.is_none() && !profile.compose_releases.is_empty() {
             let enrollments = profile
                 .compose_releases
                 .into_iter()
@@ -459,6 +469,9 @@ impl Supervisor {
         gate.publish_profile = profile.publication.map(Arc::from);
         state.recipes[1] = Some((WEB_RECIPE_ID, None));
         state.recipes[2].get_or_insert((Controller::windows_recipe_id(), None));
+        if let Some(selected) = selected_static {
+            state.install_static_selection(selected)?;
+        }
         Ok(supervisor)
     }
 
@@ -507,7 +520,13 @@ impl Supervisor {
             cancel: Shutdown::default(),
             cursor_key: hmac::Key::new(hmac::HMAC_SHA256, &secret),
             host_id,
-            recipes: [recipe.map(|(id, digest)| (id, Some(digest))), None, None],
+            recipes: [
+                recipe.map(|(id, digest)| (id, Some(digest))),
+                None,
+                None,
+                None,
+            ],
+            selected_static: None,
             native_refusal,
             runtime,
             publisher: Publication::default(),
@@ -879,6 +898,38 @@ impl Supervisor {
                 task.abort();
                 Err(unconfirmed())
             }
+        }
+    }
+
+    fn install_static_selection(
+        &mut self,
+        selected: Result<selected_static::SelectedStatic, NativeRefusal>,
+    ) -> anyhow::Result<()> {
+        if let Ok(selection) = &selected {
+            let recipe = selection.recipe();
+            anyhow::ensure!(
+                !self
+                    .recipes
+                    .iter()
+                    .flatten()
+                    .any(|(id, _)| *id == recipe.recipe_id),
+                "static Compose recipe ID conflicts with an existing entry"
+            );
+            self.recipes[3] = Some((recipe.recipe_id, Some(recipe.recipe_sha256)));
+        }
+        self.selected_static = Some(selected);
+        Ok(())
+    }
+
+    fn static_selection(&self) -> Option<&selected_static::SelectedStatic> {
+        self.selected_static.as_ref()?.as_ref().ok()
+    }
+
+    fn static_refusal(&self) -> Option<NativeRefusal> {
+        match self.selected_static.as_ref()? {
+            Ok(selected) if selected.buildable() => None,
+            Ok(_) => Some(NativeRefusal::NetworkFenceUnverified),
+            Err(reason) => Some(*reason),
         }
     }
 
@@ -1502,7 +1553,10 @@ impl VmInventory {
         if request.name == ToolName::Stop.name()
             && let Some(result) = self.stop_subject(request.arguments.as_ref())
         {
-            return result;
+            let (reply, owner) = result?;
+            drop(gate);
+            owner.notify_retry();
+            return Ok(reply);
         }
         if gate.closed || self.supervisor.fenced.load(Ordering::SeqCst) {
             return Err(SHUTDOWN);
@@ -1680,9 +1734,13 @@ impl VmInventory {
                 );
             }
             Work::StaticCreate(_) => {
-                if let Err(reason) =
-                    controller.foreground_static_template(request.id, web_digest)?
-                {
+                if let Err(reason) = controller.foreground_static_template(
+                    request.id,
+                    web_digest,
+                    self.supervisor
+                        .static_selection()
+                        .map(|selected| selected.recipe().recipe_sha256),
+                )? {
                     return self.refuse(action, None, reason.into());
                 }
                 None
@@ -1755,6 +1813,19 @@ impl VmInventory {
                 Precheck::NotReady => NOT_READY,
             };
             return self.refuse(action, request.vm(), reason);
+        }
+        if let Some(reason) = self.supervisor.static_refusal() {
+            let static_effect = match request.work {
+                Work::StaticCreate(_) => true,
+                Work::Build => self.supervisor.recipes[3].is_some_and(|(id, _)| id == request.id),
+                Work::Start | Work::Stop | Work::Script(..) => !controller
+                    .foreground_static_rows(&self.principal, Some(request.id), None, 1)?
+                    .is_empty(),
+                _ => false,
+            };
+            if static_effect {
+                return self.refuse(action, request.vm(), Fault(native_reason(reason)));
+            }
         }
         // A current TEST run owner serves its scripts on the owned channel.
         #[cfg(all(windows, target_arch = "x86_64"))]
@@ -1855,6 +1926,9 @@ impl VmInventory {
             };
             if !profile.target(supervisor.host_id, &row.name) {
                 return refuse(Refusal::PublishTargetMismatch);
+            }
+            if let Some(reason) = supervisor.static_refusal() {
+                return self.refuse(action, Some(vm), Fault(native_reason(reason)));
             }
             if row.state != StaticState::Running {
                 return refuse(Refusal::NotReady);
@@ -2088,7 +2162,16 @@ impl VmInventory {
             .as_deref()
             .map(|value| self.decode_cursor(tool, value))
             .transpose()?;
-        let capability = self.supervisor.capability(gate);
+        let mut capability = self.supervisor.capability(gate);
+        if tool == ToolName::Catalog {
+            if let Some(reason) = self.supervisor.static_refusal() {
+                capability["static_compose"] =
+                    json!({"available":false,"reason":native_reason(reason)});
+            }
+            if let Some(selected) = self.supervisor.static_selection() {
+                capability["selected_static_qualification"] = selected.catalog();
+            }
+        }
         let controller = &self.supervisor.controller;
         let available = capability["available"] == true;
         let recipes = self.supervisor.recipes.map(|entry| entry.map(|(id, _)| id));
@@ -2102,13 +2185,20 @@ impl VmInventory {
                 )?
                 .into_iter()
                 .map(|entry| {
-                    let buildable = available
-                        && self
-                            .supervisor
-                            .recipes
-                            .iter()
-                            .flatten()
-                            .any(|(id, digest)| *id == entry.id && digest.is_some());
+                    let buildable =
+                        if self.supervisor.recipes[3].is_some_and(|(id, _)| id == entry.id) {
+                            self.supervisor
+                                .static_selection()
+                                .is_some_and(|selected| selected.buildable())
+                        } else {
+                            available
+                                && self
+                                    .supervisor
+                                    .recipes
+                                    .iter()
+                                    .flatten()
+                                    .any(|(id, digest)| *id == entry.id && digest.is_some())
+                        };
                     Ok(((entry.kind, entry.id), catalog_row(&entry, buildable)?))
                 })
                 .collect::<Outcome<_>>()?
@@ -4136,6 +4226,7 @@ pub(crate) mod tests {
     }
 
     pub(super) struct Fixture {
+        static_compose: bool,
         jobs: JoinSet<Result<()>>,
         snapshot_jobs: JoinSet<Result<()>>,
         live: Arc<Mutex<Live>>,
@@ -4204,6 +4295,7 @@ pub(crate) mod tests {
     impl Fixture {
         fn new(root: &Path, origins: Arc<Mutex<HashMap<Id, Arc<FixtureOrigin>>>>) -> Self {
             Self {
+                static_compose: false,
                 jobs: JoinSet::new(),
                 snapshot_jobs: JoinSet::new(),
                 live: Arc::new(Mutex::new(Live::default())),
@@ -4441,7 +4533,8 @@ pub(crate) mod tests {
             let (operation, vm) = match work {
                 Work::Build => {
                     let recipe = hex::encode(id);
-                    let web = id == WEB_RECIPE_ID;
+                    let web = id == WEB_RECIPE_ID
+                        || inventory.supervisor.recipes[3].is_some_and(|(recipe, _)| recipe == id);
                     let windows = id == Controller::windows_recipe_id();
                     let snapshot_image = self.snapshot_test_media;
                     let (retained, transient) = if web {
@@ -4585,7 +4678,13 @@ pub(crate) mod tests {
                         name,
                         id,
                         (golden, proof),
-                        WEB_DIGEST,
+                        (
+                            WEB_DIGEST,
+                            inventory
+                                .supervisor
+                                .static_selection()
+                                .and_then(|selected| selected.fixture_evidence()),
+                        ),
                         disk,
                         self.host,
                         RESOURCES,
@@ -5857,6 +5956,14 @@ pub(crate) mod tests {
             fixture.script_hold = Some(hold_script.clone());
             fixture.fail_cancelled = fail_cancelled;
             configure(&mut fixture);
+            if fixture.static_compose {
+                Arc::get_mut(&mut supervisor)
+                    .unwrap()
+                    .install_static_selection(Ok(
+                        selected_static::FixtureStaticQualification::select(),
+                    ))
+                    .unwrap();
+            }
             if fixture.windows_recipe {
                 Arc::get_mut(&mut supervisor).unwrap().recipes[2] = Some((
                     Controller::windows_recipe_id(),
@@ -13542,6 +13649,131 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn static_compose_network_fence_unverified_closes_foreground_admission() {
+        use rusqlite::params;
+
+        let temp = crate::service::application::tests::private_temp();
+        let mut supervisor = Supervisor::new(
+            temp.path(),
+            VmPolicy::default(),
+            ForegroundClock {
+                utc: Some(Arc::new(AtomicI64::new(UTC))),
+            },
+            Some(RECIPE),
+            NativeRefusal::QualificationMissing,
+            None,
+        )
+        .unwrap();
+        let state = Arc::get_mut(&mut supervisor).unwrap();
+        state.recipes[1] = Some((WEB_RECIPE_ID, Some(WEB_DIGEST)));
+        state
+            .install_static_selection(Err(NativeRefusal::NetworkFenceUnverified))
+            .unwrap();
+
+        let vm = [2_u8; 16];
+        let template = [3_u8; 16];
+        supervisor.controller.store_for_test().transact(|db| {
+            db.execute(
+                "INSERT INTO vm_templates VALUES(?1,1,?2,zeroblob(32),zeroblob(32),4096)",
+                params![template, WEB_DIGEST],
+            )?;
+            db.execute(
+                "INSERT INTO vm_static_instances(id,name,principal,host,template,
+                    source_generation,recipe_digest,disk_digest,vars_digest,state,persistent,staging)
+                 VALUES(?1,'web-site','alice',?2,?3,zeroblob(16),?4,zeroblob(32),zeroblob(32),1,4096,0)",
+                params![vm, supervisor.host_id, template, WEB_DIGEST],
+            )?;
+            Ok(())
+        }).unwrap();
+        {
+            let mut gate = supervisor.lock().unwrap();
+            gate.allow_agent_public_sites = true;
+            gate.publish_profile =
+                Some(Arc::new(Profile::synthetic(supervisor.host_id, "web-site")));
+        }
+
+        let dispatch = |supervisor: &Arc<Supervisor>, tool, args| {
+            supervisor
+                .connection("alice".into())
+                .inventory()
+                .dispatch(request(tool, args), || false)
+        };
+        let refused = |supervisor: &Arc<Supervisor>, tool, args| {
+            assert_eq!(
+                dispatch(supervisor, tool, args).unwrap_err().0,
+                "network_fence_unverified",
+                "{tool}",
+            );
+        };
+        let compose = selected_static::FixtureStaticQualification::select().recipe();
+        let catalog = dispatch(&supervisor, "vm_catalog", json!({})).unwrap();
+        assert_eq!(
+            catalog["capability"]["static_compose"],
+            json!({"available":false,"reason":"network_fence_unverified"}),
+        );
+        assert!(
+            catalog["capability"]
+                .get("selected_static_qualification")
+                .is_none()
+        );
+        let compose_id = hex::encode(compose.recipe_id);
+        let entries = catalog["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry["recipe_id"] != compose_id));
+        let build = |n| json!({"recipe_id":compose_id,"request_id":key(n)});
+        assert_eq!(
+            dispatch(&supervisor, "vm_template_build", build(1))
+                .unwrap_err()
+                .0,
+            "not_found",
+        );
+
+        let args = |n| json!({"vm_id":hex::encode(vm),"request_id":key(n)});
+        refused(
+            &supervisor,
+            "static_vm_create",
+            json!({
+                "template_id":hex::encode(template),"name":"another-site","request_id":key(2),
+            }),
+        );
+        refused(&supervisor, "vm_start", args(3));
+        // Stop, script, and publish require a running row to reach their gate.
+        supervisor
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                db.execute("UPDATE vm_static_instances SET state=2 WHERE id=?1", [vm])?;
+                Ok(())
+            })
+            .unwrap();
+        refused(&supervisor, "vm_stop", args(4));
+        let mut script = args(5);
+        script["script"] = json!("exit 0");
+        refused(&supervisor, "vm_run_script", script);
+        refused(&supervisor, "publish_site", args(6));
+
+        // B1 never registers a native Compose recipe. Supply one only here
+        // to exercise the build guard after the known-recipe precheck.
+        Arc::get_mut(&mut supervisor).unwrap().recipes[3] =
+            Some((compose.recipe_id, Some(compose.recipe_sha256)));
+        refused(&supervisor, "vm_template_build", build(7));
+        supervisor
+            .controller
+            .store_for_test()
+            .read_only(|db| {
+                for table in ["vm_operations", "vm_publication", "vm_publication_hosts"] {
+                    assert_eq!(
+                        crate::store::vm::count(db, &format!("SELECT count(*) FROM {table}"), [])?,
+                        0,
+                        "{table}",
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn static_vm_extend_without_selected_test_is_not_found() {
         let temp = crate::service::application::tests::private_temp();
         let supervisor = Supervisor::new(
@@ -15539,14 +15771,55 @@ pub(crate) mod tests {
         let fake = Arc::new(crate::vm::runtime::publication::Fake::default());
         fake.credential.store(true, SeqCst);
         fake.multi_host.store(true, SeqCst);
+        let compose_recipe = h
+            .supervisor()
+            .static_selection()
+            .map(|selected| selected.recipe());
+        let recipe = compose_recipe.map_or(WEB_RECIPE_ID, |recipe| recipe.recipe_id);
+        if let Some(selected) = compose_recipe {
+            let catalog = call(client, "vm_catalog", json!({})).await;
+            let id = hex::encode(recipe);
+            assert!(
+                catalog["entries"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({"recipe_id":id,"guest":"ubuntu","state":"buildable"}))
+            );
+            assert_eq!(
+                catalog["capability"]["selected_static_qualification"]["compose_recipe"],
+                json!({"recipe_id":id,"recipe_sha256":hex::encode(selected.recipe_sha256)}),
+            );
+        }
         let build = call(
             client,
             "vm_template_build",
-            json!({"recipe_id":hex::encode(WEB_RECIPE_ID), "request_id":key(key_base)}),
+            json!({"recipe_id":hex::encode(recipe), "request_id":key(key_base)}),
         )
         .await;
         h.hold_build.notify_one();
         let template = terminal(client, &build).await["template_id"].clone();
+        if compose_recipe.is_some() {
+            let reply = call(
+                client,
+                "vm_create",
+                json!({
+                    "template_id":template,"request_id":key(key_base + 3)
+                }),
+            )
+            .await;
+            assert_eq!(reply["reason"], "not_found", "{reply}");
+            h.supervisor()
+                .controller
+                .compose_store()
+                .read_only(|db| {
+                    assert_eq!(
+                        crate::store::vm::count(db, "SELECT count(*) FROM vm_instances", [])?,
+                        0
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
         let created = call(client, "static_vm_create",
             json!({"template_id":template,"name":profile.static_name(),"request_id":key(key_base + 2)})).await;
         let vm_id = terminal(client, &created).await["vm_id"].clone();
@@ -15638,7 +15911,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn multihost_policy_off_and_happy_path_single_connector_with_per_host_status() {
         use std::sync::atomic::Ordering::SeqCst;
-        let mut h = Harness::start_with_web(false, false, true).await;
+        let mut h = Harness::start_configured(false, false, false, |fixture| {
+            fixture.static_compose = true;
+        })
+        .await;
         let a = h.client(0).await;
         let host = h.supervisor().host_id;
         let zone = "b".repeat(32);
@@ -15676,6 +15952,23 @@ pub(crate) mod tests {
         assert_eq!(fake.starts.load(SeqCst), 0);
         assert_eq!(fake.posts.load(SeqCst), 0);
         assert!(fake.preflight_order.lock().unwrap().is_empty());
+
+        assert!(
+            h.supervisor()
+                .controller
+                .publication_intent()
+                .unwrap()
+                .is_none()
+        );
+        for (tool, reason) in [
+            ("static_vm_delete", "static_delete_forbidden"),
+            ("compose_project_delete", "static_backup_delete_forbidden"),
+            ("compose_volume_delete", "static_backup_delete_forbidden"),
+            ("compose_backup_delete", "static_backup_delete_forbidden"),
+        ] {
+            let reply = call(&a, tool, json!({"vm_id":vm})).await;
+            assert_eq!(reply["reason"], reason, "{tool}: {reply}");
+        }
 
         // Turn policy on and publish 2 hostnames on one connector Job.
         h.supervisor().gate.lock().unwrap().allow_agent_public_sites = true;
@@ -15831,6 +16124,14 @@ pub(crate) mod tests {
         assert_eq!(terminal(&a, &rev8).await["state"], "succeeded");
         assert_eq!(fake.deletes.load(SeqCst), 10);
         assert!(fake.host_records.lock().unwrap().is_empty());
+
+        assert!(
+            h.supervisor()
+                .controller
+                .publication_intent()
+                .unwrap()
+                .is_none()
+        );
 
         drop(a);
         h.shutdown().await.unwrap();

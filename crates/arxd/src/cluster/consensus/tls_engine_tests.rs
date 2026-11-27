@@ -257,6 +257,10 @@ async fn authenticated_sender_mismatch_and_assumed_founder_control() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
+    target_os = "macos",
+    ignore = "ADR 0056 macOS single-case quarantine: main run 45906354582 attempt 1 ([DIAG-3n] lag=288@738 ticks=10 cand=Cpu)"
+)]
+#[cfg_attr(
     target_os = "windows",
     ignore = "Windows whole-fixture quarantine: docs/adr/0024-windows-three-node-test-quarantine.md"
 )]
