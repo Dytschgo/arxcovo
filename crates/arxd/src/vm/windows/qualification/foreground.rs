@@ -223,6 +223,26 @@ impl ReadDossier {
         Ok(Self(pin))
     }
 
+    pub(super) fn verify(&self) -> Result<(), NativeRefusal> {
+        inventory::binding(&self.0)
+    }
+
+    pub(super) fn seal(&self) -> Result<File, NativeRefusal> {
+        self.verify()?;
+        self.open_file("qualification.json")
+            .map_err(|_| NativeRefusal::QualificationMissing)
+    }
+
+    fn open_file(&self, name: &str) -> Result<File, RunError> {
+        let file = open_relative(&self.0.leaf, name, Node::File, false, false)
+            .map_err(|_| RunError::Output)?;
+        let id = file_identity(&file, false).map_err(|_| RunError::Output)?.0;
+        if id.volume != self.0.identity.volume {
+            return Err(RunError::Output);
+        }
+        Ok(file)
+    }
+
     pub(super) fn read_selected(
         &self,
         selection: &Selection,
@@ -252,21 +272,12 @@ impl ReadDossier {
         ) -> Result<T, RunError>,
     ) -> Result<(T, Vec<File>), RunError> {
         inventory::binding(&self.0).map_err(|_| RunError::Output)?;
-        let open = |name: &str| {
-            let file = open_relative(&self.0.leaf, name, Node::File, false, false)
-                .map_err(|_| RunError::Output)?;
-            let id = file_identity(&file, false).map_err(|_| RunError::Output)?.0;
-            if id.volume != self.0.identity.volume {
-                return Err(RunError::Output);
-            }
-            Ok(file)
-        };
-        let seal = open("qualification.json")?;
+        let seal = self.open_file("qualification.json")?;
         let length = seal.metadata().map_err(|_| RunError::Output)?.len();
         let mut rows = Vec::with_capacity(records::FileKind::ALL.len() + 1);
         let verified = read(&seal, length, &mut |kind| {
             let name = kind.name();
-            let file = open(&name)?;
+            let file = self.open_file(&name)?;
             rows.push(file.try_clone().map_err(|_| RunError::Output)?);
             Ok(file)
         })?;

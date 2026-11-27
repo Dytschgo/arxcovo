@@ -1973,7 +1973,7 @@ impl<C: Clock> VmController<C> {
     pub(crate) fn foreground_catalog(
         &self,
         principal: &str,
-        recipes: [Option<Id>; 3],
+        recipes: [Option<Id>; 4],
         after: (u8, Id),
         limit: u32,
     ) -> Result<Vec<CatalogEntry>> {
@@ -1985,6 +1985,8 @@ impl<C: Clock> VmController<C> {
                    SELECT 1, ?6, NULL, NULL WHERE ?6 IS NOT NULL
                    UNION
                    SELECT 1, ?7, NULL, NULL WHERE ?7 IS NOT NULL
+                   UNION
+                   SELECT 1, ?8, NULL, NULL WHERE ?8 IS NOT NULL
                    UNION ALL
                    SELECT 2, b.template_id, b.recipe_id, t.guest FROM vm_build_intents b
                      JOIN vm_templates t ON t.id=b.template_id
@@ -1997,7 +1999,8 @@ impl<C: Clock> VmController<C> {
             )?;
             let rows = query.query_map(
                 params![
-                    recipes[0], principal, after.0, after.1, limit, recipes[1], recipes[2]
+                    recipes[0], principal, after.0, after.1, limit, recipes[1], recipes[2],
+                    recipes[3]
                 ],
                 |row| {
                     let kind = row.get(0)?;
@@ -2158,11 +2161,13 @@ impl<C: Clock> VmController<C> {
                         "SELECT EXISTS(SELECT 1 FROM vm_templates WHERE id=?1)",
                         [template],
                     )? != 0;
-                    return Ok(refused(if sealed {
-                        Ok(())
-                    } else {
-                        Err(Refusal::NotFound)
-                    }));
+                    return Ok(refused(
+                        if sealed && !store::static_vm::is_compose_template(db, template)? {
+                            Ok(())
+                        } else {
+                            Err(Refusal::NotFound)
+                        },
+                    ));
                 }
                 ForegroundSubject::Extend {
                     vm,
@@ -2345,9 +2350,15 @@ impl<C: Clock> VmController<C> {
     pub(crate) fn foreground_static_template(
         &self,
         template: Id,
-        digest: Option<[u8; 32]>,
+        web: Option<[u8; 32]>,
+        compose: Option<[u8; 32]>,
     ) -> Result<Result<(), Refusal>> {
         self.store.transact(|db| {
+            let selected = if store::static_vm::is_compose_template(db, template)? {
+                compose
+            } else {
+                web
+            };
             let recipe = db
                 .query_row(
                     "SELECT recipe_digest FROM vm_templates WHERE id=?1 AND guest=1",
@@ -2355,7 +2366,7 @@ impl<C: Clock> VmController<C> {
                     |row| row.get::<_, [u8; 32]>(0),
                 )
                 .optional()?;
-            Ok(match (recipe, digest) {
+            Ok(match (recipe, selected) {
                 (None, _) => Err(Refusal::NotFound),
                 (Some(recipe), Some(digest)) if recipe == digest => Ok(()),
                 _ => Err(Refusal::RecipeUnqualified),
@@ -2371,7 +2382,10 @@ impl<C: Clock> VmController<C> {
         name: &super::static_web::StaticName,
         template: Id,
         source: (PairSlots, [ArtifactEvidence; 2]),
-        web_digest: [u8; 32],
+        recipes: (
+            [u8; 32],
+            Option<&super::qualification_record::VerifiedDockerEvidence>,
+        ),
         disk: DiskClaim,
         host: HostObservation,
         resources: Resources,
@@ -2406,11 +2420,18 @@ impl<C: Clock> VmController<C> {
             if store::static_vm::launch_busy(db)? {
                 return Ok(Err(Refusal::Busy));
             }
-            if store::static_vm::is_compose_template(db, template)? {
-                return Ok(Err(Refusal::RecipeUnqualified));
-            }
-            let Some(provenance) = store::static_vm::source(db, template, source, web_digest)?
-            else {
+            let (web_digest, compose) = recipes;
+            let provenance = if store::static_vm::is_compose_template(db, template)? {
+                match compose {
+                    Some(evidence) => {
+                        store::static_vm::compose_source(db, template, source, evidence)?
+                    }
+                    None => None,
+                }
+            } else {
+                store::static_vm::source(db, template, source, web_digest)?
+            };
+            let Some(provenance) = provenance else {
                 return Ok(Err(Refusal::RecipeUnqualified));
             };
             let capacity = match self.policy.host(host, resources) {
