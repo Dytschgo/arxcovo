@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import { FIXTURE_HOSTS, FIXTURE_VMS } from './fixtures';
 import { activitySearch, CSRF_HEADER, decodeFrameMeta, decodeTerminalMessage, HttpApi, readBounded } from './http';
-import { isApiError } from './types';
+import { ApiError, isApiError } from './types';
 import type { ConsoleFrame, ConsoleStream, TerminalEvent, TerminalSession } from './types';
 
 const SESSION = { user: { name: 'owner' }, csrfToken: 'csrf-token-0123456789', expiresAt: '2026-11-23T20:00:00Z' };
@@ -113,6 +113,60 @@ describe('data endpoints', () => {
     expect((await api.getHost('atlas')).arch).toBe('x86_64');
     expect(await api.listVms()).toHaveLength(FIXTURE_VMS.length);
     expect((await api.getVm('ubuntu-arm-03')).arch).toBe('arm64');
+  });
+
+  test('CPU history passes its abort signal to fetch, and an abort before the response rejects with the reason', async () => {
+    const seen: (AbortSignal | null | undefined)[] = [];
+    const { fetchImpl } = fakeFetch({
+      'GET /api/v1/hosts/atlas/cpu-history': init => {
+        seen.push(init.signal);
+        // Like fetch: never answers, rejects once the signal aborts.
+        return new Promise<Response>((_, reject) => init.signal!.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))));
+      },
+      'GET /api/v1/hosts/cpu-history': init => {
+        seen.push(init.signal);
+        return new Promise<Response>((_, reject) => init.signal!.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError'))));
+      },
+    });
+    const api = new HttpApi({ fetch: fetchImpl });
+    const timeout = new ApiError('unavailable', 'CPU history did not arrive in time.');
+    const one = new AbortController();
+    const single = api.getCpuHistory('atlas', '1h', { signal: one.signal });
+    const batchController = new AbortController();
+    const batch = api.listCpuHistory('24h', { signal: batchController.signal });
+    one.abort(timeout);
+    batchController.abort();
+    await expect(single).rejects.toBe(timeout);
+    await expect(batch).rejects.toMatchObject({ code: 'network', message: 'The request was cancelled.' });
+    expect(seen).toEqual([one.signal, batchController.signal]);
+  });
+
+  test('an abort ends a stalled CPU history body read instead of waiting for it', async () => {
+    let cancelled = false;
+    const stalled = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"hostId":"atl'));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const { fetchImpl } = fakeFetch({ 'GET /api/v1/hosts/atlas/cpu-history': () => new Response(stalled, { status: 200 }) });
+    const api = new HttpApi({ fetch: fetchImpl });
+    const controller = new AbortController();
+    const pending = api.getCpuHistory('atlas', '24h', { signal: controller.signal });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const reason = new ApiError('unavailable', 'CPU history did not arrive in time.');
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    expect(cancelled).toBe(true);
+  });
+
+  test('a request without a signal sends none', async () => {
+    const series = { hostId: 'atlas', range: '1h', bucketSeconds: 60, from: '2026-11-26T09:20:00Z', to: '2026-11-26T10:20:00Z', samples: Array<null>(60).fill(null) };
+    const { fetchImpl, calls } = fakeFetch({ 'GET /api/v1/hosts/atlas/cpu-history': () => json(200, series) });
+    await new HttpApi({ fetch: fetchImpl }).getCpuHistory('atlas', '1h');
+    expect('signal' in calls[0].init).toBe(false);
   });
 
   test('CPU history uses the host and batch endpoints and checks the returned identity', async () => {
