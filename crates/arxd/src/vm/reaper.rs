@@ -9,7 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PERIOD: Duration = Duration::from_secs(5);
+/// The production sweep cadence; MCP retry hints derive from it.
+pub(crate) const PERIOD: Duration = Duration::from_secs(5);
 const WORKER_BUDGET: Duration = Duration::from_secs(1);
 const STOP_BUDGET: Duration = Duration::from_secs(2);
 const ITEM_BUDGET: Duration = Duration::from_secs(4);

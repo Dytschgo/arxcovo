@@ -3572,18 +3572,19 @@ impl<C: Clock> VmController<C> {
         principal: &str,
         vm: Id,
         request: &super::snapshot::Request,
-    ) -> Result<Result<bool, Refusal>> {
+    ) -> Result<Result<bool, store::snapshot::Refused>> {
+        use store::snapshot::Refused;
         self.store.transact(|db| {
-            let result =
-                store::snapshot::precheck(db, principal, vm, request, utc(self.clock.now())?)?;
+            let now = utc(self.clock.now())?;
+            let result = store::snapshot::precheck(db, principal, vm, request, now)?;
             // A Compose backup ID is outside the snapshot namespace. The
             // caller's own VM gets the explicit typed refusal; everyone else
             // keeps the uncorrelated not_found.
-            if matches!(result, Err(Refusal::NotFound))
+            if matches!(result, Err(Refused::Plain(Refusal::NotFound)))
                 && let super::snapshot::Request::Delete(id) = request
                 && store::compose::owned_backup(db, principal, vm, *id)?
             {
-                return Ok(Err(Refusal::StaticBackupDeleteForbidden));
+                return Ok(Err(Refused::Plain(Refusal::StaticBackupDeleteForbidden)));
             }
             Ok(result)
         })
@@ -3714,7 +3715,7 @@ impl<C: Clock> VmController<C> {
             }
             let is_static = match snapshot::precheck(db, principal, vm, request, now)? {
                 Ok(is_static) => is_static,
-                Err(reason) => return Ok(Err(reason)),
+                Err(refused) => return Ok(Err(refused.reason())),
             };
             if is_static && route.is_none_or(|route| route.vm() != vm) {
                 return Ok(Err(Refusal::SnapshotPublishNotQuiesced));

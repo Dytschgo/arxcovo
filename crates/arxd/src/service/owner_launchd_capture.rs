@@ -112,21 +112,28 @@ fn capture(t: &mut impl Transport) -> Capture {
 
 #[cfg(unix)]
 pub(super) fn native_query() -> Query {
+    native_capture(owner_query::LAUNCHD_QUERY).query()
+}
+
+/// Production passes only the fixed query; tests may pass a fixed probe label.
+#[cfg(unix)]
+fn native_capture(args: &[&str]) -> Capture {
     use std::{
         io::Read,
         os::fd::AsRawFd,
         process::{Child, Command, Stdio},
         time::Instant,
     };
-    struct Native {
+    struct Native<'a> {
+        args: &'a [&'a str],
         child: Option<Child>,
         start: Instant,
     }
-    impl Transport for Native {
+    impl Transport for Native<'_> {
         fn spawn(&mut self) -> Result<(), ()> {
             self.child = Some(
                 Command::new("/bin/launchctl")
-                    .args(owner_query::LAUNCHD_QUERY)
+                    .args(self.args)
                     .env_clear()
                     .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
                     .env("LANG", "C")
@@ -195,10 +202,45 @@ pub(super) fn native_query() -> Query {
         }
     }
     capture(&mut Native {
+        args,
         child: None,
         start: Instant::now(),
     })
-    .query()
+}
+
+/// Read-only native evidence on hosted macOS: launchd's real answer for a
+/// label that is never registered must match the pinned absence tuple through
+/// the same bounded capture production uses. It never touches arxd's label.
+#[cfg(all(test, target_os = "macos"))]
+mod native_macos_tests {
+    use super::*;
+    const PROBE: &str = "com.arxcovo.nonexistent-probe";
+    #[test]
+    fn real_launchctl_absence_matches_pinned_tuple() {
+        let target = format!("system/{PROBE}");
+        let c = native_capture(&["print", &target]);
+        assert!(c.complete == [true; 2], "both-streams-eof");
+        assert!(c.truncated == [false; 2], "no-truncation");
+        assert!(
+            c.termination == Term::Exited(owner_query::LAUNCHD_ABSENT_EXIT),
+            "absent-exit-status"
+        );
+        let observation = LaunchdObservation {
+            termination: c.termination,
+            stdout: &c.bytes[0],
+            stderr: &c.bytes[1],
+            stdout_complete: c.complete[0],
+            stderr_complete: c.complete[1],
+            stdout_truncated: c.truncated[0],
+            stderr_truncated: c.truncated[1],
+        };
+        // Raw streams stay private: only the typed result is asserted.
+        assert!(
+            owner_query::launchd_probe(&observation, PROBE) == Query::Absent,
+            "native-absence-tuple"
+        );
+        assert!(c.query() == Query::Unknown, "probe-is-not-arxd-absence");
+    }
 }
 
 #[cfg(test)]
@@ -312,10 +354,7 @@ mod tests {
                 c.bytes[0].len() == CAPS[0] && c.bytes[1].len() == CAPS[1],
                 "exact-caps"
             );
-            assert!(
-                c.query() == Query::Unknown,
-                "capture-maps-through-empty-profile"
-            );
+            assert!(c.query() == Query::Unknown, "synthetic-capture-is-unknown");
             assert!(m.kills == 0, "complete-observation-no-kill");
         }
     }

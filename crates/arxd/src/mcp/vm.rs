@@ -71,15 +71,29 @@ type Controller = VmController<ForegroundClock>;
 type Outcome<T> = std::result::Result<T, Fault>;
 
 #[derive(Clone, Copy, Debug)]
-struct Fault(&'static str);
+struct Fault(&'static str, Retry);
 
-const INVALID: Fault = Fault("invalid");
-const INVALID_CURSOR: Fault = Fault("invalid_cursor");
-const SHUTDOWN: Fault = Fault("shutdown");
-const NOT_FOUND: Fault = Fault("not_found");
-const STATE_UNAVAILABLE: Fault = Fault("state_unavailable");
-const NOT_READY: Fault = Fault("not_ready");
-const HOST_EXECUTION_DISABLED: Fault = Fault("host_execution_disabled");
+/// Whether a refusal advertises a retry hint on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retry {
+    Never,
+    /// The next production reaper sweep is expected to clear the refusal.
+    AfterReaperSweep,
+}
+
+impl Fault {
+    const fn new(reason: &'static str) -> Self {
+        Self(reason, Retry::Never)
+    }
+}
+
+const INVALID: Fault = Fault::new("invalid");
+const INVALID_CURSOR: Fault = Fault::new("invalid_cursor");
+const SHUTDOWN: Fault = Fault::new("shutdown");
+const NOT_FOUND: Fault = Fault::new("not_found");
+const STATE_UNAVAILABLE: Fault = Fault::new("state_unavailable");
+const NOT_READY: Fault = Fault::new("not_ready");
+const HOST_EXECUTION_DISABLED: Fault = Fault::new("host_execution_disabled");
 
 impl From<anyhow::Error> for Fault {
     fn from(_: anyhow::Error) -> Self {
@@ -144,6 +158,33 @@ fn refusal_wire(reason: Refusal) -> &'static str {
         Refusal::ComposeRecoveryRequired => "compose_recovery_required",
         Refusal::BackupLimit => "backup_limit",
     }
+}
+
+/// One production reaper period, checked at compile time so a future
+/// cadence can never silently truncate.
+const REAPER_RETRY_AFTER_MS: u64 = {
+    let millis = crate::vm::reaper::PERIOD.as_millis();
+    assert!(
+        millis <= u64::MAX as u128,
+        "reaper period overflows retry_after_ms"
+    );
+    millis as u64
+};
+
+/// `vm_snapshot_delete` refused only by accounted post-restore retire work
+/// that the reaper is authorized to dispose (`Refused::Retiring`). Same wire
+/// reason and audit code as every other `cleanup_unconfirmed`.
+const SNAPSHOT_DELETE_RETIRING: Fault = Fault("cleanup_unconfirmed", Retry::AfterReaperSweep);
+
+/// The wire refusal object. Only [`Retry::AfterReaperSweep`] adds a retry
+/// hint; every other refusal keeps its exact two-key shape.
+fn refusal_value(reason: Fault) -> Value {
+    let mut value = json!({"ok":false,"reason":reason.0});
+    if reason.1 == Retry::AfterReaperSweep {
+        value["retryable"] = Value::Bool(true);
+        value["retry_after_ms"] = REAPER_RETRY_AFTER_MS.into();
+    }
+    value
 }
 
 /// Stored audit reason codes; an unknown future code is never guessed.
@@ -221,7 +262,7 @@ const REFUSAL_CODES: [Refusal; 53] = {
 
 impl From<Refusal> for Fault {
     fn from(reason: Refusal) -> Self {
-        Self(refusal_wire(reason))
+        Self::new(refusal_wire(reason))
     }
 }
 
@@ -1314,7 +1355,7 @@ impl ServerHandler for VmInventory {
                 object["ok"] = Value::Bool(true);
                 (object, false)
             }
-            Err(reason) => (json!({"ok":false,"reason":reason.0}), true),
+            Err(reason) => (refusal_value(reason), true),
         };
         let mut result = CallToolResult::structured(value);
         result.content.clear();
@@ -1533,7 +1574,7 @@ impl VmInventory {
                 request.arguments.unwrap_or_default(),
                 refusal,
             )
-            .map_err(|reason| Fault(reason.as_str()));
+            .map_err(|reason| Fault::new(reason.as_str()));
         }
         if matches!(name, "run_command" | "discover_tools") {
             return self.refuse(HOST_REFUSAL_ACTION, None, HOST_EXECUTION_DISABLED);
@@ -1722,7 +1763,14 @@ impl VmInventory {
                 )?;
                 let is_static = match result {
                     Ok(is_static) => is_static,
-                    Err(reason) => return self.refuse(action, request.vm(), reason.into()),
+                    Err(crate::store::vm::snapshot::Refused::Retiring)
+                        if matches!(snapshot, crate::vm::snapshot::Request::Delete(_)) =>
+                    {
+                        return self.refuse(action, request.vm(), SNAPSHOT_DELETE_RETIRING);
+                    }
+                    Err(reason) => {
+                        return self.refuse(action, request.vm(), reason.reason().into());
+                    }
                 };
                 let route = if is_static {
                     let Some(proof) = self
@@ -1753,7 +1801,7 @@ impl VmInventory {
                 return self.refuse(
                     action,
                     request.vm(),
-                    Fault(native_reason(self.supervisor.native_refusal)),
+                    Fault::new(native_reason(self.supervisor.native_refusal)),
                 );
             }
         };
@@ -1799,7 +1847,7 @@ impl VmInventory {
         self.refuse(
             action,
             request.vm(),
-            Fault(native_reason(self.supervisor.native_refusal)),
+            Fault::new(native_reason(self.supervisor.native_refusal)),
         )
     }
 
@@ -1811,7 +1859,7 @@ impl VmInventory {
         digest: Option<[u8; 32]>,
     ) -> Outcome<Value> {
         if let Some(reason) = self.supervisor.static_refusal() {
-            return self.refuse(action, request.vm(), Fault(native_reason(reason)));
+            return self.refuse(action, request.vm(), Fault::new(native_reason(reason)));
         }
         #[cfg(test)]
         if let Some(fixture) = &mut gate.fixture {
@@ -1821,7 +1869,7 @@ impl VmInventory {
         self.refuse(
             action,
             request.vm(),
-            Fault(native_reason(self.supervisor.native_refusal)),
+            Fault::new(native_reason(self.supervisor.native_refusal)),
         )
     }
 
@@ -1903,7 +1951,7 @@ impl VmInventory {
                 return refuse(Refusal::PublishTargetMismatch);
             }
             if let Some(reason) = supervisor.static_refusal() {
-                return self.refuse(action, Some(vm), Fault(native_reason(reason)));
+                return self.refuse(action, Some(vm), Fault::new(native_reason(reason)));
             }
             if row.state != StaticState::Running {
                 return refuse(Refusal::NotReady);
@@ -2791,11 +2839,11 @@ impl VmInventory {
             .compose
             .session(target.vm)
             .filter(|s| Some(s.generation) == generation)
-            .ok_or(Fault("not_ready"))?;
+            .ok_or(Fault::new("not_ready"))?;
         if !store
             .transact(|tx| db::live_boot(tx, target.vm, session.generation, session.wire_boot))?
         {
-            return Err(Fault("not_ready"));
+            return Err(Fault::new("not_ready"));
         }
         let (entries, next_cursor) = tokio::runtime::Handle::current()
             .block_on(self.supervisor.compose.logs(
@@ -2808,7 +2856,7 @@ impl VmInventory {
                 },
                 &self.supervisor.cancel,
             ))
-            .ok_or(Fault("not_ready"))?;
+            .ok_or(Fault::new("not_ready"))?;
         Ok(json!({"entries":entries,"next_cursor":next_cursor}))
     }
 
@@ -4642,7 +4690,7 @@ pub(crate) mod tests {
                         metadata_bytes: 4096,
                     }
                     .checked_claim()
-                    .ok_or(Fault("disk"))?;
+                    .ok_or(Fault::new("disk"))?;
                     let binding = crate::store::vm::Binding {
                         principal,
                         key,
@@ -6512,13 +6560,14 @@ pub(crate) mod tests {
         assert_eq!(page2["entries"][0]["protected"], true);
         assert!(page2["next_cursor"].is_null());
         let delete = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1808)});
+        // Non-retryable delete refusals keep the exact two-key shape.
         assert_eq!(
-            call(&b, "vm_snapshot_delete", delete.clone()).await["reason"],
-            "not_found"
+            call(&b, "vm_snapshot_delete", delete.clone()).await,
+            json!({"ok":false,"reason":"not_found"})
         );
         assert_eq!(
-            call(&a, "vm_snapshot_delete", delete).await["reason"],
-            "static_backup_delete_forbidden"
+            call(&a, "vm_snapshot_delete", delete).await,
+            json!({"ok":false,"reason":"static_backup_delete_forbidden"})
         );
         assert_eq!(call(&a, "vm_snapshot_restore", restore).await, restored);
         assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
@@ -6533,6 +6582,193 @@ pub(crate) mod tests {
         drop(a);
         drop(b);
         h.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn only_the_retiring_snapshot_delete_fault_carries_a_retry_hint() {
+        assert_eq!(REAPER_RETRY_AFTER_MS, 5000);
+        assert_eq!(
+            u128::from(REAPER_RETRY_AFTER_MS),
+            crate::vm::reaper::PERIOD.as_millis()
+        );
+        // Same wire reason and audit code as every other cleanup_unconfirmed.
+        assert_eq!(
+            SNAPSHOT_DELETE_RETIRING.0,
+            refusal_wire(Refusal::CleanupUnconfirmed)
+        );
+        assert_eq!(
+            refusal_from_wire(SNAPSHOT_DELETE_RETIRING.0),
+            Some(Refusal::CleanupUnconfirmed)
+        );
+        assert_eq!(
+            refusal_value(SNAPSHOT_DELETE_RETIRING),
+            json!({"ok":false,"reason":"cleanup_unconfirmed","retryable":true,"retry_after_ms":5000})
+        );
+        let faults = REFUSAL_CODES.into_iter().map(Fault::from).chain([
+            INVALID,
+            INVALID_CURSOR,
+            SHUTDOWN,
+            NOT_FOUND,
+            STATE_UNAVAILABLE,
+            NOT_READY,
+            HOST_EXECUTION_DISABLED,
+        ]);
+        for fault in faults {
+            assert_eq!(fault.1, Retry::Never, "{}", fault.0);
+            assert_eq!(
+                refusal_value(fault),
+                json!({"ok":false,"reason":fault.0}),
+                "{}",
+                fault.0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_delete_after_restore_hints_one_reaper_period() {
+        let mut h = Harness::start(false, false).await;
+        h.fixture(|fixture| fixture.snapshot_test_media = true);
+        let a = h.client(0).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(1860)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let clone = call(
+            &a,
+            "vm_create",
+            json!({"template_id":template,"request_id":key(1861),"ttl_s":60}),
+        )
+        .await;
+        let vm = terminal(&a, &clone).await["vm_id"].clone();
+        let created = call(
+            &a,
+            "vm_snapshot_create",
+            json!({"vm_id":vm,"request_id":key(1862)}),
+        )
+        .await;
+        let captured = terminal(&a, &created).await;
+        assert_eq!(captured["state"], "succeeded", "{captured}");
+        let point = captured["snapshot_id"].clone();
+        let start = call(&a, "vm_start", json!({"vm_id":vm,"request_id":key(1863)})).await;
+        assert_eq!(terminal(&a, &start).await["state"], "succeeded");
+        let stop = call(&a, "vm_stop", json!({"vm_id":vm,"request_id":key(1864)})).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let restore = call(
+            &a,
+            "vm_snapshot_restore",
+            json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1865)}),
+        )
+        .await;
+        let restored = terminal(&a, &restore).await;
+        assert_eq!(restored["state"], "succeeded", "{restored}");
+        assert_eq!(restored["cleanup"], "cleanup_unconfirmed");
+        let unknown = json!({"vm_id":vm,"snapshot_id":key(1866),"request_id":key(1867)});
+        assert_eq!(
+            call(&a, "vm_snapshot_delete", unknown).await,
+            json!({"ok":false,"reason":"not_found"})
+        );
+        // Before the reaper sweeps the retired generation, the refusal says
+        // when to retry: one production reaper period.
+        let delete = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1868)});
+        let refused = call(&a, "vm_snapshot_delete", delete.clone()).await;
+        assert_eq!(
+            refused,
+            json!({"ok":false,"reason":"cleanup_unconfirmed","retryable":true,
+                "retry_after_ms":crate::vm::reaper::PERIOD.as_millis() as u64})
+        );
+        assert_eq!(refused["retry_after_ms"], 5000);
+        // The same reason from another tool keeps the two-key shape.
+        assert_eq!(
+            call(
+                &a,
+                "vm_snapshot_create",
+                json!({"vm_id":vm,"request_id":key(1869)})
+            )
+            .await,
+            json!({"ok":false,"reason":"cleanup_unconfirmed"})
+        );
+        h.sweep().await;
+        // The refusal bound nothing: the same request now deletes the point.
+        let deleted = call(&a, "vm_snapshot_delete", delete.clone()).await;
+        assert_eq!(terminal(&a, &deleted).await["state"], "succeeded");
+        assert_eq!(call(&a, "vm_snapshot_delete", delete).await, deleted);
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_delete_behind_quarantined_copy_has_no_retry_hint() {
+        let mut h = Harness::start(false, false).await;
+        h.fixture(|fixture| fixture.snapshot_test_media = true);
+        let a = h.client(0).await;
+        let build = call(
+            &a,
+            "vm_template_build",
+            json!({"recipe_id":hex::encode(RECIPE.0),"request_id":key(1870)}),
+        )
+        .await;
+        h.hold_build.notify_one();
+        let template = terminal(&a, &build).await["template_id"].clone();
+        let clone = call(
+            &a,
+            "vm_create",
+            json!({"template_id":template,"request_id":key(1871),"ttl_s":600}),
+        )
+        .await;
+        let vm = terminal(&a, &clone).await["vm_id"].clone();
+        let vm_id = parse_id(vm.as_str().unwrap()).unwrap();
+        let created = call(
+            &a,
+            "vm_snapshot_create",
+            json!({"vm_id":vm,"request_id":key(1872)}),
+        )
+        .await;
+        let captured = terminal(&a, &created).await;
+        assert_eq!(captured["state"], "succeeded", "{captured}");
+        let point = captured["snapshot_id"].clone();
+        // A later copy attempts its disk create without recording an identity:
+        // the abandoned leaf is quarantined while the older point stays ready.
+        h.fixture(|f| f.snapshot_fault = Some(SnapshotFault::FailAfterDiskAttemptNoId));
+        let failed = call(
+            &a,
+            "vm_snapshot_create",
+            json!({"vm_id":vm,"request_id":key(1873)}),
+        )
+        .await;
+        assert_eq!(terminal(&a, &failed).await["state"], "failed");
+        h.fixture(|f| f.snapshot_fault = None);
+        let delete = json!({"vm_id":vm,"snapshot_id":point,"request_id":key(1874)});
+        let held = json!({"ok":false,"reason":"cleanup_unconfirmed"});
+        assert_eq!(call(&a, "vm_snapshot_delete", delete.clone()).await, held);
+        h.sweep().await;
+        h.sweep().await;
+        let quarantined = |db: &rusqlite::Connection| {
+            crate::store::vm::count(
+                db,
+                "SELECT count(*) FROM vm_snapshot_work w
+                 JOIN vm_artifacts a ON a.generation_id=w.candidate
+                 WHERE w.vm=?1 AND w.phase='abandoned' AND w.quarantine_audited=1
+                   AND a.state='quarantined'",
+                [vm_id],
+            )
+        };
+        let store = h.supervisor().controller.store_for_test();
+        assert_eq!(store.transact(|db| quarantined(db)).unwrap(), 1);
+        // Sweeps do not clear quarantine, so the refusal never hints a retry.
+        assert_eq!(call(&a, "vm_snapshot_delete", delete.clone()).await, held);
+        h.sweep().await;
+        assert_eq!(store.transact(|db| quarantined(db)).unwrap(), 1);
+        assert_eq!(call(&a, "vm_snapshot_delete", delete).await, held);
+        drop(a);
+        // The held quarantine is exactly what keeps the drain unconfirmed.
+        assert_eq!(
+            h.shutdown().await.unwrap_err().to_string(),
+            "server-drain-unconfirmed"
+        );
     }
 
     #[tokio::test]
