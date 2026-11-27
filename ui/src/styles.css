@@ -697,7 +697,11 @@ a.hn:hover { text-decoration: underline; }
 .trace-area { fill: var(--trace, var(--ink)); fill-opacity: .1; }
 .trace-grid { stroke: var(--line2); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .trace-gap { position: absolute; inset-block: 0; background: var(--hatch); border-radius: 2px; }
-@keyframes reveal { from { clip-path: inset(0 100% 0 0); } }
+/* Outside the selected bucket window: dimmed with a black veil (no text under it), edged with a dashed line. */
+.trace-dim { position: absolute; inset-block: 0; background: rgb(0 0 0 / .66); }
+.trace-dim-l { border-inline-end: 1px dashed var(--ink4); }
+.trace-dim-r { border-inline-start: 1px dashed var(--ink4); }
+@keyframes reveal { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
 @media (prefers-reduced-motion: no-preference) {
   .trace svg { animation: reveal 1.2s var(--ease) .25s backwards; }
 }
@@ -735,6 +739,12 @@ a.hn:hover { text-decoration: underline; }
 .hist-head .seg { margin-inline-start: auto; }
 .cpu-chart { block-size: 140px; }
 .chart-na, .chart-wait { display: grid; align-content: start; justify-items: start; gap: var(--sp-2); padding: var(--sp-3); border: 1px dashed var(--line2); border-radius: var(--r-card); }
+/* Window handles: white (the UI accent) on the track, one per window edge. */
+.brush { position: relative; block-size: 24px; border-block-start: 1px solid var(--line); }
+.brush-band { position: absolute; inset-block-start: 7px; block-size: 10px; border: 1px solid var(--line3); border-radius: 5px; background: rgb(255 255 255 / .14); }
+.brush-h { position: absolute; inset-block-start: 3px; inline-size: 12px; block-size: 18px; border-radius: 5px; background: var(--ink); transform: translateX(-50%); cursor: ew-resize; touch-action: none; }
+.brush-h:focus-visible { outline-offset: 2px; }
+.winread { color: var(--ink3); font: var(--fs-xs) var(--mono); }
 .cpu-axis { display: flex; justify-content: space-between; color: var(--ink4); font: var(--fs-xs) var(--mono); }
 .hist-note { display: flex; align-items: center; gap: 6px; color: var(--ink3); font-size: var(--fs-sm); }
 .ring-row { display: flex; align-items: center; gap: 18px; }
@@ -1021,6 +1031,8 @@ a.hp[aria-current] { border-color: var(--edge); background: var(--tile2); }
   .check input { appearance: auto; }
   .na::before, .meter-track[data-unknown], .cap-bar[data-unknown], .sw, .trace-gap, .spark-na { border: 1px dashed; }
   .trace-line { stroke: CanvasText; }
+  .brush-h { background: ButtonText; }
+  .brush-band { border-color: CanvasText; }
   .seg button[aria-pressed="true"], .fchip[aria-pressed="true"] { outline: 2px solid; }
 }
 

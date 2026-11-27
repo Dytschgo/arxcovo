@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react';
 import { summarizeCpuHistory } from '../../api/cpuHistory';
 import { ApiError, CPU_HISTORY_RANGES, type ArxApi, type CpuHistoryRange, type Host } from '../../api/types';
 import { useInventory, useResource } from '../context';
-import { CpuTrace, RANGE_WORDS, hasSamples, refreshFor, usePolled } from '../cpuHistory';
+import { BucketWindow, CpuTrace, RANGE_WORDS, hasSamples, refreshFor, usePolled, windowText, type Span } from '../cpuHistory';
 import { allocation } from '../derive';
 import { OS_LABEL, formatAgo, formatBytes, formatDate, percent } from '../format';
 import { Icon } from '../icons';
@@ -12,9 +12,9 @@ import { ActivityList } from './ActivityList';
 
 // Host detail as a Night Orbit bento (docs/design/night-orbit/host.html).
 // CPU shows the current sample and, below it, the CPU history trace for a
-// chosen range with avg and peak over the sampled buckets. History loads on its
-// own and never holds up the page. The two-handle time window, remote desktop
-// and the disk reserve are not drawn.
+// chosen range, a two-handle window over whole buckets, and avg and peak over
+// the sampled buckets in that window. History loads on its own and never holds
+// up the page. Remote desktop and the disk reserve are not drawn.
 
 /** A ring for a used/total pair. `role="meter"` only when there is a reading, so null never reads as 0. */
 function Ring({ label, pct }: { label: string; pct: number | null }) {
@@ -47,28 +47,42 @@ function Readout({ label, value }: { label: string; value: number | null }) {
 }
 
 /**
- * CPU history for one host: range selector, trace and avg/peak. Each response
- * is checked against the host and range it was asked for, and a response for
- * an earlier host or range is dropped (`usePolled`), so rapid switching never
- * shows a stale trace.
+ * CPU history for one host: range selector, trace, a two-handle window over
+ * whole buckets, and avg/peak/missing over the buckets in that window. Each
+ * response is checked against the host and range it was asked for, and only
+ * the current request of the current host and range is shown (`usePolled`).
+ * The window starts as the whole range and resets when the host or range changes.
  */
 export function CpuHistoryPanel({ host }: { host: Host }) {
   const [range, setRange] = useState<CpuHistoryRange>('24h');
-  const load = useCallback(async (api: ArxApi) => {
-    const history = await api.getCpuHistory(host.id, range);
+  const key = `${host.id}:${range}`;
+  const load = useCallback(async (api: ArxApi, signal: AbortSignal) => {
+    const history = await api.getCpuHistory(host.id, range, { signal });
     if (history.hostId !== host.id || history.range !== range) throw new ApiError('bad_response', 'CPU history did not match the requested host and range.');
     return history;
   }, [host.id, range]);
-  const state = usePolled(`${host.id}:${range}`, load, refreshFor(range));
-  const ready = state.status === 'ready' ? state.data : null;
-  const summary = ready ? summarizeCpuHistory(ready.samples) : null;
+  const state = usePolled(key, load, refreshFor(range));
+  const n = CPU_HISTORY_RANGES[range].points;
+  const [chosen, setChosen] = useState<{ key: string; span: Span } | null>(null);
+  // Any host or range change resets the window, so returning to a range starts from its whole span again.
+  const [windowKey, setWindowKey] = useState(key);
+  if (windowKey !== key) {
+    setWindowKey(key);
+    setChosen(null);
+  }
+  // Whole buckets, inclusive: start <= end within 0..n-1. Anything chosen for another host or range is ignored.
+  const span: Span = chosen && chosen.key === key && chosen.span.end < n ? chosen.span : { start: 0, end: n - 1 };
+  const ready = state.status === 'ready' && state.data.samples.length === n ? state.data : null;
+  const summary = ready ? summarizeCpuHistory(ready.samples.slice(span.start, span.end + 1)) : null;
+  const count = span.end - span.start + 1;
+  const partial = count < n;
 
   return (
     <div className="cpu-hist" data-range={range} aria-busy={state.status === 'loading'}>
       <div className="hist-head">
         <p className="hist-k">History · {RANGE_WORDS[range]}</p>
         {summary ? (
-          <dl className="hist-read">
+          <dl className="hist-read" aria-label={partial ? 'CPU in the selected window' : `CPU over the ${RANGE_WORDS[range]}`}>
             <Readout label="avg" value={summary.avg} />
             <Readout label="peak" value={summary.peak} />
           </dl>
@@ -86,17 +100,24 @@ export function CpuHistoryPanel({ host }: { host: Host }) {
             <p className="hist-note">{state.error.message}</p>
           </div>
         )
-      ) : !hasSamples(state.data) ? (
+      ) : !ready ? (
+        <div className="cpu-chart chart-na">
+          <NullValue reason="history unavailable" />
+          <p className="hist-note">CPU history did not match the requested range.</p>
+        </div>
+      ) : !hasSamples(ready) ? (
         <div className="cpu-chart chart-na">
           <NullValue reason="no samples" />
           <p className="hist-note">arxd has no CPU samples for {host.name} in the {RANGE_WORDS[range]}.</p>
         </div>
       ) : (
         <>
-          <CpuTrace history={state.data} os={host.os} className="cpu-chart" grid />
+          <CpuTrace history={ready} os={host.os} className="cpu-chart" grid window={partial ? span : undefined} />
+          <BucketWindow n={n} bucketSeconds={ready.bucketSeconds} value={span} onChange={next => setChosen({ key, span: next })} />
           <div className="cpu-axis" aria-hidden="true">{AXIS[range].map(t => <span key={t}>{t}</span>)}</div>
+          <p className="winread" aria-live="polite">{windowText(span, n, ready.bucketSeconds)}</p>
           {summary && summary.missing > 0
-            ? <p className="hist-note"><span className="na" aria-hidden="true" />{summary.missing} of {state.data.samples.length} buckets missing · avg and peak cover sampled buckets only</p>
+            ? <p className="hist-note"><span className="na" aria-hidden="true" />{summary.missing} of {count} buckets missing{partial ? ' in the window' : ''} · avg and peak cover sampled buckets only</p>
             : null}
         </>
       )}

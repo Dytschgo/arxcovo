@@ -48,8 +48,8 @@ export function Allocated({ host, allocated, label }: { host: Host; allocated: A
   );
 }
 
-const loadBoardHistory = async (api: ArxApi) => {
-  const series = await api.listCpuHistory('24h');
+const loadBoardHistory = async (api: ArxApi, signal: AbortSignal) => {
+  const series = await api.listCpuHistory('24h', { signal });
   return new Map(series.filter(s => s.range === '24h').map(s => [s.hostId, s]));
 };
 

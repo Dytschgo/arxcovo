@@ -87,6 +87,36 @@ test('host detail: CPU history switches between 1h, 6h and 24h with avg and peak
   await expect(tile.getByText(/6 of 60 buckets missing/)).toBeVisible();
   expect(await overflowX(page)).toBeLessThanOrEqual(0);
   await shot(page, '14-host-cpu-1h');
+
+  // The two-handle window selects whole buckets from the keyboard; avg, peak and missing follow it.
+  const start = tile.getByRole('slider', { name: 'Window start' });
+  const end = tile.getByRole('slider', { name: 'Window end' });
+  await expect(start).toHaveAttribute('aria-valuenow', '0');
+  await expect(end).toHaveAttribute('aria-valuenow', '59');
+  await start.focus();
+  for (let i = 0; i < 30; i += 1) await page.keyboard.press('ArrowRight');
+  await expect(start).toHaveAttribute('aria-valuenow', '30');
+  await expect(start).toHaveAttribute('aria-valuetext', '30 min ago');
+  await expect(tile.getByText('Window: 30 min ago → now · 30 buckets')).toBeVisible();
+  await expect(tile.getByText(/6 of 30 buckets missing in the window/)).toBeVisible();
+  await expect(tile.locator('.trace-dim')).toHaveCount(1);
+  await end.focus();
+  await page.keyboard.press('Home');
+  await expect(end).toHaveAttribute('aria-valuenow', '30');
+  await expect(tile.getByText('Window: 30 min ago → 29 min ago · 1 bucket')).toBeVisible();
+  await page.keyboard.press('End');
+  await expect(end).toHaveAttribute('aria-valuenow', '59');
+  // Dragging the end handle to the middle of the track lands on whole buckets.
+  const track = (await tile.locator('.brush').boundingBox())!;
+  const handle = (await end.boundingBox())!;
+  await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(track.x + track.width * 0.75, handle.y + handle.height / 2, { steps: 4 });
+  await page.mouse.up();
+  await expect(end).toHaveAttribute('aria-valuenow', '44');
+  await expect(tile.locator('dt', { hasText: 'avg' }).locator('+ dd')).toHaveText(/^\d+%$/);
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
+  await shot(page, '16-host-cpu-window');
   await range.getByRole('button', { name: '6h' }).click();
   await expect(tile.getByRole('img', { name: /last 6 hours, 5-minute buckets/ })).toBeVisible();
   await expect(range.getByRole('button', { pressed: true })).toHaveText('6h');
@@ -382,6 +412,12 @@ for (const motion of ['no-preference', 'reduce'] as const) {
     await page.getByRole('group', { name: 'CPU history range' }).getByRole('button', { name: '1h' }).click();
     await expect(page.getByText(/6 of 60 buckets missing/)).toBeVisible();
     await audit('host CPU history, 1h range pressed');
+    const windowStart = page.getByRole('slider', { name: 'Window start' });
+    await windowStart.focus();
+    for (let i = 0; i < 20; i += 1) await page.keyboard.press('ArrowRight');
+    await page.getByRole('slider', { name: 'Window end' }).press('PageDown');
+    await expect(page.getByText(/^Window: 40 min ago → 5 min ago/)).toBeVisible();
+    await audit('host CPU history, window narrowed');
     await page.goto('/#/hosts/pebble');
     await expect(page.getByText('no samples', { exact: true })).toBeVisible();
     await audit('host CPU history, no samples');

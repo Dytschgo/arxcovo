@@ -5,7 +5,8 @@ import { summarizeCpuHistory } from '../api/cpuHistory';
 import { DEMO_CREDENTIALS, FIXTURE_HOSTS } from '../api/fixtures';
 import { StandinApi, standinCpuHistory, type StandinOptions } from '../api/standin';
 import { ApiError, CPU_HISTORY_RANGES, type CpuHistory, type CpuHistoryRange } from '../api/types';
-import { traceGeometry, traceLabel } from './cpuHistory';
+import { HISTORY_TIMEOUT_MESSAGE, HISTORY_TIMEOUT_MS, agoText, moveHandle, traceGeometry, traceLabel, usePolled, windowText } from './cpuHistory';
+import { AppProviders } from './context';
 
 async function signIn(api: StandinApi, hash: string) {
   window.location.hash = hash;
@@ -31,11 +32,19 @@ const flat = (range: CpuHistoryRange, value: number | null) => Array<number | nu
 /** Every y coordinate the path draws: a null bucket must never put a point at y = 100 (0%). */
 const ys = (path: string) => [...path.matchAll(/[ML]([\d.]+) ([\d.]+)/g)].map(m => Number(m[2]));
 
-/** A stand-in whose CPU history calls wait until the test settles them. */
+/**
+ * A stand-in whose CPU history calls wait until the test settles them. It
+ * records each call's signal but ignores it, like a server that never answers,
+ * so the view's own guards are what the tests exercise.
+ */
 class DeferredHistory extends StandinApi {
-  calls: { hostId: string; range: CpuHistoryRange; resolve(h: CpuHistory): void; reject(e: unknown): void }[] = [];
-  getCpuHistory(hostId: string, range: CpuHistoryRange): Promise<CpuHistory> {
-    return new Promise((resolve, reject) => this.calls.push({ hostId, range, resolve, reject }));
+  calls: { hostId: string; range: CpuHistoryRange; signal?: AbortSignal; resolve(h: CpuHistory): void; reject(e: unknown): void }[] = [];
+  getCpuHistory(hostId: string, range: CpuHistoryRange, options: { signal?: AbortSignal } = {}): Promise<CpuHistory> {
+    return new Promise((resolve, reject) => this.calls.push({ hostId, range, signal: options.signal, resolve, reject }));
+  }
+  /** Calls whose signal has not been aborted. */
+  open() {
+    return this.calls.filter(c => !c.signal?.aborted);
   }
   last(hostId: string, range: CpuHistoryRange) {
     const call = [...this.calls].reverse().find(c => c.hostId === hostId && c.range === range);
@@ -112,7 +121,7 @@ describe('hosts board traces', () => {
     await signIn(api, '#/hosts');
     await screen.findAllByRole('img', { name: /CPU over the last 24 hours/ });
     expect(batch).toHaveBeenCalledTimes(1);
-    expect(batch).toHaveBeenCalledWith('24h');
+    expect(batch).toHaveBeenCalledWith('24h', { signal: expect.any(AbortSignal) });
     expect(single).not.toHaveBeenCalled();
   });
 
@@ -228,16 +237,22 @@ describe('host detail CPU history', () => {
     expect(within(tile).queryByText('11%')).toBeNull();
   });
 
-  test('a response that names another host or range is refused rather than drawn', async () => {
-    const api = new DeferredHistory();
-    await signIn(api, '#/hosts/atlas');
-    const tile = await cpuTile();
-    await waitFor(() => expect(api.last('atlas', '24h')).toBeTruthy());
-    await act(async () => api.last('atlas', '24h').resolve(history('harbor', '24h', flat('24h', 50))));
-    expect(await within(tile).findByText('history unavailable')).toBeTruthy();
-    expect(within(tile).getByText('CPU history did not match the requested host and range.')).toBeTruthy();
-    expect(within(tile).queryByRole('img', { name: /CPU over/ })).toBeNull();
-  });
+  for (const [what, wrong] of [
+    ['another host', () => history('harbor', '24h', flat('24h', 50))],
+    ['another range', () => history('atlas', '6h', flat('6h', 50))],
+  ] as const) {
+    test(`a response that names ${what} is refused rather than drawn`, async () => {
+      const api = new DeferredHistory();
+      await signIn(api, '#/hosts/atlas');
+      const tile = await cpuTile();
+      await waitFor(() => expect(api.last('atlas', '24h')).toBeTruthy());
+      await act(async () => api.last('atlas', '24h').resolve(wrong()));
+      expect(await within(tile).findByText('history unavailable')).toBeTruthy();
+      expect(within(tile).getByText('CPU history did not match the requested host and range.')).toBeTruthy();
+      expect(within(tile).queryByRole('img', { name: /CPU over/ })).toBeNull();
+      expect(within(tile).queryByText('50%')).toBeNull();
+    });
+  }
 
   test('a failed history request leaves the host page intact and says history is unavailable', async () => {
     await signIn(standin({ failures: { getCpuHistory: new ApiError('unavailable', 'arxd is busy.', 503) } }), '#/hosts/atlas');
@@ -294,5 +309,250 @@ describe('host detail CPU history', () => {
     await act(async () => vi.advanceTimersByTime(30_000));
     expect(count('1h')).toBe(2);
     expect(count('24h')).toBe(2);
+  });
+});
+
+describe('history request lifetime', () => {
+  test('returning 24h -> 1h -> 24h never shows the old 24h series before the new 24h response', async () => {
+    const api = new DeferredHistory();
+    await signIn(api, '#/hosts/atlas');
+    const tile = await cpuTile();
+    await waitFor(() => expect(api.last('atlas', '24h')).toBeTruthy());
+    await act(async () => api.last('atlas', '24h').resolve(history('atlas', '24h', flat('24h', 31))));
+    await within(tile).findByRole('img', { name: /last 24 hours.*average 31%/ });
+    const first24h = api.last('atlas', '24h');
+    fireEvent.click(within(tile).getByRole('button', { name: '1h' }));
+    await waitFor(() => expect(api.last('atlas', '1h')).toBeTruthy());
+    fireEvent.click(within(tile).getByRole('button', { name: '24h' }));
+    await waitFor(() => expect(api.last('atlas', '24h')).not.toBe(first24h));
+    // The old 31% chart and readouts stay gone while the fresh 24h request is open.
+    expect(within(tile).queryByRole('img', { name: /CPU over/ })).toBeNull();
+    expect(within(tile).queryByText('31%')).toBeNull();
+    expect(within(tile).getByText('Loading CPU history…')).toBeTruthy();
+    // A late answer to the abandoned 1h request is dropped too.
+    await act(async () => api.last('atlas', '1h').resolve(history('atlas', '1h', flat('1h', 64))));
+    expect(within(tile).queryByText('64%')).toBeNull();
+    expect(api.last('atlas', '1h').signal!.aborted).toBe(true);
+    await act(async () => api.last('atlas', '24h').resolve(history('atlas', '24h', flat('24h', 45))));
+    await within(tile).findByRole('img', { name: /last 24 hours.*average 45%/ });
+    expect(readout(tile, 'avg').textContent).toBe('45%');
+  });
+
+  test('a stalled request times out to unavailable, polls never pile up, and the next healthy poll recovers', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = new DeferredHistory();
+    await signIn(api, '#/hosts/atlas');
+    const tile = await cpuTile();
+    await waitFor(() => expect(api.calls).toHaveLength(1));
+    const stalled = api.calls[0];
+    expect(stalled.signal!.aborted).toBe(false);
+    await act(async () => vi.advanceTimersByTime(HISTORY_TIMEOUT_MS));
+    expect(stalled.signal!.aborted).toBe(true);
+    expect(stalled.signal!.reason).toMatchObject({ code: 'unavailable', message: HISTORY_TIMEOUT_MESSAGE });
+    expect(await within(tile).findByText('history unavailable')).toBeTruthy();
+    expect(within(tile).getByText(HISTORY_TIMEOUT_MESSAGE)).toBeTruthy();
+    // Three more minutes of stalled polls: never more than one request open at a time.
+    for (let i = 0; i < 6; i += 1) {
+      await act(async () => vi.advanceTimersByTime(30_000));
+      expect(api.open().length).toBeLessThanOrEqual(1);
+    }
+    expect(api.calls.length).toBeGreaterThan(1);
+    // Up to the next poll (at 240 s), which is still open.
+    await act(async () => vi.advanceTimersByTime(48_000));
+    // A late answer to a timed-out request is ignored.
+    await act(async () => stalled.resolve(history('atlas', '24h', flat('24h', 12))));
+    expect(within(tile).queryByText('12%')).toBeNull();
+    // The open poll answers: the trace comes back.
+    const open = api.open();
+    expect(open).toHaveLength(1);
+    await act(async () => open[0].resolve(history('atlas', '24h', flat('24h', 52))));
+    await within(tile).findByRole('img', { name: /average 52%/ });
+    expect(within(tile).queryByText('history unavailable')).toBeNull();
+  });
+
+  test('a poll that fires while the previous request is open aborts the previous one first', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const signals: AbortSignal[] = [];
+    function Probe() {
+      // A deadline longer than the poll interval, so a poll can overtake an open request.
+      const state = usePolled('probe', (_api, signal) => {
+        signals.push(signal);
+        return new Promise<number>(() => undefined);
+      }, 1_000, 5_000);
+      return <p>probe {state.status}</p>;
+    }
+    const api = standin();
+    render(<AppProviders api={api}><Probe /></AppProviders>);
+    expect(await screen.findByText('probe loading')).toBeTruthy();
+    expect(signals).toHaveLength(1);
+    await act(async () => vi.advanceTimersByTime(1_000));
+    expect(signals).toHaveLength(2);
+    expect(signals[0].aborted).toBe(true);
+    expect(signals[0].reason).toMatchObject({ code: 'network' });
+    expect(signals[1].aborted).toBe(false);
+    await act(async () => vi.advanceTimersByTime(3_000));
+    expect(signals).toHaveLength(5);
+    expect(signals.filter(s => !s.aborted)).toHaveLength(1);
+    // Superseded requests never surface as an error.
+    expect(screen.getByText('probe loading')).toBeTruthy();
+  });
+
+  test('changing range aborts the open request, and leaving the page aborts the current one', async () => {
+    const api = new DeferredHistory();
+    await signIn(api, '#/hosts/atlas');
+    const tile = await cpuTile();
+    await waitFor(() => expect(api.last('atlas', '24h')).toBeTruthy());
+    const day = api.last('atlas', '24h');
+    fireEvent.click(within(tile).getByRole('button', { name: '6h' }));
+    await waitFor(() => expect(api.last('atlas', '6h')).toBeTruthy());
+    expect(day.signal!.aborted).toBe(true);
+    const six = api.last('atlas', '6h');
+    expect(six.signal!.aborted).toBe(false);
+    go('#/vms');
+    await screen.findByRole('heading', { level: 1, name: 'Virtual machines' });
+    expect(six.signal!.aborted).toBe(true);
+    expect(api.open()).toHaveLength(0);
+  });
+
+  test('the board aborts its open batch request when the view goes away', async () => {
+    const api = standin();
+    const signals: AbortSignal[] = [];
+    vi.spyOn(api, 'listCpuHistory').mockImplementation((_range, options) => {
+      signals.push(options!.signal!);
+      return new Promise(() => undefined);
+    });
+    await signIn(api, '#/hosts');
+    await screen.findByRole('list', { name: 'Hosts' });
+    expect(signals).toHaveLength(1);
+    expect(signals[0].aborted).toBe(false);
+    go('#/activity');
+    await screen.findByRole('heading', { level: 1, name: 'Activity' });
+    expect(signals[0].aborted).toBe(true);
+  });
+
+  test('the stand-in rejects with the abort reason and never answers an aborted request', async () => {
+    const api = standin({ latencyMs: 50 });
+    await api.login(DEMO_CREDENTIALS);
+    const controller = new AbortController();
+    const pending = api.getCpuHistory('atlas', '1h', { signal: controller.signal });
+    const reason = new ApiError('unavailable', 'gone');
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    await expect(api.listCpuHistory('24h', { signal: controller.signal })).rejects.toBe(reason);
+  });
+});
+
+describe('bucket window', () => {
+  const span = (start: number, end: number) => ({ start, end });
+
+  test('handles move by whole buckets and are clamped so start <= end within the range', () => {
+    expect(moveHandle(span(0, 59), 'start', 'ArrowRight', 60)).toEqual(span(1, 59));
+    expect(moveHandle(span(0, 59), 'start', 'ArrowLeft', 60)).toEqual(span(0, 59));
+    expect(moveHandle(span(10, 20), 'start', 'End', 60)).toEqual(span(20, 20));
+    expect(moveHandle(span(10, 20), 'start', 'Home', 60)).toEqual(span(0, 20));
+    expect(moveHandle(span(10, 20), 'end', 'Home', 60)).toEqual(span(10, 10));
+    expect(moveHandle(span(10, 20), 'end', 'End', 60)).toEqual(span(10, 59));
+    expect(moveHandle(span(10, 20), 'end', 'ArrowDown', 60)).toEqual(span(10, 19));
+    expect(moveHandle(span(10, 20), 'end', 'PageUp', 60)).toEqual(span(10, 25));
+    expect(moveHandle(span(20, 20), 'end', 'ArrowLeft', 60)).toEqual(span(20, 20));
+    expect(moveHandle(span(0, 143), 'end', 'PageUp', 144)).toEqual(span(0, 143));
+    expect(moveHandle(span(0, 59), 'start', 'a', 60)).toBeNull();
+  });
+
+  test('the window reads as times before the end of the range', () => {
+    expect(agoText(0)).toBe('now');
+    expect(agoText(45 * 60)).toBe('45 min ago');
+    expect(agoText(4 * 3600)).toBe('4 h ago');
+    expect(agoText(250 * 60)).toBe('4 h 10 min ago');
+    expect(windowText(span(0, 59), 60, 60)).toBe('Window: 1 h ago → now · 60 buckets');
+    expect(windowText(span(36, 36), 60, 60)).toBe('Window: 24 min ago → 23 min ago · 1 bucket');
+    expect(windowText(span(0, 143), 144, 600)).toBe('Window: 24 h ago → now · 144 buckets');
+  });
+
+  const slider = (tile: HTMLElement, name: 'Window start' | 'Window end') => within(tile).getByRole('slider', { name });
+
+  test('the keyboard moves both handles; avg, peak and missing follow the selected buckets', async () => {
+    // 1h series: 10 for the first 30 buckets, 50 for the next 20, 90 for the last 10, with buckets 40-44 missing.
+    const samples: (number | null)[] = Array.from({ length: 60 }, (_, i) => (i >= 40 && i < 45 ? null : i < 30 ? 10 : i < 50 ? 50 : 90));
+    const api = new DeferredHistory();
+    await signIn(api, '#/hosts/atlas');
+    const tile = await cpuTile();
+    fireEvent.click(within(tile).getByRole('button', { name: '1h' }));
+    await waitFor(() => expect(api.last('atlas', '1h')).toBeTruthy());
+    await act(async () => api.last('atlas', '1h').resolve(history('atlas', '1h', samples)));
+    await within(tile).findByRole('img', { name: /last hour/ });
+    const start = slider(tile, 'Window start');
+    const end = slider(tile, 'Window end');
+    expect([start.getAttribute('aria-valuenow'), end.getAttribute('aria-valuenow')]).toEqual(['0', '59']);
+    expect(start.getAttribute('aria-valuetext')).toBe('1 h ago');
+    expect(end.getAttribute('aria-valuetext')).toBe('now');
+    expect(start.tabIndex).toBe(0);
+    expect(within(tile).getByText(/^Window: 1 h ago → now · 60 buckets$/)).toBeTruthy();
+    const full = summarizeCpuHistory(samples);
+    expect(readout(tile, 'avg').textContent).toBe(`${Math.round(full.avg!)}%`);
+    expect(within(tile).getByText(/5 of 60 buckets missing ·/)).toBeTruthy();
+    expect(tile.querySelector('.trace-dim')).toBeNull();
+
+    // End handle down to bucket 29: only the 10% buckets.
+    for (let i = 0; i < 30; i += 1) fireEvent.keyDown(end, { key: 'ArrowLeft' });
+    expect(end.getAttribute('aria-valuenow')).toBe('29');
+    expect(readout(tile, 'avg').textContent).toBe('10%');
+    expect(readout(tile, 'peak').textContent).toBe('10%');
+    expect(within(tile).queryByText(/buckets missing/)).toBeNull();
+    expect(start.getAttribute('aria-valuemax')).toBe('29');
+    expect(tile.querySelectorAll('.trace-dim')).toHaveLength(1);
+
+    // Window 30-49 via End on the end handle, then the start handle.
+    fireEvent.keyDown(end, { key: 'End' });
+    for (let i = 0; i < 30; i += 1) fireEvent.keyDown(start, { key: 'ArrowRight' });
+    for (let i = 0; i < 10; i += 1) fireEvent.keyDown(end, { key: 'ArrowLeft' });
+    expect([start.getAttribute('aria-valuenow'), end.getAttribute('aria-valuenow')]).toEqual(['30', '49']);
+    expect(readout(tile, 'avg').textContent).toBe('50%');
+    expect(readout(tile, 'peak').textContent).toBe('50%');
+    expect(within(tile).getByText(/5 of 20 buckets missing in the window/)).toBeTruthy();
+    expect(within(tile).getByText('Window: 30 min ago → 10 min ago · 20 buckets')).toBeTruthy();
+    expect(tile.querySelectorAll('.trace-dim')).toHaveLength(2);
+
+    // Start cannot pass end: End on the start handle stops at the end handle.
+    fireEvent.keyDown(start, { key: 'End' });
+    expect([start.getAttribute('aria-valuenow'), end.getAttribute('aria-valuenow')]).toEqual(['49', '49']);
+    expect(readout(tile, 'peak').textContent).toBe('50%');
+  });
+
+  test('a window of only missing buckets hatches avg and peak as usage unavailable, never 0%', async () => {
+    const samples: (number | null)[] = Array.from({ length: 144 }, (_, i) => (i >= 140 ? null : 30));
+    const api = new DeferredHistory();
+    await signIn(api, '#/hosts/atlas');
+    const tile = await cpuTile();
+    await waitFor(() => expect(api.last('atlas', '24h')).toBeTruthy());
+    await act(async () => api.last('atlas', '24h').resolve(history('atlas', '24h', samples)));
+    await within(tile).findByRole('img', { name: /last 24 hours/ });
+    fireEvent.keyDown(slider(tile, 'Window start'), { key: 'End' });
+    for (let i = 0; i < 3; i += 1) fireEvent.keyDown(slider(tile, 'Window start'), { key: 'ArrowLeft' });
+    expect(slider(tile, 'Window start').getAttribute('aria-valuenow')).toBe('140');
+    for (const label of ['avg', 'peak'] as const) {
+      expect(readout(tile, label).textContent).toBe('usage unavailable');
+      expect(readout(tile, label).querySelector('[data-null="true"]')).not.toBeNull();
+    }
+    expect(within(tile).getByText(/4 of 4 buckets missing in the window/)).toBeTruthy();
+    expect(tile.querySelector('.cpu-hist')!.textContent).not.toMatch(/\b0%/);
+  });
+
+  test('the window resets to the whole range when the range changes', async () => {
+    await signIn(standin(), '#/hosts/atlas');
+    const tile = await cpuTile();
+    await within(tile).findByRole('img', { name: /last 24 hours/ });
+    fireEvent.keyDown(slider(tile, 'Window start'), { key: 'PageUp' });
+    fireEvent.keyDown(slider(tile, 'Window end'), { key: 'PageDown' });
+    expect(slider(tile, 'Window start').getAttribute('aria-valuenow')).toBe('12');
+    expect(slider(tile, 'Window end').getAttribute('aria-valuenow')).toBe('131');
+    fireEvent.click(within(tile).getByRole('button', { name: '6h' }));
+    await within(tile).findByRole('img', { name: /last 6 hours/ });
+    expect(slider(tile, 'Window start').getAttribute('aria-valuenow')).toBe('0');
+    expect(slider(tile, 'Window end').getAttribute('aria-valuenow')).toBe('71');
+    fireEvent.click(within(tile).getByRole('button', { name: '24h' }));
+    await within(tile).findByRole('img', { name: /last 24 hours/ });
+    expect(slider(tile, 'Window start').getAttribute('aria-valuenow')).toBe('0');
+    expect(slider(tile, 'Window end').getAttribute('aria-valuenow')).toBe('143');
   });
 });

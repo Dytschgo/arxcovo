@@ -13,7 +13,7 @@ import {
   fixtureCpuMinute,
   isReadTool,
 } from './fixtures';
-import { activitySearch } from './http';
+import { abortError, activitySearch } from './http';
 import {
   ApiError,
   type ActivityEntry,
@@ -28,6 +28,7 @@ import {
   type CpuHistory,
   type CpuHistoryRange,
   type Host,
+  type ReadOptions,
   type Session,
   type TerminalCommand,
   type TerminalEvent,
@@ -113,15 +114,26 @@ export class StandinApi implements ArxApi {
     };
   }
 
-  private delay<T>(value: () => T): Promise<T> {
+  /** Answers after the latency; an abort before then cancels it and rejects with the signal's reason. */
+  private delay<T>(value: () => T, signal?: AbortSignal): Promise<T> {
     return new Promise((resolve, reject) => {
-      this.opts.schedule(() => {
+      if (signal?.aborted) {
+        reject(abortError(signal));
+        return;
+      }
+      const onAbort = () => {
+        cancel();
+        reject(abortError(signal!));
+      };
+      const cancel = this.opts.schedule(() => {
+        signal?.removeEventListener('abort', onAbort);
         try {
           resolve(value());
         } catch (error) {
           reject(error);
         }
       }, this.opts.latencyMs);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 
@@ -189,21 +201,21 @@ export class StandinApi implements ArxApi {
     });
   }
 
-  getCpuHistory(hostId: string, range: CpuHistoryRange): Promise<CpuHistory> {
+  getCpuHistory(hostId: string, range: CpuHistoryRange, options: ReadOptions = {}): Promise<CpuHistory> {
     return this.delay(() => {
       this.guard('getCpuHistory');
       if (!Object.hasOwn(CPU_HISTORY_RANGES, range)) throw new ApiError('invalid_request', 'Invalid CPU history range.');
       if (!this.opts.hosts.some(host => host.id === hostId)) throw new ApiError('not_found', `No host named ${hostId}.`, 404);
       return standinCpuHistory(hostId, range, this.opts.cpuMinute);
-    });
+    }, options.signal);
   }
 
-  listCpuHistory(range: '24h'): Promise<CpuHistory[]> {
+  listCpuHistory(range: '24h', options: ReadOptions = {}): Promise<CpuHistory[]> {
     return this.delay(() => {
       this.guard('listCpuHistory');
       if (range !== '24h') throw new ApiError('invalid_request', 'The CPU history batch requires a 24h range.');
       return this.opts.hosts.map(host => standinCpuHistory(host.id, range, this.opts.cpuMinute));
-    });
+    }, options.signal);
   }
 
   listActivity(query: ActivityQuery = {}): Promise<ActivityPage> {
