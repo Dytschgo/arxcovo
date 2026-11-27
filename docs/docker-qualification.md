@@ -53,7 +53,8 @@ Leave existing VMs, their hypervisor settings and the old Lab Manager untouched.
   versions including epochs, base-package inventory, the signed closure and
   the bounded read-only `ARXCOMPOSE` dependency medium.
 - Provide a disposable root-capable Ubuntu fixture as a standalone qcow2 v3
-  image of at most 8 GiB with 64 KiB clusters, a 32 GiB virtual disk and no\n  external backing.
+  image of at most 8 GiB with 64 KiB clusters, a 32 GiB virtual disk and no
+  external backing.
   Prepare it for UEFI and the enrolled guest network profile and include the
   digest-pinned benign container. The independent observer runs the fixture
   measurements against those enrolled inputs. Independently
@@ -188,7 +189,8 @@ from the production, trial, recipe and evidence areas.
 
 ## Exchange receiver evidence
 
-The mailbox protocol is covered by deterministic tests. Keep the mailbox on the\nqualifier host and the signer and signing key on the independent observer.
+The mailbox protocol is covered by deterministic tests. Keep the mailbox on the
+qualifier host and the signer and signing key on the independent observer.
 
 1. Give the independent observer the bytes of `request.json` from a fresh
    private mailbox. The request binds the run, boot, generation, nonce,
@@ -229,7 +231,8 @@ The mailbox protocol is covered by deterministic tests. Keep the mailbox on the\
    Exercise the same working public receivers. Retain independent counts
    and the original TEST seal for the later comparison. Recheck the
    Docker host pins and owner reserves after the stock run.
-3. Invoke the exact pinned runner from the reviewed release with a fresh,\n   existing empty evidence directory.
+3. Invoke the exact pinned runner from the reviewed release with a fresh,
+   existing empty evidence directory.
    Fill these three paths from the reviewed private enrollment and verified
    release. Keep them out of transcripts and shared logs.
 

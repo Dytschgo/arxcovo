@@ -1457,9 +1457,6 @@ impl StaticComposeProfile {
             backup.expected_root.identity()?;
             crate::vm::compose_backup::validate_targets(&backup.targets)?;
         }
-        if let Some(routes) = &self.private_routes {
-            routes.validate()?;
-        }
         Ok(())
     }
 }
@@ -1586,6 +1583,139 @@ impl StaticComposeSelection {
 mod static_compose_profile_tests {
     use super::*;
     use serde_json::json;
+
+    use arx_guest::compose::routing::{MAX_ROUTES, RoutingError, validate_routes};
+
+    const ROUTE_ZONE: &str = "example.invalid";
+
+    fn route(index: usize, slot: usize) -> serde_json::Value {
+        json!({
+            "hostname": format!("site-{index}.{ROUTE_ZONE}"),
+            "project_id": format!("project-{}", slot / 4),
+            "service": format!("web-{}", slot % 4),
+            "project_slot": slot / 4,
+            "service_index": slot % 4,
+            "route_slot": slot
+        })
+    }
+
+    fn combined_route_profile(
+        private: Vec<serde_json::Value>,
+        public: Vec<serde_json::Value>,
+    ) -> TestVms {
+        let hostnames: Vec<_> = public.iter().map(|route| &route["hostname"]).collect();
+        let profile: TestVms = serde_json::from_value(json!({
+            "enabled": true,
+            "static_compose": {
+                "selection": {
+                    "enrollment": "D:/qualification/enrollment.json",
+                    "dossier": "D:/qualification/dossier",
+                    "expected_dossier_root": {
+                        "volume_guid": r"\\?\Volume{a0b1c2d3-aaaa-bbbb-cccc-a0b1c2d3e4f5}",
+                        "volume_serial": "ab".repeat(8),
+                        "directory_file_id": "cd".repeat(16)
+                    },
+                    "seal_sha256": "aa".repeat(32),
+                    "scope": "bb".repeat(32)
+                },
+                "private_routes": {
+                    "vm_id": "aa".repeat(16),
+                    "zone": ROUTE_ZONE,
+                    "routes": private
+                }
+            },
+            "publication": {
+                "hostnames": hostnames,
+                "zone_name": ROUTE_ZONE,
+                "routes": public,
+                "static_name": "site",
+                "host_id": "bb".repeat(16),
+                "tunnel_id": "11111111-2222-3333-4444-555555555555",
+                "account_id": "cc".repeat(16),
+                "zone_id": "dd".repeat(16),
+                "private_root": "D:/private/publication",
+                "dns_ciphertext": "D:/private/publication/dns.dpapi",
+                "tunnel_ciphertext": "D:/private/publication/tunnel.dpapi",
+                "connector": "D:/tools/cloudflared.exe",
+                "connector_length": 1,
+                "connector_sha256": "ee".repeat(32)
+            }
+        }))
+        .unwrap();
+
+        // Each table passes its own validation before the union is checked.
+        let private = profile
+            .static_compose
+            .as_ref()
+            .unwrap()
+            .private_routes
+            .as_ref()
+            .unwrap();
+        validate_routes(Some(ROUTE_ZONE), private.targets()).unwrap();
+        profile
+            .publication
+            .as_ref()
+            .unwrap()
+            .validate_binding()
+            .unwrap();
+        profile
+    }
+
+    fn assert_combined_route_refusal(profile: TestVms, expected: RoutingError) {
+        let endpoint = crate::local::Endpoint {
+            address: "unused".into(),
+            client_identity: "unused".into(),
+        };
+        assert_eq!(
+            profile
+                .validate(Path::new("unused"), &endpoint)
+                .err()
+                .unwrap()
+                .to_string(),
+            format!("invalid combined Compose route bindings: {expected:?}")
+        );
+    }
+
+    #[test]
+    fn config_accepts_disjoint_static_route_bindings() {
+        combined_route_profile(vec![route(1, 1)], vec![route(0, 0)])
+            .validate_route_bindings()
+            .unwrap();
+    }
+
+    #[test]
+    fn config_accepts_identical_static_route_bindings() {
+        combined_route_profile(vec![route(0, 0)], vec![route(0, 0)])
+            .validate_route_bindings()
+            .unwrap();
+    }
+
+    #[test]
+    fn config_refuses_conflicting_static_route_bindings() {
+        assert_combined_route_refusal(
+            combined_route_profile(vec![route(0, 0)], vec![route(0, 1)]),
+            RoutingError::UnsortedOrDuplicateHostname,
+        );
+    }
+
+    #[test]
+    fn config_refuses_combined_static_route_slot_collision() {
+        let mut public = route(1, 1);
+        public["route_slot"] = json!(0);
+        assert_combined_route_refusal(
+            combined_route_profile(vec![route(0, 0)], vec![public]),
+            RoutingError::DuplicateRouteSlot,
+        );
+    }
+
+    #[test]
+    fn config_refuses_combined_static_route_table_overflow() {
+        let private = (0..MAX_ROUTES).map(|slot| route(slot, slot)).collect();
+        assert_combined_route_refusal(
+            combined_route_profile(private, vec![route(MAX_ROUTES, 0)]),
+            RoutingError::TooManyRoutes,
+        );
+    }
 
     #[test]
     fn static_compose_requires_supported_platform_and_independent_pins() {
@@ -1726,6 +1856,23 @@ impl ForegroundConfig {
 }
 
 impl TestVms {
+    fn validate_route_bindings(&self) -> Result<()> {
+        if let Some(routes) = self
+            .static_compose
+            .as_ref()
+            .and_then(|profile| profile.private_routes.as_ref())
+        {
+            routes.validate()?;
+            // Private enrollment uses a VM ID and publication uses a host and
+            // static name. Without a common key in the config, validate the two
+            // tables together before opening the store.
+            if let Some(publication) = &self.publication {
+                publication.validate_route_union(routes.targets())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Hold the state directory and any Compose secret directory before
     /// composition can open SQLite or write release enrollments.
     fn validate(
@@ -1735,6 +1882,7 @@ impl TestVms {
     ) -> Result<(PathBuf, std::sync::Arc<VmCustody>)> {
         use crate::vm::paths::LocalPath;
 
+        self.validate_route_bindings()?;
         anyhow::ensure!(
             self.compose_secret_root.is_none() || cfg!(all(windows, target_arch = "x86_64")),
             ComposeCustodyRefusal

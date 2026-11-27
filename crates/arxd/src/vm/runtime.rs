@@ -637,6 +637,10 @@ pub(crate) mod publication {
     }
 
     impl RouteBinding {
+        fn target(&self) -> arx_guest::compose::routing::RouteTarget {
+            self.slot().target(&self.hostname)
+        }
+
         fn slot(&self) -> RouteSlot {
             RouteSlot {
                 project_id: self.project_id.clone(),
@@ -749,7 +753,7 @@ pub(crate) mod publication {
                         binding.hostname == *expected_host,
                         "publication route hostname order mismatch"
                     );
-                    routes.push(binding.slot().target(expected_host));
+                    routes.push(binding.target());
                 }
                 arx_guest::compose::routing::validate_routes(
                     self.zone_name.as_ref().map(Hostname::as_str),
@@ -758,6 +762,28 @@ pub(crate) mod publication {
                 .map_err(|_| anyhow::anyhow!("invalid publication route bindings"))?;
             }
             Ok(())
+        }
+
+        pub(crate) fn validate_route_union(
+            &self,
+            private: &[arx_guest::compose::routing::RouteTarget],
+        ) -> Result<()> {
+            if !self.has_routes() {
+                return Ok(());
+            }
+            self.validate_binding()?;
+            let mut combined = private.to_vec();
+            combined.extend(self.routes.iter().map(RouteBinding::target));
+            combined.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+            // Full binding equality is required for an overlapping hostname.
+            // Conflicting duplicates remain for the table validator to reject.
+            combined.dedup();
+            // The guest validates the merged table in the publication zone.
+            arx_guest::compose::routing::validate_routes(
+                self.zone_name.as_ref().map(Hostname::as_str),
+                &combined,
+            )
+            .map_err(|error| anyhow::anyhow!("invalid combined Compose route bindings: {error:?}"))
         }
 
         pub(crate) fn validate(&self, state: &LocalPath) -> Result<()> {
