@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.2
 <#
 .SYNOPSIS
 Seals the owner's Cloudflare DNS bearer token and/or Cloudflare Tunnel credential
@@ -8,6 +8,8 @@ JSON into current-user DPAPI ciphertext leaves that arxd's publication profile r
 Writes `<TargetDirectory>\dns.dpapi` (profile `dns_ciphertext`) and/or
 `<TargetDirectory>\tunnel.dpapi` (profile `tunnel_ciphertext`). The directory is the
 profile's `private_root`; arxd requires both leaves directly inside it.
+
+Requires PowerShell 7.2 or later (.NET 6, for System.IO.RandomAccess).
 
 Secrets are read ONLY from:
   * a secure interactive prompt (Read-Host -AsSecureString), the default; or
@@ -66,7 +68,7 @@ Custody follows publish/windows.rs read_secret and create_private:
     user-scope DPAPI header, decrypts within arxd's read limit, compares with the
     validated plaintext and re-validates it. Any failure deletes the leaf through the
     same handle, as publish/windows.rs delete_on_close does (FileDispositionInfoEx with
-    DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE, falling back to the classic
+    DELETE | IGNORE_READONLY_ATTRIBUTE, falling back to the classic
     disposition); a cleanup that cannot be confirmed is reported as residue.
 
 -TestFault exists only for the test suite: it can only force a refusal after the leaf
@@ -152,7 +154,6 @@ namespace Arxcovo.CloudflareSeal
         public const int TokenElevationType = 18;
         public const int TokenElevation = 20;
         public const int ERROR_INVALID_PARAMETER = 87;
-        public const int ERROR_NOT_SUPPORTED = 50;
 
         // NtCreateFile
         public const uint FILE_OPEN = 1;
@@ -172,7 +173,6 @@ namespace Arxcovo.CloudflareSeal
         public const int FileDispositionInfo = 4;
         public const int FileDispositionInfoEx = 21;
         public const uint FILE_DISPOSITION_FLAG_DELETE = 0x1;
-        public const uint FILE_DISPOSITION_FLAG_POSIX_SEMANTICS = 0x2;
         public const uint FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE = 0x10;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -983,16 +983,16 @@ namespace Arxcovo.CloudflareSeal
 
         static bool Same(byte[] a, byte[] b) { return CryptographicOperations.FixedTimeEquals(a, b); }
 
-        /// publish/windows.rs delete_on_close: extended disposition (POSIX, ignoring a read-only
-        /// attribute) on the creating handle; the classic disposition only where Ex is unsupported.
+        /// Mirrors publish/windows.rs delete_on_close: marks the file this run created for deletion
+        /// through its own handle with the extended disposition, which ignores a read-only attribute.
+        /// Only where the extended class is reported unsupported (ERROR_INVALID_PARAMETER) is the
+        /// classic disposition tried on the same handle. Failure is returned, never retried by path.
         static bool DeleteOnClose(SafeFileHandle handle)
         {
             Native.FILE_DISPOSITION_INFO_EX extended = new Native.FILE_DISPOSITION_INFO_EX();
-            extended.Flags = Native.FILE_DISPOSITION_FLAG_DELETE | Native.FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
-                | Native.FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
+            extended.Flags = Native.FILE_DISPOSITION_FLAG_DELETE | Native.FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
             if (Native.SetFileInformationByHandle(handle, Native.FileDispositionInfoEx, ref extended, 4)) return true;
-            int error = Marshal.GetLastWin32Error();
-            if (error != Native.ERROR_INVALID_PARAMETER && error != Native.ERROR_NOT_SUPPORTED) return false;
+            if (Marshal.GetLastWin32Error() != Native.ERROR_INVALID_PARAMETER) return false;
             Native.FILE_DISPOSITION_INFO classic = new Native.FILE_DISPOSITION_INFO();
             classic.DeleteFile = 1;
             return Native.SetFileInformationByHandle(handle, Native.FileDispositionInfo, ref classic, 1);
