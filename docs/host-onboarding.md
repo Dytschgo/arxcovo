@@ -209,12 +209,16 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`, ADR 0015):
    `arxd: service-foreign-registration` has two sources (`owner_unix.rs`
    `observe`): a file at `/Library/LaunchDaemons/com.arxcovo.arxd.plist` whose
    bytes differ from Arxcovo's plist, or a launchd job with this label whose
-   plist path, program or arguments differ from Arxcovo's. `status` and
-   `install` change nothing when they report it. `stop` and `uninstall` check
-   again before `bootout` and after it (`owner_plan.rs`), so a foreign result
-   there can come after `disable` has already run, or after `bootout` has
-   already stopped the job; the plist is never removed in that case. Inspect
-   the conflicting file or job yourself before rerunning.
+   plist path, program or arguments differ from Arxcovo's. Only `status` is
+   strictly read-only. The other verbs check first and change nothing when
+   that first check reports it, but they check again later (`owner_plan.rs`),
+   and nothing is rolled back: `install` can report it at its final check,
+   after it has created the private directories and state, run `disable` and
+   published the plist; `start` can report it before `bootstrap`, after
+   `enable` has run; `stop` and `uninstall` can report it before `bootout`,
+   after `disable` has run, or after `bootout` has already stopped the job,
+   and they never remove the plist in that case. Inspect the conflicting
+   file or job yourself before rerunning.
 6. Cluster join: not available on macOS in this version. The cluster runtime is
    Linux-only (`cluster/consensus/bound_start.rs`), `--cluster-config` exits
    with the config error on macOS, and the service refuses a `cluster`
