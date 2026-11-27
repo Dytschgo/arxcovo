@@ -4,10 +4,14 @@
 use super::*;
 use crate::vm::public_egress::FROZEN_DENY;
 use std::{
+    collections::BTreeSet,
     ffi::c_void,
     net::Ipv4Addr,
     ptr::{NonNull, addr_of, null_mut},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use windows_sys::Win32::{
     Foundation::HANDLE,
@@ -22,23 +26,38 @@ const NETWORK: NativeRefusal = NativeRefusal::NetworkFenceUnverified;
 const MAX_TABLE_ROWS: usize = 4096;
 const MAX_TARGETS: usize = 32;
 
+type Interface = (u32, u64);
+
+struct WatchContext {
+    policy: PublicEgressPolicy,
+    changed: AtomicBool,
+    interfaces: OnceLock<BTreeSet<Interface>>,
+}
+
+impl WatchContext {
+    fn on_uplink(&self, interface: Interface) -> bool {
+        let uplink = self.policy.uplink();
+        interface.0 == uplink.interface_index || interface.1 == uplink.interface_luid
+    }
+}
+
 struct Notification {
     handle: usize,
-    changed: Arc<AtomicBool>,
+    context: Arc<WatchContext>,
 }
 
 impl Notification {
     fn arm(
-        changed: &Arc<AtomicBool>,
+        context: &Arc<WatchContext>,
         register: impl FnOnce(*const c_void, *mut HANDLE) -> u32,
     ) -> Result<Self, NativeRefusal> {
         let mut handle = null_mut();
-        if register(Arc::as_ptr(changed).cast(), &mut handle) != 0 || handle.is_null() {
+        if register(Arc::as_ptr(context).cast(), &mut handle) != 0 || handle.is_null() {
             return Err(NETWORK);
         }
         Ok(Self {
             handle: handle as usize,
-            changed: changed.clone(),
+            context: context.clone(),
         })
     }
 }
@@ -48,40 +67,57 @@ impl Drop for Notification {
         // The registration's Arc keeps its callback context live until
         // deregistration. Retain that reference if cancellation fails.
         if unsafe { CancelMibChangeNotify2(self.handle as HANDLE) } != 0 {
-            std::mem::forget(self.changed.clone());
+            std::mem::forget(self.context.clone());
         }
     }
 }
 
 pub(in crate::vm::windows::qualification) struct RouteWatch {
     _notifications: [Notification; 3],
-    changed: Arc<AtomicBool>,
+    context: Arc<WatchContext>,
 }
 
 impl RouteWatch {
-    pub(super) fn arm() -> Result<Self, NativeRefusal> {
-        let changed = Arc::new(AtomicBool::new(false));
+    pub(super) fn arm(policy: &PublicEgressPolicy) -> Result<Self, NativeRefusal> {
+        let context = Arc::new(WatchContext {
+            policy: policy.clone(),
+            changed: AtomicBool::new(false),
+            interfaces: OnceLock::new(),
+        });
         // Context belongs to the returned registrations and remains alive
         // during registration. The callbacks only mark it invalid.
-        let route = Notification::arm(&changed, |context, handle| unsafe {
+        let route = Notification::arm(&context, |context, handle| unsafe {
             NotifyRouteChange2(AF_INET, Some(route_changed), context, false, handle)
         })?;
-        let address = Notification::arm(&changed, |context, handle| unsafe {
+        let address = Notification::arm(&context, |context, handle| unsafe {
             NotifyUnicastIpAddressChange(AF_INET, Some(address_changed), context, false, handle)
         })?;
-        let interface = Notification::arm(&changed, |context, handle| unsafe {
+        let interface = Notification::arm(&context, |context, handle| unsafe {
             NotifyIpInterfaceChange(AF_INET, Some(interface_changed), context, false, handle)
         })?;
         Ok(Self {
             _notifications: [route, address, interface],
-            changed,
+            context,
         })
     }
 
     pub(super) fn require_current(&self) -> Result<(), NativeRefusal> {
-        (!self.changed.load(Ordering::Acquire))
+        (!self.context.changed.load(Ordering::Acquire))
             .then_some(())
             .ok_or(NETWORK)
+    }
+
+    pub(super) fn require_baseline(
+        &self,
+        policy: &PublicEgressPolicy,
+        public_targets: &[Ipv4Addr],
+        expected: Hash,
+    ) -> Result<(), NativeRefusal> {
+        let (_, observed) = self.observe(policy, public_targets)?;
+        if observed != expected {
+            self.context.changed.store(true, Ordering::Release);
+        }
+        self.require_current()
     }
 
     pub(super) fn observe(
@@ -89,7 +125,16 @@ impl RouteWatch {
         policy: &PublicEgressPolicy,
         public_targets: &[Ipv4Addr],
     ) -> Result<(RouteObservation, Hash), NativeRefusal> {
-        sample_while_current(&self.changed, || topology(policy, public_targets))
+        sample_while_current(&self.context.changed, || {
+            if policy != &self.context.policy {
+                return Err(NETWORK);
+            }
+            let (route, fingerprint, interfaces) = topology(policy, public_targets)?;
+            if self.context.interfaces.get_or_init(|| interfaces.clone()) != &interfaces {
+                return Err(NETWORK);
+            }
+            Ok((route, fingerprint))
+        })
     }
 }
 
@@ -110,34 +155,58 @@ fn sample_while_current<T>(
     observed
 }
 
-fn mark_changed(context: *const c_void) {
-    // All three registration callbacks receive a pointer retained by their
-    // registration. No Windows-owned row pointer is read.
-    unsafe { &*context.cast::<AtomicBool>() }.store(true, Ordering::Release);
+// SAFETY: context must be the live Arc pointer passed to registration.
+unsafe fn mark_changed(context: *const c_void, relevant: impl FnOnce(&WatchContext) -> bool) {
+    let context = unsafe { &*context.cast::<WatchContext>() };
+    if relevant(context) {
+        context.changed.store(true, Ordering::Release);
+    }
 }
 
 unsafe extern "system" fn route_changed(
     context: *const c_void,
-    _: *const MIB_IPFORWARD_ROW2,
+    row: *const MIB_IPFORWARD_ROW2,
     _: MIB_NOTIFICATION_TYPE,
 ) {
-    mark_changed(context);
+    // Windows owns the row for the duration of the callback.
+    unsafe {
+        mark_changed(context, |context| {
+            row.as_ref()
+                .is_none_or(|row| route_relevant(&context.policy, row).unwrap_or(true))
+        });
+    }
 }
 
 unsafe extern "system" fn address_changed(
     context: *const c_void,
-    _: *const MIB_UNICASTIPADDRESS_ROW,
+    row: *const MIB_UNICASTIPADDRESS_ROW,
     _: MIB_NOTIFICATION_TYPE,
 ) {
-    mark_changed(context);
+    unsafe {
+        mark_changed(context, |context| {
+            row.as_ref()
+                .is_none_or(|row| address_relevant(&context.policy, row).unwrap_or(true))
+        });
+    }
 }
 
 unsafe extern "system" fn interface_changed(
     context: *const c_void,
-    _: *const MIB_IPINTERFACE_ROW,
+    row: *const MIB_IPINTERFACE_ROW,
     _: MIB_NOTIFICATION_TYPE,
 ) {
-    mark_changed(context);
+    unsafe {
+        mark_changed(context, |context| {
+            row.as_ref().is_none_or(|row| {
+                let key = (row.InterfaceIndex, row.InterfaceLuid.Value);
+                context.on_uplink(key)
+                    || context
+                        .interfaces
+                        .get()
+                        .is_none_or(|set| set.contains(&key))
+            })
+        });
+    }
 }
 
 struct Table<T>(NonNull<T>);
@@ -201,24 +270,71 @@ fn best_route(source: Ipv4Addr, target: Ipv4Addr) -> Result<RouteObservation, Na
     })
 }
 
-fn deny_covers_prefix(policy: &PublicEgressPolicy, address: Ipv4Addr, prefix: u8) -> bool {
+fn covers_prefix(
+    address: Ipv4Addr,
+    prefix: u8,
+    includes: impl FnOnce(Ipv4Addr, Ipv4Addr) -> bool,
+) -> bool {
     if !(1..=32).contains(&prefix) {
         return false;
     }
     let host_mask = u32::MAX.checked_shr(u32::from(prefix)).unwrap_or(0);
     let address = u32::from(address);
-    let first = Ipv4Addr::from(address & !host_mask);
-    let last = Ipv4Addr::from(address | host_mask);
-    FROZEN_DENY
-        .iter()
-        .chain(policy.deny())
-        .any(|denied| denied.contains(first) && denied.contains(last))
+    includes((address & !host_mask).into(), (address | host_mask).into())
+}
+
+fn deny_covers_prefix(policy: &PublicEgressPolicy, address: Ipv4Addr, prefix: u8) -> bool {
+    covers_prefix(address, prefix, |first, last| {
+        FROZEN_DENY
+            .iter()
+            .chain(policy.deny())
+            .any(|denied| denied.contains(first) && denied.contains(last))
+    })
+}
+
+fn unrelated_prefix(policy: &PublicEgressPolicy, address: Ipv4Addr, prefix: u8) -> bool {
+    covers_prefix(address, prefix, |first, last| {
+        FROZEN_DENY
+            .iter()
+            .any(|denied| denied.contains(first) && denied.contains(last))
+            && !policy
+                .deny()
+                .iter()
+                .any(|site| site.contains(first) || (first..=last).contains(&site.network()))
+    })
+}
+
+fn address_relevant(
+    policy: &PublicEgressPolicy,
+    row: &MIB_UNICASTIPADDRESS_ROW,
+) -> Result<bool, NativeRefusal> {
+    let uplink = policy.uplink();
+    let ip = ipv4(row.Address)?;
+    Ok(row.InterfaceIndex == uplink.interface_index
+        || unsafe { row.InterfaceLuid.Value } == uplink.interface_luid
+        || !unrelated_prefix(policy, ip, row.OnLinkPrefixLength))
+}
+
+fn route_relevant(
+    policy: &PublicEgressPolicy,
+    row: &MIB_IPFORWARD_ROW2,
+) -> Result<bool, NativeRefusal> {
+    let uplink = policy.uplink();
+    let ip = ipv4(row.DestinationPrefix.Prefix)?;
+    let gateway = ipv4(row.NextHop)?;
+    // Always include defaults (prefix 0), uplink changes and public-numbered
+    // routes, even on secondary adapters. Only immutable denies can make a
+    // non-uplink private route irrelevant to the public egress policy.
+    Ok(row.InterfaceIndex == uplink.interface_index
+        || unsafe { row.InterfaceLuid.Value } == uplink.interface_luid
+        || !unrelated_prefix(policy, ip, row.DestinationPrefix.PrefixLength)
+        || (!gateway.is_unspecified() && !unrelated_prefix(policy, gateway, 32)))
 }
 
 fn topology(
     policy: &PublicEgressPolicy,
     public_targets: &[Ipv4Addr],
-) -> Result<(RouteObservation, Hash), NativeRefusal> {
+) -> Result<(RouteObservation, Hash, BTreeSet<Interface>), NativeRefusal> {
     if public_targets.is_empty()
         || public_targets.len() > MAX_TARGETS
         || public_targets.iter().any(|&ip| policy.denies(ip))
@@ -257,8 +373,13 @@ fn topology(
             links.rows(addr_of!((*l).Table).cast::<MIB_IF_ROW2>(), (*l).NumEntries)?,
         )
     };
+    let mut relevant = BTreeSet::new();
     let mut address_projection = Vec::with_capacity(addresses.len());
     for row in addresses {
+        if !address_relevant(policy, row)? {
+            continue;
+        }
+        relevant.insert((row.InterfaceIndex, unsafe { row.InterfaceLuid.Value }));
         let ip = ipv4(row.Address)?;
         if !deny_covers_prefix(policy, ip, row.OnLinkPrefixLength) {
             return Err(NETWORK);
@@ -284,6 +405,10 @@ fn topology(
     }
     let mut route_projection = Vec::with_capacity(routes.len());
     for row in routes {
+        if !route_relevant(policy, row)? {
+            continue;
+        }
+        relevant.insert((row.InterfaceIndex, unsafe { row.InterfaceLuid.Value }));
         let address = ipv4(row.DestinationPrefix.Prefix)?;
         let prefix = row.DestinationPrefix.PrefixLength;
         let next_hop = ipv4(row.NextHop)?;
@@ -305,6 +430,7 @@ fn topology(
     }
     let mut interface_projection: Vec<_> = interfaces
         .iter()
+        .filter(|row| relevant.contains(&(row.InterfaceIndex, unsafe { row.InterfaceLuid.Value })))
         .map(|row| {
             (
                 row.InterfaceIndex,
@@ -319,6 +445,7 @@ fn topology(
         .collect();
     let mut link_projection: Vec<_> = links
         .iter()
+        .filter(|row| relevant.contains(&(row.InterfaceIndex, unsafe { row.InterfaceLuid.Value })))
         .map(|row| {
             (
                 row.InterfaceIndex,
@@ -342,7 +469,7 @@ fn topology(
     interface_projection.sort_unstable();
     link_projection.sort_unstable();
     let hash = projection(
-        "arx-docker-ipv4-topology-v1",
+        "arx-docker-ipv4-topology-v2",
         (
             address_projection,
             route_projection,
@@ -351,21 +478,25 @@ fn topology(
         ),
     )
     .map_err(|_| NETWORK)?;
-    Ok((route, hash))
+    Ok((route, hash, relevant))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn local_prefix_coverage_requires_the_entire_network() {
-        let body = "version=1\ninterface_index=7\ninterface_luid=8\nsource=10.8.0.4\ngateway=10.8.0.1\ndeny=11.0.0.4/32\n";
+    fn policy() -> PublicEgressPolicy {
+        let body = "version=1\ninterface_index=7\ninterface_luid=8\nsource=10.8.0.4\ngateway=10.8.0.1\ndeny=11.0.0.4/32\ndeny=192.168.2.0/24\n";
         let bytes = format!(
             "{body}fingerprint={}\n",
             hex::encode(digest(body.as_bytes()))
         );
-        let policy = PublicEgressPolicy::parse(bytes.as_bytes()).unwrap();
+        PublicEgressPolicy::parse(bytes.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn local_prefix_coverage_requires_the_entire_network() {
+        let policy = policy();
         let ip = "11.0.0.4".parse().unwrap();
         assert!(deny_covers_prefix(&policy, ip, 32));
         assert!(!deny_covers_prefix(&policy, ip, 24));
@@ -375,17 +506,68 @@ mod tests {
     }
 
     #[test]
+    fn relevant_notifications_include_enrolled_lans_and_alternate_defaults() {
+        use windows_sys::Win32::Networking::WinSock::SOCKADDR_IN;
+        let sockaddr = |octets| {
+            let mut addr = SOCKADDR_IN {
+                sin_family: AF_INET,
+                ..Default::default()
+            };
+            addr.sin_addr.S_un.S_addr = u32::from_ne_bytes(octets);
+            SOCKADDR_INET { Ipv4: addr }
+        };
+        let context = WatchContext {
+            policy: policy(),
+            changed: AtomicBool::new(false),
+            interfaces: OnceLock::from(BTreeSet::from([(7, 8)])),
+        };
+        let pointer = (&raw const context).cast();
+        let mut route = MIB_IPFORWARD_ROW2 {
+            InterfaceIndex: 9,
+            ..Default::default()
+        };
+        route.DestinationPrefix.Prefix = sockaddr([192, 168, 50, 0]);
+        route.DestinationPrefix.PrefixLength = 24;
+        route.NextHop = sockaddr([0; 4]);
+        let interface = MIB_IPINTERFACE_ROW {
+            InterfaceIndex: 9,
+            ..Default::default()
+        };
+        unsafe {
+            route_changed(pointer, &route, 0);
+            interface_changed(pointer, &interface, 0);
+        }
+        assert!(!context.changed.load(Ordering::Acquire));
+
+        for (destination, prefix) in [([0; 4], 0), ([192, 168, 2, 0], 24), ([11, 0, 0, 0], 24)] {
+            route.DestinationPrefix.Prefix = sockaddr(destination);
+            route.DestinationPrefix.PrefixLength = prefix;
+            unsafe { route_changed(pointer, &route, 0) };
+            assert!(context.changed.swap(false, Ordering::AcqRel));
+        }
+        route.DestinationPrefix.Prefix = sockaddr([192, 168, 50, 0]);
+        route.InterfaceIndex = 7;
+        unsafe { route_changed(pointer, &route, 0) };
+        assert!(context.changed.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn observation_failure_and_notifications_permanently_retire_the_sample() {
-        let changed = AtomicBool::new(false);
-        assert_eq!(sample_while_current(&changed, || Ok(1)), Ok(1));
-        let result = sample_while_current(&changed, || {
+        let context = WatchContext {
+            policy: policy(),
+            changed: AtomicBool::new(false),
+            interfaces: OnceLock::new(),
+        };
+        let changed = &context.changed;
+        assert_eq!(sample_while_current(changed, || Ok(1)), Ok(1));
+        let result = sample_while_current(changed, || {
             // The observer owns the callback context for this exchange.
-            unsafe { route_changed((&raw const changed).cast(), std::ptr::null(), 0) };
+            unsafe { route_changed((&raw const context).cast(), std::ptr::null(), 0) };
             Ok(2)
         });
         assert_eq!(result, Err(NETWORK));
         assert_eq!(
-            sample_while_current::<()>(&changed, || panic!("retired sample retried")),
+            sample_while_current::<()>(changed, || panic!("retired sample retried")),
             Err(NETWORK)
         );
 

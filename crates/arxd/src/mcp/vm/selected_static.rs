@@ -1,5 +1,7 @@
 //! Static Compose selection is separate from TEST recipe and launch authority.
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+use super::selected_test::SelectedTest;
 use super::*;
 use crate::vm::qualification_record::{Hash, RecipeIdentity, VerifiedDockerEvidence};
 
@@ -7,23 +9,36 @@ pub(super) struct SelectedStatic(Source);
 
 enum Source {
     #[cfg(all(windows, target_arch = "x86_64"))]
-    Native(crate::vm::qualification::StaticDossier),
+    Native(Box<crate::vm::qualification::StaticDossier>),
     #[cfg(test)]
-    Fixture(FixtureStaticQualification),
+    Fixture(Box<FixtureStaticQualification>),
 }
 
 impl SelectedStatic {
-    pub(super) fn open(custody: &crate::config::VmCustody) -> Result<Self, NativeRefusal> {
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        {
-            custody
-                .select_static_dossier()
-                .map(|dossier| Self(Source::Native(dossier)))
-        }
-        #[cfg(not(all(windows, target_arch = "x86_64")))]
-        {
-            let _ = custody;
-            Err(NativeRefusal::UnsupportedPlatform)
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) fn open(
+        custody: &crate::config::VmCustody,
+        m4: &SelectedTest,
+    ) -> Result<Self, NativeRefusal> {
+        let dossier = custody.select_static_dossier(Some(m4.native_source()))?;
+        Ok(Self(Source::Native(Box::new(dossier))))
+    }
+
+    pub(super) fn refusal(&self) -> Option<NativeRefusal> {
+        match self.0 {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            Source::Native(ref dossier) => {
+                // Verified read-side selection has no checked static launcher.
+                Some(
+                    dossier
+                        .require_current()
+                        .err()
+                        .unwrap_or(NativeRefusal::NetworkFenceUnverified),
+                )
+            }
+            #[cfg(test)]
+            Source::Fixture(ref fixture) => (!fixture.network_live.load(Ordering::Acquire))
+                .then_some(NativeRefusal::NetworkFenceUnverified),
         }
     }
 
@@ -55,12 +70,7 @@ impl SelectedStatic {
     }
 
     pub(super) fn buildable(&self) -> bool {
-        match self.0 {
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            Source::Native(_) => false,
-            #[cfg(test)]
-            Source::Fixture(ref fixture) => fixture.network_live.load(Ordering::Acquire),
-        }
+        self.refusal().is_none()
     }
 
     #[cfg(test)]
@@ -95,7 +105,7 @@ impl FixtureStaticQualification {
         use crate::vm::qualification_record::DockerRecipe;
 
         let closure = [0x71; 32];
-        SelectedStatic(Source::Fixture(Self {
+        SelectedStatic(Source::Fixture(Box::new(Self {
             network_live: AtomicBool::new(true),
             seal_sha256: [0x70; 32],
             evidence: VerifiedDockerEvidence::recipe_fixture(DockerRecipe {
@@ -104,6 +114,6 @@ impl FixtureStaticQualification {
                 closure,
                 medium: [0x73; 32],
             }),
-        }))
+        })))
     }
 }
