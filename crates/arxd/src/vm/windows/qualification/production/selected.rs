@@ -1,9 +1,8 @@
 use super::*;
 use crate::store::vm::{native::Origin, snapshot::Work};
 use crate::vm::{
-    ClonePublication, FailureReason, HostObservation, PendingOperation, Resources, SealedGolden,
-    VmController,
-    test_issuer::{NativeTarget, TestIssuer},
+    ClonePublication, FailureReason, HostObservation, PendingOperation, Resources, VmController,
+    test_issuer::{NativeTarget, SelectedSource, TestIssuer},
 };
 use clone::{CheckedOverlay, CloneRequest, stage_linked_clone};
 use snapshot::{
@@ -21,33 +20,11 @@ impl ForegroundQualification {
         self.observe_host(TEST_JOB_MEMORY).map(|(_, host)| host)
     }
 
-    pub(crate) fn verify_golden<C: crate::vm::Clock>(
-        &self,
-        controller: &VmController<C>,
-        golden: &SealedGolden,
-    ) -> Result<(), NativeRefusal> {
-        let ledger = LedgerCheckpoints {
-            store: controller.native_store(),
-            origin: Origin::Clone,
-        };
-        let scope = controller
-            .native_workspace_scope(golden.slots().disk.generation)
-            .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
-        self.hold_golden(
-            &ledger,
-            binding_from_scope(scope),
-            golden,
-            Instant::now() + Duration::from_secs(10),
-            &|| false,
-        )?;
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments, reason = "one admitted clone's wiring")]
-    pub(crate) async fn clone_test<C: crate::vm::Clock>(
+    pub(crate) async fn clone_test<S: SelectedSource, C: crate::vm::Clock>(
         &self,
         controller: &VmController<C>,
-        issuer: &TestIssuer<'_, Self, C>,
+        issuer: &TestIssuer<'_, S, C>,
         worker: PendingOperation,
         slots: PairSlots,
         size: u64,
@@ -136,10 +113,10 @@ impl ForegroundQualification {
     /// Called by the tracked blocking worker. The inspector drives its helper
     /// via Handle::block_on, so the caller must not enter an async task here.
     #[allow(clippy::too_many_arguments, reason = "one admitted snapshot's wiring")]
-    pub(crate) fn snapshot_test<C: crate::vm::Clock>(
+    pub(crate) fn snapshot_test<S: SelectedSource, C: crate::vm::Clock>(
         &self,
         controller: &VmController<C>,
-        issuer: &TestIssuer<'_, Self, C>,
+        issuer: &TestIssuer<'_, S, C>,
         worker: PendingOperation,
         work: Work,
         cutoff: Instant,

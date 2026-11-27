@@ -334,7 +334,7 @@ pub(crate) struct CheckedSnapshotInspector<'a, M, R> {
     pub refresh: R,
 }
 
-fn inspection_launch_target<'a, 'plan>(
+pub(super) fn inspection_launch_target<'a, 'plan>(
     plan: &'a CommandPlan<'plan>,
     workspace: &ProductionWorkspace,
     cwd: &'a LocalPath,
@@ -931,4 +931,4 @@ pub(crate) fn copy_offline_snapshot(
 
 #[cfg(test)]
 #[path = "snapshot_tests.rs"]
-mod tests;
+pub(super) mod tests;

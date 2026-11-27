@@ -5,7 +5,7 @@
 use super::health::{AdmittedProbe, HealthRun, HealthSession, run_health};
 use super::*;
 use crate::vm::runtime::InstallerFailureReason;
-use crate::vm::test_issuer::{Intent, NativeTarget, TestIssuer};
+use crate::vm::test_issuer::{Intent, NativeTarget, SelectedSource, TestIssuer};
 use crate::vm::windows::qualification::recipe::BootReservation;
 
 /// A held installed boot driven by the shared health runner.
@@ -73,17 +73,17 @@ fn installer_refusal(reason: InstallerFailureReason) -> Q {
     }
 }
 
-struct Checked<'a, C> {
+struct Checked<'a, S, C> {
     qualification: &'a ForegroundQualification,
-    issuer: &'a TestIssuer<'a, ForegroundQualification, C>,
-    intent: &'a Intent<'a, ForegroundQualification, C>,
+    issuer: &'a TestIssuer<'a, S, C>,
+    intent: &'a Intent<'a, S, C>,
     cwd: LocalPath,
     cancel: &'a Shutdown,
     cancelled: &'a dyn Fn() -> bool,
     limits: BuildRequest<'a>,
 }
 
-impl<C: Clock> Effects for Checked<'_, C> {
+impl<S: SelectedSource, C: Clock> Effects for Checked<'_, S, C> {
     fn fresh(&self) -> Result<Instant, Q> {
         self.issuer.refresh()
     }
@@ -308,10 +308,10 @@ impl ForegroundQualification {
     /// Runs an already-admitted build. Installation of the issuer and the
     /// entry point that admits native production requests land in chunk 16.
     #[allow(clippy::too_many_arguments, reason = "one admitted build's inputs")]
-    pub(crate) async fn build_test_golden<'q, C: Clock>(
+    pub(crate) async fn build_test_golden<'q, S: SelectedSource, C: Clock>(
         &'q self,
         controller: &VmController<C>,
-        issuer: &'q TestIssuer<'q, Self, C>,
+        issuer: &'q TestIssuer<'q, S, C>,
         worker: &PendingOperation,
         slots: BuildSlots,
         request: BuildRequest<'_>,

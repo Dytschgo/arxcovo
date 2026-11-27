@@ -929,6 +929,16 @@ pub(crate) struct VmCustody {
 }
 
 impl VmCustody {
+    #[cfg(all(test, windows, target_arch = "x86_64"))]
+    pub(crate) fn test_only(root: &Path) -> Result<Self> {
+        Ok(Self {
+            configured_state: root.to_owned(),
+            state: RootPin::acquire(root)?,
+            lost: Default::default(),
+            secret: None,
+        })
+    }
+
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn configured_state(&self) -> &Path {
         &self.configured_state

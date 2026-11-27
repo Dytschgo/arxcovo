@@ -41,12 +41,39 @@ pub(crate) struct HeldGolden {
     slots: PairSlots,
     evidence: [ArtifactEvidence; 2],
     pins: [PathPin; 2],
-    _guards: [File; 2],
+    guards: [File; 2],
 }
 
 impl HeldGolden {
     /// T25: the exact admitted golden, in its bound scope, before any write.
     pub(super) fn hold(
+        production: &PathPin,
+        owner: PSID,
+        ledger: &dyn CustodyCheckpoints,
+        scope: WorkspaceBinding,
+        golden: &SealedGolden,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, Q> {
+        let held = Self::identify(
+            production, owner, ledger, scope, golden, deadline, cancelled,
+        )?;
+        for ((guard, limit), expected) in
+            held.guards.iter().zip(START_PAIR_LIMITS).zip(held.evidence)
+        {
+            if launch::hash_held(guard, limit, deadline, cancelled)? != expected.pin {
+                return Err(PATH);
+            }
+        }
+        WorkspaceCustody::production(&held.workspace.root, &held.workspace.lease)?;
+        Ok(held)
+    }
+
+    /// The custody of [`HeldGolden::hold`] without hashing the content: the
+    /// sealed ledger pair, its bound workspace lease and both slots pinned at
+    /// their sealed identities and writer-excluded. Every clone and start
+    /// still hashes its held golden before any write.
+    pub(super) fn identify(
         production: &PathPin,
         owner: PSID,
         ledger: &dyn CustodyCheckpoints,
@@ -69,18 +96,14 @@ impl HeldGolden {
         ];
         let guard = |pin: &PathPin| pin.reopen_without_writer().map_err(|_| PATH);
         let guards = [guard(&pins[0])?, guard(&pins[1])?];
-        for ((guard, limit), expected) in guards.iter().zip(START_PAIR_LIMITS).zip(evidence) {
-            if launch::hash_held(guard, limit, deadline, cancelled)? != expected.pin {
-                return Err(PATH);
-            }
-        }
         WorkspaceCustody::production(&workspace.root, &workspace.lease)?;
+        launch::check_preparation(deadline, cancelled)?;
         Ok(Self {
             workspace,
             slots,
             evidence,
             pins,
-            _guards: guards,
+            guards,
         })
     }
 
@@ -127,7 +150,38 @@ impl ForegroundQualification {
             cancelled,
         )
     }
+
+    /// Build reuse under the foreground gate: the sealed pair's custody as
+    /// [`HeldGolden::identify`], bounded and cancellable, without hashing up
+    /// to 40 GiB while every other dispatch waits on the gate.
+    pub(crate) fn confirm_golden<C: crate::vm::Clock>(
+        &self,
+        controller: &crate::vm::VmController<C>,
+        golden: &SealedGolden,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), Q> {
+        let ledger = LedgerCheckpoints {
+            store: controller.native_store(),
+            origin: crate::store::vm::native::Origin::Clone,
+        };
+        let scope = controller
+            .native_workspace_scope(golden.slots().disk.generation)
+            .map_err(|_| PATH)?;
+        HeldGolden::identify(
+            self.production_root(),
+            self.held.token.account.0,
+            &ledger,
+            binding_from_scope(scope),
+            golden,
+            Instant::now() + GOLDEN_CUSTODY_BUDGET,
+            cancelled,
+        )?;
+        Ok(())
+    }
 }
+
+/// Bounds the identity-only golden check made under the foreground gate.
+pub(super) const GOLDEN_CUSTODY_BUDGET: Duration = Duration::from_secs(2);
 
 /// One clone's staging scope: its planned pair, overlay size and cutoffs.
 pub(crate) struct CloneRequest<'a> {

@@ -274,10 +274,22 @@ fn same_work(work: &Work) -> Work {
 /// held disk's first cluster and reports what the pinned helper would.
 type InspectionCheck<'a> = dyn Fn(&InspectTarget<'_>, &SnapshotInfo<'_>, &CopyBudget<'_>) + 'a;
 
-struct FixtureInspector<'a> {
+pub(in crate::vm::windows::qualification::production) struct FixtureInspector<'a> {
     calls: u32,
     fail: bool,
     check: &'a InspectionCheck<'a>,
+}
+
+impl<'a> FixtureInspector<'a> {
+    pub(in crate::vm::windows::qualification::production) fn checking(
+        check: &'a InspectionCheck<'a>,
+    ) -> Self {
+        Self {
+            calls: 0,
+            fail: false,
+            check,
+        }
+    }
 }
 
 impl SnapshotInspector for FixtureInspector<'_> {

@@ -64,7 +64,7 @@ fn recipes() -> TestRecipes {
     }
 }
 
-fn profile(enrollment: &str, dossier: &str) -> serde_json::Value {
+pub(crate) fn profile(enrollment: &str, dossier: &str) -> serde_json::Value {
     serde_json::json!({
         "enabled": true, "owner_sid": OWNER_SID, "supervisor_sid": OWNER_SID,
         "bundle": "E:/pinned bundle", "volume": "D:/", "state": "D:/test_vms/state",

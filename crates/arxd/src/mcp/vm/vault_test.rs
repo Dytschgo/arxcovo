@@ -246,6 +246,20 @@ impl Run {
                 .is_some_and(|fixture| status.vm.is_some_and(|vm| fixture.worker_active(vm)));
             #[cfg(not(test))]
             let working = false;
+            // A native clone or snapshot worker settles its operation before
+            // it drops its staging registration. A busy gate is unconfirmed.
+            // A live run owner is not waited for: it stays registered while
+            // the VM runs, and the cleanup turn ends it.
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            let working = working
+                || status.vm.is_some_and(|vm| {
+                    !matches!(
+                        supervisor.observe_test_worker(&supervisor.test_staging, vm, |owner| {
+                            owner.is_none()
+                        }),
+                        Ok(true)
+                    )
+                });
             if status.state != Status::Pending && !working {
                 return Some(status);
             }

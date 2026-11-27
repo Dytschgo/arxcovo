@@ -4,17 +4,79 @@ use super::*;
 use crate::store::vm::native::recovery;
 use crate::vm::{
     qualification::{ForegroundQualification, NativeRecovery, TEST_RESOURCES},
-    reaper::CleanupWork,
+    reaper::{CleanupKind, CleanupWork},
     runtime::{Quiesced, ReaperRuntime, StopDisposition},
     test_issuer::{Installation, TestIssuer},
 };
 
 const GIB: u64 = 1 << 30;
 
-pub(super) type SelectedTest = TestIssuer<'static, ForegroundQualification, ForegroundClock>;
+#[cfg(not(test))]
+pub(super) type Source = ForegroundQualification;
+
+#[cfg(test)]
+pub(super) enum Source {
+    Native(Box<ForegroundQualification>),
+    Fixture(Box<crate::vm::qualification::FixtureQualification>),
+}
+
+#[cfg(test)]
+impl Source {
+    fn measurements(&self) -> &dyn crate::vm::test_issuer::SelectedSource {
+        match self {
+            Self::Native(source) => &**source,
+            Self::Fixture(source) => &**source,
+        }
+    }
+}
+
+#[cfg(test)]
+impl crate::vm::test_issuer::SelectedSource for Source {
+    fn seal_sha256(&self) -> qualification_record::Hash {
+        self.measurements().seal_sha256()
+    }
+    fn class(&self) -> qualification_record::Class {
+        self.measurements().class()
+    }
+    fn scope(&self) -> qualification_record::Hash {
+        self.measurements().scope()
+    }
+    fn recipes(&self) -> qualification_record::TestRecipes {
+        self.measurements().recipes()
+    }
+    fn owner_matches(&self, configured: &str) -> bool {
+        self.measurements().owner_matches(configured)
+    }
+    fn sample(
+        &self,
+        advance: &dyn Fn() -> Result<ClockReading, crate::vm::selection_epoch::Invalidation>,
+    ) -> Result<crate::vm::selection_epoch::Sample, crate::vm::selection_epoch::Invalidation> {
+        self.measurements().sample(advance)
+    }
+}
+
+pub(super) type SelectedTest = TestIssuer<'static, Source, ForegroundClock>;
+
+#[cfg(test)]
+mod journey;
 
 impl Supervisor {
     pub(super) fn install_test(&mut self) {
+        self.install_test_with(|controller, config| {
+            let selected = TestIssuer::open_configured(controller, config)?;
+            #[cfg(test)]
+            let selected = selected.map_source(|source| Source::Native(Box::new(source)));
+            Ok(selected)
+        });
+    }
+
+    fn install_test_with(
+        &mut self,
+        open: impl FnOnce(
+            Arc<Controller>,
+            &crate::config::TestQualificationSelection,
+        ) -> Result<SelectedTest, NativeRefusal>,
+    ) {
         let Some(config) = self
             .runtime
             .as_ref()
@@ -22,13 +84,14 @@ impl Supervisor {
         else {
             return;
         };
-        let selected = match SelectedTest::open_configured(self.controller.clone(), &config) {
-            Ok(selected) => Arc::new(selected),
-            Err(reason) => {
-                self.native_refusal = reason;
-                return;
-            }
-        };
+        match open(self.controller.clone(), &config) {
+            Ok(selected) => self.install_selected(selected),
+            Err(reason) => self.native_refusal = reason,
+        }
+    }
+
+    fn install_selected(&mut self, selected: SelectedTest) {
+        let selected = Arc::new(selected);
         let recipes = selected.recipes();
         self.recipes[0] = Some((recipes.ubuntu.recipe_id, Some(recipes.ubuntu.recipe_sha256)));
         self.recipes[2] = Some((
@@ -67,9 +130,40 @@ impl Supervisor {
 impl SelectedTest {
     fn live_host(&self) -> Result<HostObservation, NativeRefusal> {
         self.refresh()?;
-        self.source().test_host()
+        #[cfg(test)]
+        if let Source::Fixture(source) = self.source() {
+            return source.test_host();
+        }
+        self.native_source().test_host()
     }
 
+    fn native_source(&self) -> &ForegroundQualification {
+        #[cfg(not(test))]
+        return self.source();
+        #[cfg(test)]
+        match self.source() {
+            Source::Native(source) => source,
+            Source::Fixture(_) => unreachable!("fixture handled at worker entry"),
+        }
+    }
+
+    fn confirm_golden(
+        &self,
+        ctl: &Controller,
+        golden: &SealedGolden,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), NativeRefusal> {
+        #[cfg(test)]
+        if let Source::Fixture(source) = self.source() {
+            return source.confirm_golden(ctl, golden, cancelled);
+        }
+        self.native_source().confirm_golden(ctl, golden, cancelled)
+    }
+
+    /// Every refusal before a durable commit is filed through the caller's
+    /// audited refusal, except those `admit_build` and `extend_lease` file
+    /// in their own transaction. After a commit, a failure before the worker
+    /// owns the intent settles that intent as cancelled.
     pub(super) fn dispatch(
         self: &Arc<Self>,
         caller: &VmInventory,
@@ -79,7 +173,7 @@ impl SelectedTest {
     ) -> Outcome<Value> {
         if !matches!(
             request.work,
-            Work::Build | Work::Create(_) | Work::Start | Work::Snapshot(_)
+            Work::Build | Work::Create(_) | Work::Start | Work::Extend(_) | Work::Snapshot(_)
         ) {
             return caller.refuse(
                 action,
@@ -88,6 +182,8 @@ impl SelectedTest {
             );
         }
         let subject = request.vm();
+        let refuse = |reason: Fault| caller.refuse::<Value>(action, subject, reason);
+        let native = |reason: NativeRefusal| refuse(Fault(native_reason(reason)));
         let live_host = || {
             self.live_host()
                 .or_else(|reason| caller.refuse(action, subject, Fault(native_reason(reason))))
@@ -98,10 +194,12 @@ impl SelectedTest {
         let Mutation { key, id, work } = request;
         gate.test_workers_open(supervisor)?;
         let recipes = self.recipes();
-        if matches!(work, Work::Start | Work::Snapshot(_))
-            && !ctl.selected_test_generation(id, recipes)?
+        // A caller-owned Static, unselected or historic VM already passed
+        // the ownership precheck; only the selected runtime is missing.
+        if matches!(work, Work::Start | Work::Extend(_) | Work::Snapshot(_))
+            && !ctl.selected_test_vm(id, recipes)?
         {
-            return caller.refuse(action, subject, Refusal::NotFound.into());
+            return native(NativeRefusal::QualificationMissing);
         }
         let sizes = [(recipes.ubuntu, 24 * GIB), (recipes.windows, 40 * GIB)];
         let vm_request = |operation, disk| Request {
@@ -111,23 +209,60 @@ impl SelectedTest {
             operation,
             disk,
         };
+        let cancelled = || supervisor.cancel.is_cancelled();
         match work {
-            Work::Start => gate.start_native_run(
-                supervisor,
-                &Installation::selected(self),
-                vm_request(Operation::Start, DiskClaim::default()),
-                live_host()?,
-                TEST_RESOURCES,
-                move |supervisor, runtime, owner, start| {
-                    let selected = installed(supervisor)?;
-                    runtime.block_on(owner.run(supervisor, start, selected, selected.source()))
-                },
-            ),
+            Work::Start => {
+                let host = live_host()?;
+                gate.start_native_run(
+                    supervisor,
+                    &Installation::selected(self),
+                    vm_request(Operation::Start, DiskClaim::default()),
+                    host,
+                    TEST_RESOURCES,
+                    move |supervisor, runtime, owner, start| {
+                        let selected = installed(supervisor)?;
+                        #[cfg(test)]
+                        if let Source::Fixture(source) = selected.source() {
+                            return runtime.block_on(journey::run(
+                                source, supervisor, owner, start, selected,
+                            ));
+                        }
+                        runtime.block_on(owner.run(
+                            supervisor,
+                            start,
+                            selected,
+                            selected.native_source(),
+                        ))
+                    },
+                )
+                // The start's own admission files nothing; a closed
+                // supervisor is not a refusal of this request.
+                .or_else(|reason| {
+                    if reason.0 == SHUTDOWN.0 {
+                        Err(reason)
+                    } else {
+                        refuse(reason)
+                    }
+                })
+            }
+            Work::Extend(ttl) => {
+                // A lease extension changes no host resource or artifact, so
+                // only the selection epoch must be current, not idleness.
+                if let Err(reason) = self.refresh() {
+                    return native(reason);
+                }
+                let end = ctl.extend_lease(principal, id, key, ttl)??;
+                let replay = ctl
+                    .foreground_replay(principal, key, Subject::Vm(id), action)??
+                    .ok_or(STATE_UNAVAILABLE)?;
+                Ok(receipt(replay.operation.id, Some(end)))
+            }
             Work::Build => {
-                let (recipe, size) = sizes
-                    .into_iter()
-                    .find(|(recipe, _)| recipe.recipe_id == id)
-                    .ok_or(Refusal::RecipeUnqualified)?;
+                let Some((recipe, size)) =
+                    sizes.into_iter().find(|(recipe, _)| recipe.recipe_id == id)
+                else {
+                    return refuse(Refusal::RecipeUnqualified.into());
+                };
                 let name = hex::encode(id);
                 let retained = DiskClaim {
                     images: size + GIB,
@@ -150,53 +285,70 @@ impl SelectedTest {
                     retained,
                     transient,
                 };
+                // Live idleness first, then only a bounded identity check
+                // of a reusable sealed pair under the gate. Every clone and
+                // start re-hashes the held golden before any write.
+                let host = live_host()?;
                 let held = ctl
                     .selected_golden(recipe)?
-                    .filter(|golden| self.source().verify_golden(ctl, golden).is_ok());
-                let (slots, worker, reference) = match ctl.admit_build(
-                    spec,
-                    live_host()?,
-                    TEST_RESOURCES,
-                    |template, pair| {
+                    .filter(|golden| self.confirm_golden(ctl, golden, &cancelled).is_ok());
+                let (slots, worker, reference) =
+                    match ctl.admit_build(spec, host, TEST_RESOURCES, |template, pair| {
                         held.filter(|golden| {
                             golden.template() == template && golden.slots() == pair
                         })
                         .map(|golden| golden.evidence())
-                    },
-                )?? {
-                    BuildAdmission::Existing(reference) => {
-                        return Ok(receipt(reference.id, None));
+                    })?? {
+                        BuildAdmission::Existing(reference) => {
+                            return Ok(receipt(reference.id, None));
+                        }
+                        BuildAdmission::Fresh(slots, worker, reference) => {
+                            (*slots, worker, reference)
+                        }
+                    };
+                let registration = match supervisor.test_staging.register(slots.id, ()) {
+                    Ok(registration) => registration,
+                    Err(reason) => {
+                        let _ = ctl.fail_build_with(&worker, slots, true, None);
+                        return Err(reason);
                     }
-                    BuildAdmission::Fresh(slots, worker, reference) => (*slots, worker, reference),
                 };
-                let registration = supervisor.test_staging.register(slots.id, ())?;
                 let principal = principal.to_owned();
-                gate.enqueue_test_worker(
-                    supervisor,
-                    registration,
-                    worker_runtime,
-                    move |supervisor, runtime| {
-                        let selected = installed(supervisor)?;
-                        let ctl = &supervisor.controller;
-                        let result = runtime.block_on(selected.source().build_test_golden(
+                gate.spawn_test_worker(supervisor, registration, move |supervisor, runtime| {
+                    let selected = installed(supervisor)?;
+                    let ctl = &supervisor.controller;
+                    let request = BuildRequest {
+                        principal: &principal,
+                        key,
+                        recipe: &name,
+                        digest: recipe.recipe_sha256,
+                        retained,
+                        transient,
+                    };
+                    #[cfg(test)]
+                    if let Source::Fixture(source) = selected.source() {
+                        let result = runtime.block_on(source.build_test_golden(
                             ctl,
                             selected,
                             &worker,
                             slots,
-                            BuildRequest {
-                                principal: &principal,
-                                key,
-                                recipe: &name,
-                                digest: recipe.recipe_sha256,
-                                retained,
-                                transient,
-                            },
+                            request,
                             &supervisor.test_generations,
                             &supervisor.cancel,
                         ));
-                        settled(ctl, &principal, reference.id, result.map(|_| ()))
-                    },
-                )?;
+                        return settled(ctl, &principal, reference.id, result.map(|_| ()));
+                    }
+                    let result = runtime.block_on(selected.native_source().build_test_golden(
+                        ctl,
+                        selected,
+                        &worker,
+                        slots,
+                        request,
+                        &supervisor.test_generations,
+                        &supervisor.cancel,
+                    ));
+                    settled(ctl, &principal, reference.id, result.map(|_| ()))
+                });
                 Ok(receipt(reference.id, None))
             }
             Work::Create(ttl) => {
@@ -210,10 +362,13 @@ impl SelectedTest {
                         break;
                     }
                 }
-                let (golden, size) = golden.ok_or(NOT_FOUND)?;
-                self.source()
-                    .verify_golden(ctl, &golden)
-                    .map_err(|reason| Fault(native_reason(reason)))?;
+                let Some((golden, size)) = golden else {
+                    return refuse(NOT_FOUND);
+                };
+                // The ledger pair and its bound workspace are checked by
+                // the lookup above. The clone worker holds and hashes the
+                // golden, bounded and cancellable, before any clone write.
+                let host = live_host()?;
                 let disk = DiskClaim {
                     images: size + GIB,
                     metadata: 4096,
@@ -225,69 +380,124 @@ impl SelectedTest {
                 };
                 let (vm, slots, worker, reference) = match ctl.admit_linked_clone(
                     vm_request(operation, disk),
-                    live_host()?,
+                    host,
                     TEST_RESOURCES,
                     golden.slots(),
                     golden.evidence(),
-                )?? {
-                    CloneAdmission::Existing(reference) => {
+                )? {
+                    Err(reason) => return refuse(reason.into()),
+                    Ok(CloneAdmission::Existing(reference)) => {
                         let lease = ctl
                             .operation_status(principal, reference.id)??
                             .expires_at_ms;
                         return Ok(receipt(reference.id, lease));
                     }
-                    CloneAdmission::Fresh(vm, slots, worker, reference) => {
+                    Ok(CloneAdmission::Fresh(vm, slots, worker, reference)) => {
                         (vm, slots, worker, reference)
                     }
                 };
-                let registration = supervisor.test_staging.register(vm, ())?;
-                let lease = ctl
-                    .get_status(principal, vm)??
-                    .expires_at_ms
-                    .ok_or(STATE_UNAVAILABLE)?;
+                let handoff = (|| {
+                    let lease = ctl
+                        .get_status(principal, vm)??
+                        .expires_at_ms
+                        .ok_or(STATE_UNAVAILABLE)?;
+                    Ok::<_, Fault>((supervisor.test_staging.register(vm, ())?, lease))
+                })();
+                let (registration, lease) = match handoff {
+                    Ok(handoff) => handoff,
+                    Err(reason) => {
+                        // Untouched: nothing was staged for this clone.
+                        let _ = ctl.finish_native_clone(
+                            &worker,
+                            slots,
+                            Err(FailureReason::Cancelled),
+                            ClonePublication {
+                                golden: None,
+                                effect_cutoff: ctl.native_clock().monotonic,
+                                cancelled: &|| true,
+                            },
+                        );
+                        return Err(reason);
+                    }
+                };
                 let cutoff = lease_cutoff(ctl, lease);
-                gate.enqueue_test_worker(
-                    supervisor,
-                    registration,
-                    worker_runtime,
-                    move |supervisor, runtime| {
-                        let selected = installed(supervisor)?;
-                        runtime.block_on(selected.source().clone_test(
+                gate.spawn_test_worker(supervisor, registration, move |supervisor, runtime| {
+                    let selected = installed(supervisor)?;
+                    #[cfg(test)]
+                    if let Source::Fixture(source) = selected.source() {
+                        return runtime.block_on(source.clone_test(
                             &supervisor.controller,
                             selected,
                             worker,
                             slots,
-                            size,
                             cutoff,
                             &supervisor.cancel,
-                        ))
-                    },
-                )?;
+                        ));
+                    }
+                    runtime.block_on(selected.native_source().clone_test(
+                        &supervisor.controller,
+                        selected,
+                        worker,
+                        slots,
+                        size,
+                        cutoff,
+                        &supervisor.cancel,
+                    ))
+                });
                 Ok(receipt(reference.id, Some(lease)))
             }
             Work::Snapshot(request) => {
-                let registration = supervisor.test_staging.register(id, ())?;
-                let status = ctl.get_status(principal, id)??;
-                let cutoff = lease_cutoff(ctl, status.expires_at_ms.ok_or(STATE_UNAVAILABLE)?);
-                let (work, worker, reference) = ctl.admit_snapshot(
+                // Everything fallible precedes the durable admission. The
+                // inspector needs the live foreground runtime's drivers.
+                let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                    return refuse(STATE_UNAVAILABLE);
+                };
+                let registration = match supervisor.test_staging.register(id, ()) {
+                    Ok(registration) => registration,
+                    Err(reason) => return refuse(reason),
+                };
+                let lease = match ctl.get_status(principal, id)? {
+                    Ok(status) => status.expires_at_ms.ok_or(STATE_UNAVAILABLE)?,
+                    Err(reason) => return refuse(reason.into()),
+                };
+                let cutoff = lease_cutoff(ctl, lease);
+                let host = live_host()?;
+                let (work, worker, reference) = match ctl.admit_snapshot(
                     principal,
                     key,
                     id,
                     action,
                     &request,
                     None,
-                    live_host()?,
+                    host,
                     TEST_RESOURCES,
-                )??;
+                )? {
+                    Ok(admitted) => admitted,
+                    Err(reason) => return refuse(reason.into()),
+                };
                 if work.candidate.is_some() {
                     let principal = principal.to_owned();
-                    gate.enqueue_test_snapshot(
+                    gate.spawn_test_snapshot(
                         supervisor,
                         registration,
+                        runtime,
                         move |supervisor, runtime| {
                             let selected = installed(supervisor)?;
                             let ctl = &supervisor.controller;
-                            let result = selected.source().snapshot_test(
+                            #[cfg(test)]
+                            if let Source::Fixture(source) = selected.source() {
+                                let result = source.snapshot_test(
+                                    ctl,
+                                    selected,
+                                    worker,
+                                    work,
+                                    cutoff,
+                                    &supervisor.cancel,
+                                    runtime,
+                                );
+                                return settled(ctl, &principal, reference.id, result);
+                            }
+                            let result = selected.native_source().snapshot_test(
                                 ctl,
                                 selected,
                                 worker,
@@ -298,7 +508,7 @@ impl SelectedTest {
                             );
                             settled(ctl, &principal, reference.id, result)
                         },
-                    )?;
+                    );
                 }
                 Ok(receipt(reference.id, None))
             }
@@ -308,23 +518,37 @@ impl SelectedTest {
 }
 
 impl Gate {
-    fn enqueue_test_snapshot(
+    /// The tracked worker of a build or clone this gate hold admitted.
+    fn spawn_test_worker(
         &mut self,
         supervisor: &Arc<Supervisor>,
         registration: owned_worker::Registration<()>,
+        work: impl FnOnce(&Supervisor, &tokio::runtime::Runtime) -> anyhow::Result<()> + Send + 'static,
+    ) {
+        self.spawn_test_blocking(
+            supervisor,
+            registration,
+            |_| {},
+            move |supervisor| work(supervisor, &worker_runtime()?),
+        );
+    }
+
+    /// The inspector uses Handle::block_on to run the checked helper. Use
+    /// the live foreground runtime's I/O and timer drivers, and execute the
+    /// copy itself on the tracked blocking pool.
+    fn spawn_test_snapshot(
+        &mut self,
+        supervisor: &Arc<Supervisor>,
+        registration: owned_worker::Registration<()>,
+        runtime: tokio::runtime::Handle,
         copy: impl FnOnce(&Supervisor, &tokio::runtime::Handle) -> anyhow::Result<()> + Send + 'static,
-    ) -> Outcome<()> {
-        // The inspector uses Handle::block_on to run the checked helper.
-        // Use the live foreground runtime's I/O and timer drivers, and
-        // execute the copy itself on the tracked blocking pool.
-        let runtime = tokio::runtime::Handle::current();
-        self.enqueue_test_blocking(
+    ) {
+        self.spawn_test_blocking(
             supervisor,
             registration,
             |_| {},
             move |supervisor| copy(supervisor, &runtime),
-        )?;
-        Ok(())
+        );
     }
 }
 
@@ -373,18 +597,23 @@ pub(super) struct TestCleanup<'a> {
 }
 
 impl ReaperRuntime for TestCleanup<'_> {
-    fn quiesce(&self, work: &CleanupWork, _: Instant) -> Quiesced {
+    fn quiesce(&self, work: &CleanupWork, join_by: Instant) -> Quiesced {
         let supervisor = self.supervisor;
+        let vm = work.kind.subject();
+        // Expiry and recovery end a live owner and give its release one
+        // bounded join. Other cleanup never interrupts a live run.
+        let ending = matches!(
+            work.kind,
+            CleanupKind::Expiry { .. } | CleanupKind::Recovery { .. }
+        );
         if !work.accounted && !work.release_only
             || !matches!(
-                supervisor.observe_test_worker(
-                    &supervisor.test_staging,
-                    work.kind.subject(),
-                    |owner| owner.is_none()
-                ),
+                supervisor
+                    .observe_test_worker(&supervisor.test_staging, vm, |owner| owner.is_none()),
                 Ok(true)
             )
-            || !supervisor.reap_native_run(work.kind.subject(), &mut || true)
+            || ending && !supervisor.end_native_run(vm, join_by)
+            || !supervisor.reap_native_run(vm, &mut || true)
         {
             return Quiesced::Unconfirmed;
         }
@@ -516,17 +745,18 @@ mod tests {
         .unwrap();
         let (inspected, confirmed) = tokio::sync::oneshot::channel();
         let registration = supervisor.test_staging.register([1; 16], ()).unwrap();
-        supervisor
-            .lock()
-            .unwrap()
-            .enqueue_test_snapshot(&supervisor, registration, move |_, runtime| {
+        supervisor.lock().unwrap().spawn_test_snapshot(
+            &supervisor,
+            registration,
+            tokio::runtime::Handle::try_current().unwrap(),
+            move |_, runtime| {
                 // Match CheckedSnapshotInspector's call on a live Tokio
                 // handle, including an operation that needs its timer driver.
                 runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
                 inspected.send(()).unwrap();
                 Ok(())
-            })
-            .unwrap();
+            },
+        );
 
         tokio::time::timeout(Duration::from_secs(5), confirmed)
             .await

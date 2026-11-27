@@ -2762,19 +2762,30 @@ impl<C: Clock> VmController<C> {
         })
     }
 
-    pub(crate) fn selected_test_generation(
+    /// Whether the VM's active TEST generation is bound to a native
+    /// workspace from one of the selected recipes, whether it is running or
+    /// stopped. Lease extension changes no artifacts, so no released pair
+    /// is required.
+    pub(crate) fn selected_test_vm(
         &self,
         vm: Id,
         recipes: super::qualification_record::TestRecipes,
     ) -> Result<bool> {
         self.store.read_only(|db| {
-            Ok(
-                store::snapshot::active(db, vm, false)?.is_some_and(|active| {
-                    [recipes.ubuntu.recipe_sha256, recipes.windows.recipe_sha256]
-                        .contains(&active.recipe)
-                        && Self::bound_native_workspace(db, active.pair.0.disk.generation).is_ok()
-                }),
-            )
+            let active = db
+                .query_row(
+                    "SELECT g.id,t.recipe_digest FROM vm_generations g
+                     JOIN vm_instances v ON v.id=g.vm_id
+                     JOIN vm_templates t ON t.id=v.template
+                     WHERE v.id=?1 AND g.active=1",
+                    [vm],
+                    |row| Ok((row.get::<_, Id>(0)?, row.get::<_, [u8; 32]>(1)?)),
+                )
+                .optional()?;
+            Ok(active.is_some_and(|(generation, recipe)| {
+                [recipes.ubuntu.recipe_sha256, recipes.windows.recipe_sha256].contains(&recipe)
+                    && Self::bound_native_workspace(db, generation).is_ok()
+            }))
         })
     }
 

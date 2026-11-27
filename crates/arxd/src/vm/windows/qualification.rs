@@ -22,8 +22,6 @@ mod network;
 pub(in crate::vm) use network::Targets as WitnessTargets;
 mod paused;
 mod production;
-#[cfg(test)]
-pub(crate) use production::consume_checked;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use production::{
     BuildSeal, FinalizedPair, GenerationGuards, HeldStartRefusal, HelperSettlement, HelperTarget,
@@ -31,6 +29,8 @@ pub(crate) use production::{
     NativeLaunch, NativeRecovery, ProductionWorkspace, ReleasedGeneration, StartCreation,
     StartPair, StartRefusal, TEST_RESOURCES, WorkspaceBinding, binding_from_scope,
 };
+#[cfg(test)]
+pub(crate) use production::{FixtureQualification, consume_checked};
 mod recipe;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use recipe::{

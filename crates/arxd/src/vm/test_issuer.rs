@@ -54,7 +54,15 @@ pub(crate) struct Minted(());
 pub(crate) struct Installation(());
 
 impl Installation {
+    /// Production installs only the concrete foreground selection.
+    #[cfg(not(test))]
     pub(crate) fn selected<C>(_: &TestIssuer<'_, ForegroundQualification, C>) -> Self {
+        Self(())
+    }
+
+    /// Tests also install the fixture selection through the same routes.
+    #[cfg(test)]
+    pub(crate) fn selected<S: SelectedSource, C>(_: &TestIssuer<'_, S, C>) -> Self {
         Self(())
     }
 
@@ -143,6 +151,15 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
         Self::verify_selection(ControllerHandle::Borrowed(controller), source, config)
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_owned_fixture(
+        controller: Arc<VmController<C>>,
+        source: S,
+        config: &TestQualificationSelection,
+    ) -> Result<Self, NativeRefusal> {
+        Self::verify_selection(ControllerHandle::Owned(controller), source, config)
+    }
+
     fn verify_selection(
         controller: ControllerHandle<'a, C>,
         source: S,
@@ -172,6 +189,20 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
             seal_sha256: selection.seal_sha256,
             recipes,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn map_source<T: SelectedSource>(
+        self,
+        wrap: impl FnOnce(S) -> T,
+    ) -> TestIssuer<'a, T, C> {
+        TestIssuer {
+            controller: self.controller,
+            source: wrap(self.source),
+            epoch: self.epoch,
+            seal_sha256: self.seal_sha256,
+            recipes: self.recipes,
+        }
     }
 
     pub(crate) fn source(&self) -> &S {

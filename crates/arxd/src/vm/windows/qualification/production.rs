@@ -1384,7 +1384,11 @@ impl FinalizedPair {
 mod build;
 mod clone;
 mod selected;
+#[cfg(test)]
+mod selected_fixture;
 pub(crate) use selected::TEST_RESOURCES;
+#[cfg(test)]
+pub(crate) use selected_fixture::FixtureQualification;
 mod custody;
 mod disposal;
 mod helper;

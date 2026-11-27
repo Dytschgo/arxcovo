@@ -237,12 +237,26 @@ impl Gate {
         work: impl FnOnce(&Supervisor) -> anyhow::Result<()> + Send + 'static,
     ) -> Outcome<AbortHandle> {
         self.test_workers_open(supervisor)?;
+        Ok(self.spawn_test_blocking(supervisor, registration, cleanup, work))
+    }
+
+    /// Track the worker of an intent this same gate hold admitted after
+    /// [`Gate::test_workers_open`] passed. Once the durable commit exists the
+    /// worker is always spawned: a closed or fenced supervisor cancels it and
+    /// drain joins it, so no committed intent is left without its worker.
+    pub(super) fn spawn_test_blocking<T: Send + 'static>(
+        &mut self,
+        supervisor: &Arc<Supervisor>,
+        registration: Registration<T>,
+        cleanup: impl FnOnce(&Supervisor) + Send + 'static,
+        work: impl FnOnce(&Supervisor) -> anyhow::Result<()> + Send + 'static,
+    ) -> AbortHandle {
         let on_exit = OnWorkerExit {
             supervisor: supervisor.clone(),
             cleanup: Some(cleanup),
         };
         let supervisor = supervisor.clone();
-        Ok(self.test_workers.tasks.spawn_blocking(move || {
+        self.test_workers.tasks.spawn_blocking(move || {
             let _registration = registration;
             let mut on_exit = on_exit;
             // The worker includes terminal settlement. A failure leaves its
@@ -252,7 +266,7 @@ impl Gate {
                 on_exit.cleanup = None;
             }
             result
-        }))
+        })
     }
 
     /// Track a bounded recovery task for an already-committed durable intent

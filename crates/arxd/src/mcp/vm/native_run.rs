@@ -37,6 +37,8 @@ const FENCE_RETRY_WINDOW: Duration = Duration::from_secs(3);
 /// most this long, well inside any script's own timeout, before the owner
 /// abandons it as channel loss and tears down.
 const SCRIPT_INTERRUPT: Duration = Duration::from_secs(2);
+/// Poll interval while a cleanup turn waits for an ended owner to leave.
+const CLEANUP_POLL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 pub(super) struct BlockingBarrier {
@@ -258,6 +260,16 @@ impl Run {
             state.ended = true;
             state.witness = None;
         }
+    }
+
+    /// Ends this run for expiry or recovery cleanup. The witness goes first,
+    /// then the live loop, a boot and any in-flight script are interrupted.
+    /// No owner stop receipt exists, so an interrupted script settles as
+    /// lost and teardown fences the writer before it commits the release.
+    fn end_for_cleanup(&self) {
+        self.withdraw();
+        self.cancel.cancel();
+        self.retry.notify_one();
     }
 
     /// Whether a new script could still be queued for this live run.
@@ -1271,7 +1283,11 @@ impl Run {
         }
     }
 
-    async fn settle_proof(&self, supervisor: &Supervisor, proof: &ReleasedGeneration<'_>) {
+    pub(super) async fn settle_proof(
+        &self,
+        supervisor: &Supervisor,
+        proof: &ReleasedGeneration<'_>,
+    ) {
         self.settle_with(
             supervisor,
             || {
@@ -1381,6 +1397,31 @@ impl Supervisor {
             }
             Ok(None) => self.with_test_orphan_fence(&self.native_runs, vm, recover),
             Err(_) => false,
+        }
+    }
+
+    /// Expiry or recovery of a live TEST run: end its owner, then wait up to
+    /// `join_by` for the owner to settle its release and leave. No gate or
+    /// registry lock is held while waiting. Returns whether no owner remains;
+    /// an owner still tearing down keeps sole custody of its handles.
+    pub(super) fn end_native_run(&self, vm: Id, join_by: Instant) -> bool {
+        match self.observe_test_worker(&self.native_runs, vm, |owner| owner.cloned()) {
+            Ok(None) => return true,
+            Ok(Some(owner)) => owner.end_for_cleanup(),
+            Err(_) => return false,
+        }
+        loop {
+            if matches!(
+                self.native_runs.with_entry(vm, |owner| owner.is_none()),
+                Ok(true)
+            ) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= join_by {
+                return false;
+            }
+            std::thread::sleep(CLEANUP_POLL.min(join_by - now));
         }
     }
 }

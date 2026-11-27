@@ -1,7 +1,7 @@
 //! Run the build against real NTFS and SQLite, consuming the real issuer
 //! permits. Child launch and guest responses are injected at the runtime edge.
 use super::super::disposal::tests::{
-    FakeClock, Fault as DisposalFault, FaultDisposal, NOW, RestartReaper, SweepFixture, exists,
+    Fault as DisposalFault, FaultDisposal, NOW, RestartReaper, SweepFixture, exists,
 };
 use super::super::recovery::{NativeRecovery, StorePins};
 use super::super::tests::custody::{Fault as CustodyFault, Recorder};
@@ -73,11 +73,13 @@ enum Step {
     Verification,
 }
 
-struct Peer<'a> {
-    fx: &'a SweepFixture,
+struct Peer<'a, S, C> {
+    store: &'a crate::store::vm::VmStore,
+    root: &'a LocalPath,
+    seal_cutoff: &'a dyn Fn(),
     slots: BuildSlots,
-    intent: &'a Intent<'a, &'a FakeSource, FakeClock>,
-    issuer: &'a TestIssuer<'a, &'a FakeSource, FakeClock>,
+    intent: &'a Intent<'a, S, C>,
+    issuer: &'a TestIssuer<'a, S, C>,
     cancel: &'a Shutdown,
     cwd: LocalPath,
     fault: Fault,
@@ -88,7 +90,18 @@ struct Peer<'a> {
     mutation_refused: Cell<Option<bool>>,
 }
 
-impl Peer<'_> {
+impl<S: SelectedSource, C: crate::vm::Clock> Peer<'_, S, C> {
+    fn gen_dir(&self, id: Id) -> LocalPath {
+        self.root.join(&hex::encode(id)).unwrap()
+    }
+
+    fn slot_file(&self, slot: ArtifactSlot) -> std::path::PathBuf {
+        slot_path(&self.gen_dir(slot.generation), slot)
+            .unwrap()
+            .as_str()
+            .into()
+    }
+
     fn artifact(&self, role: ArtifactRole, name: &str) -> Artifact {
         let path = self.cwd.join(name).unwrap();
         std::fs::write(path.as_str(), b"fixture input").unwrap();
@@ -101,8 +114,7 @@ impl Peer<'_> {
     fn record_job(&self, workspace: &ProductionWorkspace) {
         let scope = custody::scope(workspace.binding());
         let origin = self.origin;
-        self.fx
-            .store()
+        self.store
             .transact(|db| native::recovery::record_job(db, scope, scope.generation, origin))
             .unwrap();
     }
@@ -215,7 +227,7 @@ impl Peer<'_> {
     }
 }
 
-impl Effects for Peer<'_> {
+impl<S: SelectedSource, C: crate::vm::Clock> Effects for Peer<'_, S, C> {
     fn fresh(&self) -> Result<Instant, Q> {
         if self.fault == Fault::StaleSample {
             // Still fresh before the seal transaction, stale inside it.
@@ -229,7 +241,7 @@ impl Effects for Peer<'_> {
             ("capture", Fault::CancelAtCapture) => self.cancel.cancel(),
             ("copy", Fault::VarsMutation) => {
                 use std::io::Write;
-                let path = self.fx.slot_file(self.slots.verification.vars);
+                let path = self.slot_file(self.slots.verification.vars);
                 match std::fs::OpenOptions::new().write(true).open(path) {
                     Ok(mut file) => {
                         // Same object, same length, one changed byte.
@@ -310,7 +322,7 @@ impl Effects for Peer<'_> {
             }
             None => unbacked_qcow2_header(size),
         };
-        std::fs::write(self.fx.slot_file(slot), cluster).unwrap();
+        std::fs::write(self.slot_file(slot), cluster).unwrap();
         if slot.role == "verification_overlay" && self.fault == Fault::OverlayChild {
             return HelperSettlement::quarantined(Err(PATH));
         }
@@ -396,13 +408,13 @@ impl Effects for Peer<'_> {
         use std::io::Write;
         let mut vars = std::fs::OpenOptions::new()
             .append(true)
-            .open(self.fx.slot_file(pair.slots.vars))
+            .open(self.slot_file(pair.slots.vars))
             .unwrap();
         vars.write_all(b"+guest").unwrap();
         drop(vars);
         if verify && self.fault == Fault::VerificationLineage {
             std::fs::write(
-                self.fx.slot_file(pair.slots.disk),
+                self.slot_file(pair.slots.disk),
                 backed_header("D:\\foreign"),
             )
             .unwrap();
@@ -412,12 +424,12 @@ impl Effects for Peer<'_> {
         }
         let last_primary = matches!(step, Step::UbuntuInstall | Step::WindowsFinalize);
         if last_primary && self.fault == Fault::OverRetained {
-            let vars = std::fs::metadata(self.fx.slot_file(pair.slots.vars))
+            let vars = std::fs::metadata(self.slot_file(pair.slots.vars))
                 .unwrap()
                 .len();
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(self.fx.slot_file(pair.slots.disk))
+                .open(self.slot_file(pair.slots.disk))
                 .unwrap()
                 .set_len(TIGHT - vars + 1)
                 .unwrap();
@@ -471,13 +483,18 @@ impl Effects for Peer<'_> {
     }
 
     fn inside_seal(&self) {
-        assert!(!exists(&self.fx.slot_file(self.slots.seed)));
-        assert!(!exists(
-            &self.fx.gen_dir(self.slots.verification.disk.generation)
-        ));
+        assert!(!exists(&self.slot_file(self.slots.seed)));
+        assert!(!exists(std::path::Path::new(
+            self.gen_dir(self.slots.verification.disk.generation)
+                .as_str()
+        )));
         // The primary lease is still held exclusively by the build.
-        if let Ok(lease) = std::fs::File::open(self.fx.lease_file(self.slots.pair.disk.generation))
-        {
+        if let Ok(lease) = std::fs::File::open(
+            self.gen_dir(self.slots.pair.disk.generation)
+                .join(GENERATION_LEASE)
+                .unwrap()
+                .as_str(),
+        ) {
             assert!(
                 lease.try_lock().is_err(),
                 "the primary lease was released before the seal transaction"
@@ -487,7 +504,7 @@ impl Effects for Peer<'_> {
             assert!(
                 std::fs::OpenOptions::new()
                     .write(true)
-                    .open(self.fx.slot_file(slot))
+                    .open(self.slot_file(slot))
                     .is_err(),
                 "a writer acquired {} inside the seal transaction",
                 slot.role
@@ -501,7 +518,7 @@ impl Effects for Peer<'_> {
         if check == 2 {
             match self.fault {
                 Fault::SealRollback => self.cancel.cancel(),
-                Fault::SealCutoff => self.fx.clock.advance(0, 14_000),
+                Fault::SealCutoff => (self.seal_cutoff)(),
                 _ => {}
             }
         }
@@ -636,7 +653,9 @@ async fn run(fx: &SweepFixture, windows: bool, fault: Fault, nonce: u32) -> Outc
         },
     };
     let peer = Peer {
-        fx,
+        store: fx.store(),
+        root: &fx.production.path,
+        seal_cutoff: &|| fx.clock.advance(0, 14_000),
         slots,
         intent: &intent,
         issuer: &issuer,
@@ -1164,4 +1183,86 @@ async fn build_replay_and_new_request_reuse_the_exact_sealed_pair() {
     assert_eq!(reuse.receipt.status, Status::Succeeded);
     assert_eq!(fx.count("SELECT count(*) FROM vm_templates"), 1);
     assert_eq!(fx.count("SELECT count(*) FROM vm_generations"), 1);
+}
+
+impl super::super::FixtureQualification {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn build_test_golden<S: SelectedSource, C: crate::vm::Clock>(
+        &self,
+        controller: &VmController<C>,
+        issuer: &TestIssuer<'_, S, C>,
+        worker: &PendingOperation,
+        slots: BuildSlots,
+        request: BuildRequest<'_>,
+        guards: &GenerationGuards,
+        cancel: &Shutdown,
+    ) -> anyhow::Result<Status> {
+        let store = controller.native_store();
+        let ledger = LedgerCheckpoints {
+            store,
+            origin: native::Origin::Build,
+        };
+        let ledger_disposal = LedgerDisposal { store };
+        let reserve = |generation| {
+            reserve_workspace_under(&self.production, self.owner(), generation, &ledger)
+                .map_err(|_| anyhow::anyhow!("fixture build reservation"))
+        };
+        let intent = issuer
+            .intent(
+                worker,
+                NativeTarget {
+                    generation: slots.pair.disk.generation,
+                    writer_epoch: None,
+                },
+                cancel,
+            )
+            .map_err(|_| anyhow::anyhow!("fixture build intent"))?;
+        let recipe = intent.build_recipe().expect("admitted build recipe");
+        let origin = StorePins::open(&self.production)
+            .unwrap()
+            .origin(store, boot::marker().unwrap())
+            .unwrap();
+        let peer = Peer {
+            store,
+            root: &self.production.path,
+            seal_cutoff: &|| {},
+            slots,
+            intent: &intent,
+            issuer,
+            cancel,
+            cwd: self.cwd.clone(),
+            fault: Fault::None,
+            steps: RefCell::default(),
+            seal_checks: Cell::new(0),
+            verification_settled: Cell::new(false),
+            origin,
+            mutation_refused: Cell::new(None),
+        };
+        Build {
+            controller,
+            worker,
+            request,
+            slots,
+            recipe,
+            ledger: &ledger,
+            disposal: NativeDisposal::under(
+                &self.production,
+                self.owner(),
+                &ledger_disposal,
+                guards,
+            ),
+            cancel,
+            owner: self.owner(),
+            size: SIZE,
+        }
+        .run(&peer, reserve(slots.pair.disk.generation)?, || {
+            reserve_workspace_under(
+                &self.production,
+                self.owner(),
+                slots.verification.disk.generation,
+                &ledger,
+            )
+        })
+        .await
+    }
 }
