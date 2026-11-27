@@ -38,7 +38,7 @@ impl ForegroundQualification {
         // This projection precedes all reads of the selected seal and rows.
         let recipes = launch::measure_recipes(&held, [0; 16], [0; 32])?;
         recipes.projection.bind(&mut dependencies);
-        let fresh = measure_fresh(&held, &store, &dependencies)?;
+        let fresh = measure_fresh(&held, CollectMode::Foreground(&store), &dependencies)?;
         let (evidence, rows) = dossier
             .read_selected(selection, &fresh)
             .map_err(|_| NativeRefusal::QualificationMissing)?;
@@ -81,17 +81,12 @@ impl ForegroundQualification {
     /// confirmed. The selected seal was verified at open, so a refused
     /// issuance anchor means the boot marker changed.
     pub(crate) fn fresh(&self) -> Result<Fresh<'_>, Invalidation> {
-        let reason = NativeRefusal::QualificationMissing;
-        let fresh = measure_fresh(&self.held, &self.store, &self.dependencies)?;
-        let binding = self.evidence.seal.binding;
-        let issued = binding
-            .issued_on_boot(fresh.boot_marker)
-            .ok_or(Confirmed(reason))?;
-        if !binding.live_at(fresh.now.utc, fresh.dependencies.key(binding.scope))
-            || !records::clocks_agree(issued, fresh.now)
-        {
-            return Err(Confirmed(reason));
-        }
+        let fresh = measure_fresh(
+            &self.held,
+            CollectMode::Foreground(&self.store),
+            &self.dependencies,
+        )?;
+        require_live(&self.evidence, &fresh)?;
         Ok(fresh)
     }
 
@@ -163,9 +158,23 @@ fn sid_matches(held: &LocalSid, configured: &str) -> bool {
 /// Measured profile, custody, volume, asset, DNS-witness, host or profile-key
 /// mismatches confirm drift. API or I/O failures, missing observations and an
 /// inactive console session fail closed as indeterminate.
+fn require_live(evidence: &VerifiedEvidence, fresh: &Fresh<'_>) -> Result<(), Invalidation> {
+    let reason = NativeRefusal::QualificationMissing;
+    let binding = evidence.seal.binding;
+    let issued = binding
+        .issued_on_boot(fresh.boot_marker)
+        .ok_or(Confirmed(reason))?;
+    if !binding.live_at(fresh.now.utc, fresh.dependencies.key(binding.scope))
+        || !records::clocks_agree(issued, fresh.now)
+    {
+        return Err(Confirmed(reason));
+    }
+    Ok(())
+}
+
 fn measure_fresh<'a>(
     held: &Held,
-    store: &VmStore,
+    mode: CollectMode<'_>,
     dependencies: &'a Dependencies,
 ) -> Result<Fresh<'a>, Invalidation> {
     let reason = NativeRefusal::QualificationMissing;
@@ -173,10 +182,12 @@ fn measure_fresh<'a>(
         .verify_current_profile()
         .map_err(TokenCheckError::into_invalidation)?;
     inventory::check_binding(&held._source)?;
-    held.scope
-        .as_ref()
-        .ok_or(Indeterminate(reason))?
-        .validate_foreground(store)?;
+    let scope = held.scope.as_ref().ok_or(Indeterminate(reason))?;
+    match mode {
+        CollectMode::Foreground(store) => scope.validate_foreground(store)?,
+        CollectMode::QualifierReview => scope.validate_stopped()?,
+        CollectMode::Qualifier => return Err(Indeterminate(reason)),
+    }
     for volume in &held.volumes {
         capacity::check_still_bound(&capacity::MountManager, volume)
             .map_err(|error| error.into_invalidation(NativeRefusal::PathCustodyUnverified))?;
@@ -211,6 +222,65 @@ fn measure_fresh<'a>(
         boot_marker: boot::marker().map_err(Indeterminate)?,
         dependencies,
     })
+}
+
+/// Read the TEST seal as a qualifier, with the daemon stopped and both store
+/// files held without writer sharing. A Docker run never borrows TEST launch
+/// authority and cannot claim the selected TEST evidence directory.
+pub(super) struct QualifierTestInputs {
+    pub(super) held: Held,
+    pub(super) recipes: launch::RecipeInputs,
+    dependencies: Dependencies,
+    evidence: VerifiedEvidence,
+    dossier: ReadDossier,
+    _rows: Vec<File>,
+}
+
+impl QualifierTestInputs {
+    pub(super) fn open(
+        selected: &crate::config::TestQualificationSelection,
+    ) -> Result<Self, NativeRefusal> {
+        let reason = NativeRefusal::QualificationMissing;
+        let mode = CollectMode::QualifierReview;
+        let (observations, _, held, dossier) = collect_preflight(
+            &capacity::MountManager,
+            selected.enrollment().as_str(),
+            selected.dossier().as_str(),
+            false,
+            true,
+            mode,
+            |pin, owner, _, _| ReadDossier::open(pin, owner),
+        )?;
+        if !sid_matches(&held.token.account, selected.owner_sid()) {
+            return Err(NativeRefusal::IdentityUnverified);
+        }
+        let recipes = launch::measure_recipes(&held, [0; 16], [0; 32])?;
+        let mut dependencies = observations.dependencies();
+        recipes.projection.bind(&mut dependencies);
+        let fresh = measure_fresh(&held, mode, &dependencies)?;
+        let (evidence, rows) = dossier
+            .read_selected(selected.selection(), &fresh)
+            .map_err(|_| reason)?;
+        require_live(&evidence, &fresh)?;
+        if recipes.projection.recipes != evidence.recipes {
+            return Err(reason);
+        }
+        Ok(Self {
+            held,
+            recipes,
+            dependencies,
+            evidence,
+            dossier,
+            _rows: rows,
+        })
+    }
+
+    pub(super) fn require_current(&self) -> Result<(), NativeRefusal> {
+        self.dossier.verify()?;
+        let fresh = measure_fresh(&self.held, CollectMode::QualifierReview, &self.dependencies)?;
+        require_live(&self.evidence, &fresh)?;
+        Ok(())
+    }
 }
 
 pub(super) struct ReadDossier(PathPin);

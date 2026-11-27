@@ -5,7 +5,6 @@ use crate::vm::{
     Id,
     paths::Artifact,
     qemu_args::BootRecipe,
-    qemu_img::inspect_header,
     qualification_record::{
         COLLECTOR, CONTRACT, Class, Diagnostic, DockerDependencies, Hash, Instant2, MAX_TRIAL_MS,
         Observation, Origin, Record, RunError, Stage, StageResult, canonical, clocks_agree, digest,
@@ -53,10 +52,51 @@ pub(super) fn preflight(
     }
     let bytes = read_bounded(&source.leaf, MAX_ENROLLMENT_BYTES)
         .map_err(|_| NativeRefusal::QualificationMissing)?;
-    static_compose::enrollment::Enrollment::parse(&bytes)?;
-    // Checked native creation, live route enforcement and independently reviewed
-    // capture/HTTPS adapters are required even for an owner opt-in.
-    // Stop before claiming an evidence directory or admitting any effect.
+    let enrollment = static_compose::enrollment::Enrollment::parse(&bytes)?;
+    let profile = enrollment.runtime_profile.file();
+    let profile = static_compose::hold_file(profile.path, profile.pin, MAX_ENROLLMENT_BYTES)?;
+    if profile.path.overlaps(&evidence) || !sink::held_private(&profile.leaf, user_sid(&user)) {
+        return Err(REFUSED);
+    }
+    let config = crate::config::VmRuntimeProfile::parse(&static_compose::held_bytes(
+        &profile,
+        MAX_ENROLLMENT_BYTES,
+    )?)
+    .map_err(|_| NativeRefusal::QualificationMissing)?;
+    let selected = config
+        .test_qualification()
+        .filter(|_| config.enabled())
+        .ok_or(NativeRefusal::QualificationMissing)?;
+    if [selected.dossier(), selected.enrollment()]
+        .into_iter()
+        .any(|path| path.overlaps(&evidence))
+    {
+        return Err(REFUSED);
+    }
+    let mode = CollectMode::QualifierReview;
+    let m4 = foreground::QualifierTestInputs::open(&selected)?;
+    let scope = m4.held.scope.as_ref().ok_or(REFUSED)?;
+    if [
+        &scope.production.root.path,
+        &scope.recipe.root.path,
+        &m4.held.trial.path,
+    ]
+    .into_iter()
+    .any(|path| path.overlaps(&evidence))
+    {
+        return Err(REFUSED);
+    }
+    let recipe = enrollment.recipe.hold(&m4.held, &m4.recipes, [1; 16])?;
+    let inputs = enrollment.hold_inputs(&evidence, mode, &m4.held, &recipe)?;
+    if inputs.m4_seal() != selected.selection().seal_sha256 {
+        return Err(NativeRefusal::QualificationMissing);
+    }
+    let targets = inputs.public_targets()?.addresses();
+    let (_dependencies, watch) = inputs.measure_live(&targets)?;
+    m4.require_current()?;
+    // A complete input check grants no native effects or evidence claim.
+    // Require the independent receiver and boot-bound HTTPS adapters first.
+    watch.require_current()?;
     Err(NativeRefusal::NetworkFenceUnverified)
 }
 
@@ -100,12 +140,7 @@ impl Phase {
             (Self::Install, Some(medium)) => recipe.static_compose_installer(medium),
             (Self::Detached, None) => recipe.docker_trial_boot(BootMode::Detached),
             (Self::Endpoint, None) => recipe.docker_trial_boot(BootMode::Endpoint),
-            (Self::PublicFixture, None)
-                if (recipe.vcpus, recipe.ram_mib) == (2, 4096)
-                    && inspect_header(recipe.disk_header, None).ok() == Some(32 << 30) =>
-            {
-                recipe.plan()
-            }
+            (Self::PublicFixture, None) => recipe.plan(),
             _ => return Err(REFUSED),
         }
         .map_err(|_| REFUSED)?;

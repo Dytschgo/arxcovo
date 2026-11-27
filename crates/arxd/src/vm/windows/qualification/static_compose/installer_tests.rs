@@ -366,6 +366,7 @@ impl MeasureEnv {
             scope: &self.scope,
             token: &self.token,
             recipe,
+            m4_seal: [0x63; 32],
             profile: self.hold_named("profile.json", b"profile"),
             policy: self.hold_named("policy.txt", &self.policy_bytes),
             parsed_policy: PublicEgressPolicy::parse(&self.policy_bytes).unwrap(),

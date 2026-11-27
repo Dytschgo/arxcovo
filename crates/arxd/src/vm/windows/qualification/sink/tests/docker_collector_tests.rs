@@ -1059,14 +1059,26 @@ fn collect(fault: Fault) {
             boot_marker: TEST_BOOT.marker,
             dependencies: &dependencies,
         };
-        records::read_native_docker(
-            seal.as_slice(),
-            seal.len() as u64,
-            |file| Ok(std::io::Cursor::new(read(&output, &file.name()))),
-            &selection,
-            &fresh,
-        )
-        .unwrap();
+        crate::service::windows::set_current_token_owner().unwrap();
+        let (_, enrolled) = private_dir(dir.path(), "docker-enrollment");
+        let enrolled = enrolled.join("docker.json").unwrap();
+        std::fs::write(enrolled.as_str(), br#"{"class":"docker"}"#).unwrap();
+        let output_pin = PathPin::open(&output, true, false).unwrap();
+        let expected = crate::config::fixture_directory_pin(&output_pin.leaf);
+        let dossier =
+            PreparedStaticDossier::hold(&output, &expected, &enrolled, selection).unwrap();
+        let (selected, _rows) = dossier.read_measured(&fresh).unwrap();
+        assert_eq!(selected.recipe(), dependencies.recipe);
+        let mut other_boot = fresh.boot_marker;
+        other_boot[0] ^= 1;
+        assert!(
+            dossier
+                .read_measured(&records::DockerFresh {
+                    boot_marker: other_boot,
+                    ..fresh
+                })
+                .is_err()
+        );
         return;
     }
     assert!(!names(&output).contains(&COMPLETE.to_owned()));

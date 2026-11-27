@@ -119,12 +119,8 @@ impl SelectedStatic {
                 "recipe_id":hex::encode(recipe.recipe_id),
                 "recipe_sha256":hex::encode(recipe.recipe_sha256),
             },
-            "live_available":self.buildable(),
+            "live_available":true,
         })
-    }
-
-    pub(super) fn buildable(&self) -> bool {
-        self.refusal().is_none()
     }
 
     #[cfg(test)]

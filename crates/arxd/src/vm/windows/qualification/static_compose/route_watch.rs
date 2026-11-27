@@ -101,7 +101,9 @@ impl RouteWatch {
         })
     }
 
-    pub(super) fn require_current(&self) -> Result<(), NativeRefusal> {
+    pub(in crate::vm::windows::qualification) fn require_current(
+        &self,
+    ) -> Result<(), NativeRefusal> {
         (!self.context.changed.load(Ordering::Acquire))
             .then_some(())
             .ok_or(NETWORK)
@@ -147,6 +149,8 @@ fn sample_while_current<T>(
     }
     let observed = sample();
     if observed.is_err() {
+        // Cache even a transient read refusal as terminal for this watch.
+        // A later successful sample cannot prove continuity across the gap.
         changed.store(true, Ordering::Release);
     }
     if changed.load(Ordering::Acquire) {

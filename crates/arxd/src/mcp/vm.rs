@@ -2198,8 +2198,10 @@ impl VmInventory {
         let mut capability = self.supervisor.capability(gate);
         let mut recipes = self.supervisor.recipes.map(|entry| entry.map(|(id, _)| id));
         let mut static_available = false;
+        let mut static_blocked = false;
         if tool == ToolName::Catalog {
             if let Some(reason) = self.supervisor.static_refusal() {
+                static_blocked = true;
                 capability["static_compose"] =
                     json!({"available":false,"reason":native_reason(reason)});
                 recipes[3] = None;
@@ -2226,6 +2228,7 @@ impl VmInventory {
                             static_available
                         } else {
                             available
+                                && (entry.id != WEB_RECIPE_ID || !static_blocked)
                                 && self
                                     .supervisor
                                     .recipes
@@ -2669,7 +2672,12 @@ impl VmInventory {
         use crate::store::vm::compose as db;
         let target = Self::compose_target(&mut args)?;
         let store = self.supervisor.controller.compose_store();
-        let session = self.supervisor.compose.session(target.vm);
+        let static_refusal = self.supervisor.static_refusal();
+        let session = if static_refusal.is_none() {
+            self.supervisor.compose.session(target.vm)
+        } else {
+            None
+        };
         if tool == ToolName::ComposeStatus {
             args.end()?;
             let mut status = store
@@ -2770,7 +2778,9 @@ impl VmInventory {
                 (prior, old_key, true)
             }
             Err(compose::Fault::NotFound) => return Err(NOT_FOUND),
-            Err(compose::Fault::NotReady) => return Err(NOT_READY),
+            Err(compose::Fault::NotReady) => {
+                return Err(static_refusal.map_or(NOT_READY, |r| Fault::new(native_reason(r))));
+            }
             Err(compose::Fault::Busy) => return Err(Refusal::Busy.into()),
             Err(compose::Fault::StaleKey) => return Err(Refusal::StaleKey.into()),
             Err(compose::Fault::ReplayFull) => return Err(Refusal::ReplayFull.into()),
@@ -2881,7 +2891,12 @@ impl VmInventory {
 
         let store = self.supervisor.controller.compose_store();
         let _ = self.supervisor.compose_backup.reconcile_partials(store);
-        let session = self.supervisor.compose_backup.session(target.vm);
+        let static_refusal = self.supervisor.static_refusal();
+        let session = if static_refusal.is_none() {
+            self.supervisor.compose_backup.session(target.vm)
+        } else {
+            None
+        };
         let custody_present = self.supervisor.compose_backup.custody().is_some();
 
         let admission = store.transact(|tx| {
@@ -2927,7 +2942,9 @@ impl VmInventory {
         let intent = match admission {
             Ok(intent) => intent,
             Err(BackupFault::NotFound) => return Err(NOT_FOUND),
-            Err(BackupFault::NotReady) => return Err(NOT_READY),
+            Err(BackupFault::NotReady) => {
+                return Err(static_refusal.map_or(NOT_READY, |r| Fault::new(native_reason(r))));
+            }
             Err(BackupFault::Busy) => return Err(Refusal::Busy.into()),
             Err(BackupFault::BackupLimit) => return Err(Refusal::BackupLimit.into()),
             Err(BackupFault::Disk) => return Err(Refusal::Disk.into()),
@@ -13716,6 +13733,7 @@ pub(crate) mod tests {
                  VALUES(?1,'web-site','alice',?2,?3,zeroblob(16),?4,zeroblob(32),zeroblob(32),1,4096,0)",
                 params![vm, supervisor.host_id, template, WEB_DIGEST],
             )?;
+            db.execute("INSERT INTO vm_compose_projects(vm,project) VALUES(?1,'fixture')", [vm])?;
             Ok(())
         }).unwrap();
         {
@@ -13826,8 +13844,20 @@ pub(crate) mod tests {
                 .iter()
                 .all(|entry| { entry["recipe_id"] != compose_id })
         );
+        assert!(catalog["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["recipe_id"] == hex::encode(WEB_RECIPE_ID) && entry["state"] == "unqualified"
+        }));
         refused(&supervisor, "vm_template_build", build(7));
         refused(&supervisor, "publish_site", args(8));
+        let compose_args =
+            |n| json!({"vm_id":hex::encode(vm),"project_id":"fixture","request_id":key(n)});
+        refused(&supervisor, "compose_start", compose_args(9));
+        refused(&supervisor, "compose_backup", compose_args(10));
+        let foreign = supervisor
+            .connection("bob".into())
+            .inventory()
+            .dispatch(request("compose_start", compose_args(11)), || false);
+        assert_eq!(foreign.unwrap_err().0, "not_found");
         supervisor
             .controller
             .store_for_test()

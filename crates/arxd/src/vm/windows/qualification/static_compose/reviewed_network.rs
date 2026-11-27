@@ -5,6 +5,40 @@ use std::{collections::BTreeSet, net::SocketAddrV4};
 pub(super) const MAX_BYTES: u64 = 65_536;
 const NETWORK: NativeRefusal = NativeRefusal::NetworkFenceUnverified;
 
+/// Exact socket targets shared by the pinned fixture profile and the
+/// post-run TEST comparison. Only the addresses go into route sampling.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(in crate::vm::windows::qualification) struct PublicTargets {
+    public_tcp_target: SocketAddrV4,
+    public_dns_target: SocketAddrV4,
+}
+
+impl PublicTargets {
+    pub(in crate::vm::windows::qualification) fn parse(
+        bytes: &[u8],
+        policy: &PublicEgressPolicy,
+    ) -> Result<Self, NativeRefusal> {
+        let targets: Self = serde_json::from_slice(bytes).map_err(|_| NETWORK)?;
+        targets.verify(policy)?;
+        Ok(targets)
+    }
+
+    fn verify(self, policy: &PublicEgressPolicy) -> Result<(), NativeRefusal> {
+        if self.public_tcp_target.port() == 0
+            || self.public_dns_target.port() != 53
+            || self.addresses().iter().any(|ip| policy.denies(*ip))
+        {
+            return Err(NETWORK);
+        }
+        Ok(())
+    }
+
+    pub(in crate::vm::windows::qualification) fn addresses(self) -> [std::net::Ipv4Addr; 2] {
+        [*self.public_tcp_target.ip(), *self.public_dns_target.ip()]
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Receipt {
@@ -61,7 +95,7 @@ pub(super) fn verify(
     policy_hash: Hash,
     executable: Hash,
     policy: &PublicEgressPolicy,
-) -> Result<[std::net::Ipv4Addr; 2], NativeRefusal> {
+) -> Result<PublicTargets, NativeRefusal> {
     if bytes.len() as u64 > MAX_BYTES || docker_seal == test_seal {
         return Err(NETWORK);
     }
@@ -70,16 +104,17 @@ pub(super) fn verify(
     let observed = receipt.r#static;
     let comparison = receipt.test;
     let uplink = policy.uplink();
-    let public_targets = [*observed.tcp_target.ip(), *observed.dns_target.ip()];
+    let public_targets = PublicTargets {
+        public_tcp_target: observed.tcp_target,
+        public_dns_target: observed.dns_target,
+    };
+    public_targets.verify(policy)?;
     if receipt.version != 1
         || !matches(&receipt.qualification_sha256, docker_seal)
         || !matches(&receipt.m4_qualification_sha256, test_seal)
         || !matches(&receipt.recipe_sha256, recipe)
         || !matches(&receipt.policy_sha256, policy_hash)
         || !matches(&receipt.qemu_sha256, executable)
-        || observed.tcp_target.port() == 0
-        || observed.dns_target.port() != 53
-        || public_targets.iter().any(|ip| policy.denies(*ip))
         || !observed.public_tcp_connected
         || !observed.udp_dns_answer
         || !observed.root_capable_fixture
@@ -114,6 +149,7 @@ pub(super) fn verify(
         || !contains(uplink.gateway)
         || !contains([10, 0, 2, 2].into())
         || !contains([10, 0, 2, 3].into())
+        || !targets.iter().any(|t| t.ip().is_loopback())
         || !targets.iter().any(|t| t.ip().is_link_local())
         || !targets.iter().any(|t| {
             let [a, b, ..] = t.ip().octets();
@@ -132,8 +168,7 @@ mod tests {
 
     #[test]
     fn witness_requires_exact_seals_pins_controls_and_denials() {
-        let body =
-            "version=1\ninterface_index=7\ninterface_luid=8\nsource=10.8.0.4\ngateway=10.8.0.1\n";
+        let body = "version=1\ninterface_index=7\ninterface_luid=8\nsource=10.8.0.4\ngateway=10.8.0.1\ndeny=11.0.0.0/24\ndeny=12.0.0.9/32\n";
         let policy = PublicEgressPolicy::parse(
             format!(
                 "{body}fingerprint={}\n",
@@ -149,6 +184,9 @@ mod tests {
             "10.0.2.3:53",
             "169.254.1.1:80",
             "100.64.0.1:80",
+            "127.0.0.1:443",
+            "11.0.0.15:443", // enrolled public-numbered LAN
+            "12.0.0.9:443",  // enrolled WAN hairpin
         ]
         .iter()
         .map(|target| {
@@ -176,7 +214,20 @@ mod tests {
                 &policy,
             )
         };
-        assert_eq!(check(&receipt), Ok([[8; 4].into(), [9; 4].into()]));
+        let profile = br#"{"public_tcp_target":"8.8.8.8:443","public_dns_target":"9.9.9.9:53"}"#;
+        let expected = PublicTargets::parse(profile, &policy).unwrap();
+        assert_eq!(check(&receipt), Ok(expected));
+        let mut different_port = receipt.clone();
+        for role in ["static", "test"] {
+            different_port[role]["tcp_target"] = json!("8.8.8.8:8443");
+        }
+        assert_ne!(check(&different_port).unwrap(), expected);
+        let mut missing_loopback = receipt.clone();
+        missing_loopback["static"]["denied"]
+            .as_array_mut()
+            .unwrap()
+            .remove(6);
+        assert_eq!(check(&missing_loopback), Err(NETWORK));
         for path in [
             "/qualification_sha256",
             "/m4_qualification_sha256",
@@ -187,6 +238,9 @@ mod tests {
             "/static/ipv6_disabled",
             "/static/denied/0/udp_replied",
             "/static/denied/3/witness_udp_arrivals",
+            "/static/denied/6/witness_tcp_arrivals",
+            "/static/denied/7/witness_udp_arrivals",
+            "/static/denied/8/witness_tcp_arrivals",
             "/test/witness_tcp_arrivals",
         ] {
             let mut invalid = receipt.clone();

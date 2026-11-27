@@ -6,7 +6,7 @@
 )]
 
 pub(super) mod enrollment;
-mod reviewed_network;
+pub(super) mod reviewed_network;
 mod route_watch;
 
 use super::*;
@@ -119,27 +119,19 @@ impl PreparedStaticDossier {
 
         // Seed rendering needs a nonzero build ID. Selection uses the
         // stable recipe ID only; builders render a new seed for their generation.
-        let recipe = enrollment.recipe.hold(m4, [1; 16])?;
-        let held = HeldDockerInputs::hold(
-            &DockerInputEnrollment {
-                release: &enrollment.release,
-                runtime_profile: enrollment.runtime_profile.file(),
-                policy: &local(&enrollment.policy)?,
-                stock_bundle: &local(&enrollment.stock_bundle)?,
-                patched_bundle: &local(&enrollment.patched_bundle)?,
-                fixture_image: enrollment.fixture_image.file(),
-                fixture_network_profile: enrollment.fixture_network_profile.file(),
-                receiver_inventory: enrollment.receiver_inventory.file(),
-                probe_image: enrollment.probe_image.file(),
-                topology: enrollment.topology.file(),
-                origin_profile: enrollment.origin_profile.file(),
-            },
+        let recipe = {
+            let inputs = m4.recipes.lock().map_err(|_| REFUSAL)?;
+            enrollment.recipe.hold(&m4.held, &inputs, [1; 16])?
+        };
+        let held = enrollment.hold_inputs(
             self.root.path(),
             CollectMode::Foreground(&m4.store),
-            &m4.held.token,
-            m4.held.scope.as_ref().ok_or(REFUSAL)?,
+            &m4.held,
             &recipe,
         )?;
+        if held.m4_seal() != m4.seal_sha256() {
+            return Err(REFUSAL);
+        }
         let public_targets = reviewed_network::verify(
             &held_bytes(&reviewed, reviewed_network::MAX_BYTES)?,
             self.selection.seal_sha256,
@@ -149,6 +141,10 @@ impl PreparedStaticDossier {
             held.patched.review.qemu.sha256,
             &held.parsed_policy,
         )?;
+        if public_targets != held.public_targets()? {
+            return Err(NativeRefusal::NetworkFenceUnverified);
+        }
+        let public_targets = public_targets.addresses();
         let (dependencies, watch) = held.measure_live(&public_targets)?;
         let fresh = DockerFresh {
             now: boot::now(),
@@ -181,6 +177,7 @@ impl PreparedStaticDossier {
             fixture: held.fixture,
             recipe,
         };
+        m4.fresh()?;
         selected.require_current()?;
         Ok(selected)
     }
@@ -219,6 +216,18 @@ pub(crate) struct StaticDossier {
 impl StaticDossier {
     pub(crate) fn require_current(&self) -> Result<(), NativeRefusal> {
         self.watch.require_current()?;
+        let inputs = self.require_inputs_current();
+        // A notification during slower custody checks wins over their result.
+        self.watch.require_current()?;
+        inputs?;
+        self.watch.require_baseline(
+            &self.policy,
+            &self.public_targets,
+            self.dependencies.topology,
+        )
+    }
+
+    fn require_inputs_current(&self) -> Result<(), NativeRefusal> {
         self.root.verify()?;
         self.recipe.recheck()?;
         inventory::binding(&self.patched.bundle.root)?;
@@ -249,11 +258,7 @@ impl StaticDossier {
         {
             return Err(REFUSAL);
         }
-        self.watch.require_baseline(
-            &self.policy,
-            &self.public_targets,
-            self.dependencies.topology,
-        )
+        Ok(())
     }
 }
 
@@ -662,7 +667,11 @@ impl<'a> StockBootInputs<'a> {
     }
 }
 
-fn hold_file(path: &LocalPath, expected: ArtifactPin, max: u64) -> Result<PathPin, NativeRefusal> {
+pub(super) fn hold_file(
+    path: &LocalPath,
+    expected: ArtifactPin,
+    max: u64,
+) -> Result<PathPin, NativeRefusal> {
     let mut pin = PathPin::open(path, false, false)?;
     pin.verify_content(expected, max)?;
     recheck_file(&pin)?;
@@ -679,7 +688,7 @@ fn recheck_file(pin: &PathPin) -> Result<(), NativeRefusal> {
     Ok(())
 }
 
-fn held_bytes(pin: &PathPin, max: u64) -> Result<Vec<u8>, NativeRefusal> {
+pub(super) fn held_bytes(pin: &PathPin, max: u64) -> Result<Vec<u8>, NativeRefusal> {
     let reader = pin.reopen_without_writer().map_err(|_| REFUSAL)?;
     let bytes = read_bounded(&reader, max).map_err(|_| REFUSAL)?;
     let expected = pin.verified_content.ok_or(REFUSAL)?;
@@ -712,6 +721,7 @@ pub(super) struct HeldDockerInputs<'a> {
     token: &'a VmToken,
     recipe: &'a ComposeInstallerInputs,
     profile: PathPin,
+    m4_seal: Hash,
     policy: PathPin,
     parsed_policy: PublicEgressPolicy,
     pub(super) patched: inventory::PatchedBundle,
@@ -755,9 +765,12 @@ impl<'a> HeldDockerInputs<'a> {
         let config =
             crate::config::VmRuntimeProfile::parse(&held_bytes(&profile, MAX_ENROLLMENT_BYTES)?)
                 .map_err(|_| REFUSAL)?;
-        if !config.enabled() {
-            return Err(REFUSAL);
-        }
+        let m4_seal = config
+            .test_qualification()
+            .filter(|_| config.enabled())
+            .ok_or(REFUSAL)?
+            .selection()
+            .seal_sha256;
         let policy = private_input(
             EnrolledFile {
                 path: enrollment.policy,
@@ -794,6 +807,7 @@ impl<'a> HeldDockerInputs<'a> {
             token,
             recipe,
             profile,
+            m4_seal,
             policy,
             parsed_policy,
             patched,
@@ -813,6 +827,10 @@ impl<'a> HeldDockerInputs<'a> {
         })
     }
 
+    pub(super) fn m4_seal(&self) -> Hash {
+        self.m4_seal
+    }
+
     pub(super) fn stock_boot_inputs(&self) -> Result<StockBootInputs<'_>, NativeRefusal> {
         self.recipe.recheck()?;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -822,6 +840,15 @@ impl<'a> HeldDockerInputs<'a> {
             self.stock_inventory,
             self.recipe.firmware[0].verified_content.ok_or(REFUSAL)?,
             deadline,
+        )
+    }
+
+    pub(super) fn public_targets(&self) -> Result<reviewed_network::PublicTargets, NativeRefusal> {
+        let profile = &self.fixture[1];
+        recheck_file(profile)?;
+        reviewed_network::PublicTargets::parse(
+            &held_bytes(profile, MAX_ENROLLMENT_BYTES)?,
+            &self.parsed_policy,
         )
     }
 

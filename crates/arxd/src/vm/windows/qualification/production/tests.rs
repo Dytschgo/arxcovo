@@ -1191,13 +1191,14 @@ fn native_launch_pre_spawn_validation_refuses_invalid_bounds_roots_and_plan_kind
         ws_root.join("egress-policy.json").unwrap(),
         44,
     );
+    let public_egress_header = unbacked_qcow2_header(32 << 30);
     let public_egress_recipe = BootRecipe {
         image: &egress_qemu,
         data: &data,
         firmware: &firmware,
         vars: &static_vars,
         disk: &static_disk,
-        disk_header: &header,
+        disk_header: &public_egress_header,
         backing: None,
         backing_header: None,
         serial: &serial,
@@ -1205,7 +1206,7 @@ fn native_launch_pre_spawn_validation_refuses_invalid_bounds_roots_and_plan_kind
             &port_lease,
             StaticNetwork::PublicEgress(&egress_policy),
         ),
-        ram_mib: 1024,
+        ram_mib: 4096,
         vcpus: 2,
     };
     let public_egress_plan = public_egress_recipe.plan().unwrap();

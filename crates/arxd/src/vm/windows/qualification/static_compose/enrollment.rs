@@ -7,7 +7,7 @@ use crate::vm::template::{ubuntu_compose::PackagePin, ubuntu_web::PoolPackage};
 pub(in crate::vm::windows::qualification) struct Enrollment {
     pub(super) class: crate::vm::qualification_record::Class,
     pub(super) release: ReleaseEnrollment,
-    pub(super) runtime_profile: Input,
+    pub(in crate::vm::windows::qualification) runtime_profile: Input,
     pub(super) policy: String,
     pub(super) stock_bundle: String,
     pub(super) patched_bundle: String,
@@ -20,12 +20,12 @@ pub(in crate::vm::windows::qualification) struct Enrollment {
     // The independently reviewed comparison refers to the emitted seal.
     // Collection can precede it. Foreground selection always requires it.
     pub(super) network_witness: Option<Input>,
-    pub(super) recipe: Recipe,
+    pub(in crate::vm::windows::qualification) recipe: Recipe,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Input {
+pub(in crate::vm::windows::qualification) struct Input {
     #[serde(deserialize_with = "local_path")]
     path: LocalPath,
     size: u64,
@@ -43,10 +43,39 @@ impl Enrollment {
         }
         Ok(enrollment)
     }
+
+    pub(in crate::vm::windows::qualification) fn hold_inputs<'a>(
+        &self,
+        evidence: &LocalPath,
+        mode: CollectMode<'_>,
+        held: &'a Held,
+        recipe: &'a ComposeInstallerInputs,
+    ) -> Result<HeldDockerInputs<'a>, NativeRefusal> {
+        HeldDockerInputs::hold(
+            &DockerInputEnrollment {
+                release: &self.release,
+                runtime_profile: self.runtime_profile.file(),
+                policy: &local(&self.policy)?,
+                stock_bundle: &local(&self.stock_bundle)?,
+                patched_bundle: &local(&self.patched_bundle)?,
+                fixture_image: self.fixture_image.file(),
+                fixture_network_profile: self.fixture_network_profile.file(),
+                receiver_inventory: self.receiver_inventory.file(),
+                probe_image: self.probe_image.file(),
+                topology: self.topology.file(),
+                origin_profile: self.origin_profile.file(),
+            },
+            evidence,
+            mode,
+            &held.token,
+            held.scope.as_ref().ok_or(REFUSAL)?,
+            recipe,
+        )
+    }
 }
 
 impl Input {
-    pub(super) fn file(&self) -> EnrolledFile<'_> {
+    pub(in crate::vm::windows::qualification) fn file(&self) -> EnrolledFile<'_> {
         EnrolledFile {
             path: &self.path,
             pin: self.pin(),
@@ -79,7 +108,7 @@ fn sha256<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Hash, D::Error> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Recipe {
+pub(in crate::vm::windows::qualification) struct Recipe {
     medium: Input,
     review: Input,
     docker_keyring: Input,
@@ -115,14 +144,14 @@ struct ComposePackage {
 }
 
 impl Recipe {
-    pub(super) fn hold(
+    pub(in crate::vm::windows::qualification) fn hold(
         &self,
-        m4: &ForegroundQualification,
+        held: &Held,
+        measured: &launch::RecipeInputs,
         generation: Id,
     ) -> Result<ComposeInstallerInputs, NativeRefusal> {
-        let measured = m4.recipes.lock().map_err(|_| REFUSAL)?;
-        let [iso, kernel, initrd] = &m4.held.network.as_ref().ok_or(REFUSAL)?.media;
-        let guest = m4.held.ubuntu_guest.as_ref().map_err(|_| REFUSAL)?;
+        let [iso, kernel, initrd] = &held.network.as_ref().ok_or(REFUSAL)?.media;
+        let guest = held.ubuntu_guest.as_ref().map_err(|_| REFUSAL)?;
         let base = launch::ubuntu_test_recipe([
             launch::content(iso)?,
             launch::content(kernel)?,

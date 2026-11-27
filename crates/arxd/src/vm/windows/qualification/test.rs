@@ -235,7 +235,9 @@ impl Scope {
         }
         let host = match mode {
             CollectMode::Foreground(store) => read_guarded_host(store, &database, &lock)?,
-            CollectMode::Qualifier => read_store_host(&production.root, &database)?,
+            CollectMode::Qualifier | CollectMode::QualifierReview => {
+                read_store_host(&production.root, &database)?
+            }
         };
         let key = crate::vm::qualification_record::digest(
             &serde_json::to_vec(&(
@@ -256,6 +258,17 @@ impl Scope {
             host,
             key,
         })
+    }
+
+    pub(super) fn validate_stopped(&self) -> Result<(), Invalidation> {
+        self.validate_live()?;
+        let refused = NativeRefusal::PathCustodyUnverified;
+        let observed = read_store_host(&self.production.root, &self._database)
+            .map_err(Invalidation::Indeterminate)?;
+        if observed != self.host {
+            return Err(Invalidation::Confirmed(refused));
+        }
+        Ok(())
     }
 
     pub(super) fn validate_foreground(
