@@ -196,6 +196,12 @@ export interface ConsoleStream {
 
 export type AdapterKind = 'http' | 'standin';
 
+/** Per-call options for reads that a view may abandon (CPU history polls). */
+export interface ReadOptions {
+  /** Aborts the request, including a stalled body read; it then rejects with the signal's reason. */
+  signal?: AbortSignal;
+}
+
 export interface ArxApi {
   readonly kind: AdapterKind;
   /** Current session, or null when the cookie is missing or expired. */
@@ -204,8 +210,8 @@ export interface ArxApi {
   logout(): Promise<void>;
   listHosts(): Promise<Host[]>;
   getHost(id: string): Promise<Host>;
-  getCpuHistory(hostId: string, range: CpuHistoryRange): Promise<CpuHistory>;
-  listCpuHistory(range: '24h'): Promise<CpuHistory[]>;
+  getCpuHistory(hostId: string, range: CpuHistoryRange, options?: ReadOptions): Promise<CpuHistory>;
+  listCpuHistory(range: '24h', options?: ReadOptions): Promise<CpuHistory[]>;
   listActivity(query?: ActivityQuery): Promise<ActivityPage>;
   listVms(): Promise<Vm[]>;
   getVm(id: string): Promise<Vm>;
