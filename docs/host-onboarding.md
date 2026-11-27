@@ -208,8 +208,17 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`, ADR 0015):
 
    `arxd: service-foreign-registration` has two sources (`owner_unix.rs`
    `observe`): a file at `/Library/LaunchDaemons/com.arxcovo.arxd.plist` whose
-   bytes differ from Arxcovo's plist, or a launchd job with this label whose
-   plist path, program or arguments differ from Arxcovo's. Only `status` is
+   bytes differ from Arxcovo's plist, or an opened plist that fails the
+   file-protection check even when those bytes are identical, or a launchd
+   job with this label whose plist path, program or arguments differ from
+   Arxcovo's. The opened file must be a regular file with one hard link,
+   owner and group `root:wheel`, mode `0644` and no ACL entries. A wrong
+   mode such as `0600`, a wrong owner or group, or a non-regular file
+   reports `service-foreign-registration`. A symlink fails the no-follow
+   open and reports `service-permissions`. The job mismatch applies when
+   `launchctl print` output has recognized structure and a recognized state
+   (`owner_query.rs:396`). Output with unrecognized structure or state
+   reports `service-manager`. Only `status` is
    strictly read-only. The other verbs check first and change nothing when
    that first check reports it, but they check again later (`owner_plan.rs`),
    and nothing is rolled back: `install` can report it at its final check,
