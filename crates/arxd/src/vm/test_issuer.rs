@@ -466,18 +466,17 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         slots: &[ArtifactSlot],
         inspection: Option<InspectionBinding>,
     ) -> Result<(), NativeRefusal> {
-        // A worker's ledger reads are nonblocking. Transient contention is
-        // retried, bounded, while neither cancellation nor revocation holds.
-        retry_contended(
-            &|| self.cancel.is_cancelled(),
-            &|| self.issuer.epoch.effects_revoked(),
-            || {
-                self.guard(slots, inspection)?;
-                let captured = self.issuer.refresh()?;
-                self.guard(slots, inspection)?;
-                fresh_observation(captured, Instant::now(), REFUSED)
-            },
-        )
+        // A worker's ledger reads are nonblocking. Each step retries its own
+        // transient contention, bounded, while neither cancellation nor
+        // revocation holds, so a slow refresh cannot spend the trailing
+        // guard's window. The observation must still be fresh once the
+        // trailing guard passes, so the retries never extend its freshness.
+        let cancelled = || self.cancel.is_cancelled();
+        let revoked = || self.issuer.epoch.effects_revoked();
+        retry_contended(&cancelled, &revoked, || self.guard(slots, inspection))?;
+        let captured = retry_contended(&cancelled, &revoked, || self.issuer.refresh())?;
+        retry_contended(&cancelled, &revoked, || self.guard(slots, inspection))?;
+        fresh_observation(captured, Instant::now(), REFUSED)
     }
 
     /// One permit per durable effect.

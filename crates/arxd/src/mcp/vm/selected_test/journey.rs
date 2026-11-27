@@ -208,7 +208,7 @@ impl Session {
                     }
                     return row;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
@@ -336,7 +336,7 @@ fn fixture_recipes() -> crate::vm::qualification_record::TestRecipes {
     (&source).recipes()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() {
     let dir = fixture_root();
     let root = dir.path();
@@ -771,7 +771,7 @@ fn tick(now: &Arc<AtomicI64>, origin: Instant) -> tokio::task::JoinHandle<()> {
 /// I12/T49/T50: closure withdraws the live witness and refuses fresh
 /// effects, while the exact owner stop still admits and settles with its
 /// receipt instead of entering recovery.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_admission_withdraws_witness_and_settles_exact_owner_stop() {
     let dir = fixture_root();
     let root = dir.path();
@@ -864,7 +864,7 @@ async fn closed_admission_withdraws_witness_and_settles_exact_owner_stop() {
 
 /// P2-2: a caller-owned Static VM reaching the selected TEST dispatch is
 /// refused, audited, as unqualified rather than unknown.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_dispatch_refuses_a_static_vm_as_unqualified() {
     let dir = fixture_root();
     let root = dir.path();

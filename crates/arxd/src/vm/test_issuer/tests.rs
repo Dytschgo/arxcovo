@@ -104,6 +104,8 @@ pub(crate) struct FakeSource {
     marker: Mutex<Hash>,
     fault: Mutex<Option<Invalidation>>,
     during: Mutex<Option<Hook>>,
+    /// How long before each sample its observation was captured.
+    age: Mutex<Duration>,
 }
 
 impl FakeSource {
@@ -118,6 +120,7 @@ impl FakeSource {
             marker: Mutex::new(MARKER),
             fault: Mutex::default(),
             during: Mutex::default(),
+            age: Mutex::default(),
         }
     }
 }
@@ -147,7 +150,7 @@ impl SelectedSource for &FakeSource {
         &self,
         advance: &dyn Fn() -> Result<ClockReading, Invalidation>,
     ) -> Result<Sample, Invalidation> {
-        let captured = Instant::now();
+        let captured = Instant::now() - *self.age.lock().unwrap();
         if let Some(fault) = *self.fault.lock().unwrap() {
             return Err(fault);
         }
@@ -1626,6 +1629,134 @@ fn contention_retry_stops_at_cancellation_or_revocation() {
             assert!(issuer.intent(&worker, target, &fixture.cancel).is_err());
             began.elapsed()
         });
+        assert!(
+            elapsed < CONTENTION_BUDGET / 5,
+            "revoke={revoke}: {elapsed:?}"
+        );
+    }
+    assert_admission_closed();
+}
+
+/// Inside the next sample, after the clock read: waits `delay`, has a peer
+/// hold the store lock for `hold` after applying `drift`, then returns.
+/// Yields the intent's result and how long it took after the sample.
+fn intent_after_slow_sample(
+    fixture: &Fixture,
+    issuer: &TestIssuer<'_, &FakeSource, TestClock>,
+    delay: Duration,
+    hold: Duration,
+    drift: &(dyn Fn() + Sync),
+) -> (Result<(), NativeRefusal>, Duration) {
+    let (worker, target) = fixture.script();
+    let store = fixture.ctl.store_for_test();
+    let (go, start) = std::sync::mpsc::channel::<()>();
+    let (holding, held) = std::sync::mpsc::channel::<()>();
+    let returned = Arc::new(Mutex::new(None::<Instant>));
+    let mark = returned.clone();
+    fixture.during_next_sample(Box::new(move || {
+        std::thread::sleep(delay);
+        go.send(()).unwrap();
+        held.recv().unwrap();
+        *mark.lock().unwrap() = Some(Instant::now());
+    }));
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            if start.recv().is_ok() {
+                store
+                    .read_only(|_| {
+                        drift();
+                        holding.send(()).unwrap();
+                        std::thread::sleep(hold);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        });
+        let result = issuer.intent(&worker, target, &fixture.cancel).map(|_| ());
+        // An unrun hook releases the peer.
+        drop(fixture.source.during.lock().unwrap().take());
+        let elapsed = returned.lock().unwrap().expect("the sample ran").elapsed();
+        (result, elapsed)
+    })
+}
+
+/// A refresh that outlasts the contention budget, as a slow commit on a
+/// loaded host does, leaves the trailing guard its own window to ride out
+/// a concurrent poll.
+#[test]
+fn a_slow_refresh_leaves_the_trailing_guard_its_own_contention_window() {
+    let fixture = Fixture::new();
+    let issuer = fixture.issuer();
+    let (minted, _) = intent_after_slow_sample(
+        &fixture,
+        &issuer,
+        CONTENTION_BUDGET + Duration::from_millis(100),
+        Duration::from_millis(60),
+        &|| {},
+    );
+    assert!(minted.is_ok(), "{:?}", minted.err());
+    assert!(!issuer.epoch().effects_revoked());
+    assert_admission_closed();
+}
+
+/// The per-step retries never stretch the observation: once the trailing
+/// guard passes, an observation older than the freshness bound refuses.
+#[test]
+fn per_step_retries_never_outlive_the_observation_freshness() {
+    for (age, fresh) in [
+        (crate::vm::runtime::FRESHNESS - Duration::from_secs(1), true),
+        (
+            crate::vm::runtime::FRESHNESS - Duration::from_millis(200),
+            false,
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let issuer = fixture.issuer();
+        *fixture.source.age.lock().unwrap() = age;
+        // The guard rides out this hold inside its own budget.
+        let (minted, _) = intent_after_slow_sample(
+            &fixture,
+            &issuer,
+            Duration::ZERO,
+            Duration::from_millis(400),
+            &|| {},
+        );
+        if fresh {
+            assert!(minted.is_ok(), "{age:?}: {:?}", minted.err());
+        } else {
+            assert!(
+                matches!(minted, Err(NativeRefusal::QualificationMissing)),
+                "{age:?}: a stale observation minted"
+            );
+        }
+    }
+    assert_admission_closed();
+}
+
+/// Cancellation or a revoked epoch during the trailing guard's contention
+/// ends its window at once.
+#[test]
+fn per_step_contention_windows_stop_at_cancellation_or_revocation() {
+    for revoke in [false, true] {
+        let fixture = Fixture::new();
+        let issuer = fixture.issuer();
+        let drift = || {
+            if revoke {
+                fixture.fault(Some(Confirmed(REFUSED)));
+                assert!(issuer.refresh().is_err());
+            } else {
+                fixture.cancel.cancel();
+            }
+        };
+        let (minted, elapsed) = intent_after_slow_sample(
+            &fixture,
+            &issuer,
+            Duration::ZERO,
+            CONTENTION_BUDGET * 2,
+            &drift,
+        );
+        assert!(minted.is_err(), "revoke={revoke}");
+        assert_eq!(issuer.epoch().effects_revoked(), revoke);
         assert!(
             elapsed < CONTENTION_BUDGET / 5,
             "revoke={revoke}: {elapsed:?}"

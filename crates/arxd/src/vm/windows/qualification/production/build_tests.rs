@@ -327,8 +327,17 @@ impl<S: SelectedSource, C: crate::vm::Clock> Effects for Peer<'_, S, C> {
             crate::vm::qemu_img::create(prepared.lease(), image, &stage, backing, size, ceiling)
                 .unwrap();
         let target = || prepared.launch_target(&plan, &self.cwd);
-        let permit = self.intent.launch(binding, target()).unwrap();
-        consume_checked(permit, target(), binding, config().selection().seal_sha256).unwrap();
+        // A refused launch settles the helper with its reason instead of
+        // panicking the worker and leaving its operation pending.
+        let permit = match self.intent.launch(binding, target()) {
+            Ok(permit) => permit,
+            Err(reason) => return HelperSettlement::quarantined(Err(reason)),
+        };
+        if let Err(reason) =
+            consume_checked(permit, target(), binding, config().selection().seal_sha256)
+        {
+            return HelperSettlement::quarantined(Err(reason));
+        }
         self.record_job(prepared.workspace());
         let cluster = match backing {
             Some((backing, _)) => {
