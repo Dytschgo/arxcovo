@@ -183,10 +183,14 @@ token into chat, an issue, a command line or a log.
    `/home`, because the service hides `/home` from builds:
 
    ```sh
-   sudo useradd --system --create-home --home-dir /var/lib/arxcovo-build --shell /usr/sbin/nologin arxcovo
+   sudo useradd --create-home --home-dir /var/lib/arxcovo-build --shell /bin/sh arxcovo
    ```
 
-   Then create the workspace as that user:
+   The native account lookup accepts only UIDs of 1000 or more with a login
+   shell (`service/native_unix.rs` `account`). A `--system` account or a
+   `nologin` shell makes `service configure` refuse with `service-identity`.
+   The password stays locked; never add a sudo rule. Then create the workspace
+   as that user:
    `sudo -u arxcovo mkdir /var/lib/arxcovo-build/work`.
 2. **(admin)** Install the tools for `arxcovo`, for example rustup into its home.
 3. **(admin)** Install the binary and the service, then configure it:
@@ -204,6 +208,16 @@ token into chat, an issue, a command line or a log.
    accepts `--rights standard|admin`; Linux admin plans remove the drop-in,
    but no production executor exists for either mode. This guide's acceptance
    uses standard rights only. Do not enable lingering for the build account.
+4. **(admin, optional) Cluster.** `arxd service cluster-config` writes the
+   private cluster installation file. `service configure ... --cluster-config
+   FILE --cluster-intent INTENT` adds the Linux-only `cluster` launch setting.
+   `INTENT` is one of `create-founder`, `join`, `recover-founder` or
+   `recover-joiner`. Both options are given together or not at all; without
+   them `configure` writes no `cluster` setting, as before. macOS and Windows
+   refuse both commands. Follow
+   [host-onboarding.md](host-onboarding.md) Linux step 6 for the accounts,
+   layout, exact commands, refusal tokens and the known drop-in capability
+   blocker. Installed cluster activation is **unverified on real hardware**.
 
 ## macOS
 

@@ -247,7 +247,7 @@ pub(crate) struct Roles {
 }
 
 impl Roles {
-    fn qualify(self) -> Result<(), Failure> {
+    pub(super) fn qualify(self) -> Result<(), Failure> {
         let ids = [self.owner, self.daemon, self.agent, self.build];
         for (index, uid) in ids.iter().enumerate() {
             if *uid == 0 || *uid == u32::MAX || ids[..index].contains(uid) {

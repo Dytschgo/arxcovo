@@ -1,6 +1,7 @@
 //! ADR0009 service lifecycle and fixed protected inventory application.
 //! Dedicated-account execution remains unavailable until its backend is integrated.
 pub(crate) mod application;
+pub mod cluster_install;
 pub mod config;
 pub mod layout;
 pub mod native;

@@ -1,4 +1,5 @@
 //! Strict, bounded service-only schema. No foreground or CLI config overrides.
+use super::cluster_install::{DAEMON_ACCOUNT, INTENTS, posix_path};
 use super::layout::{Error, Layout, Platform};
 use super::preflight::ExecutionUnavailable;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,13 @@ pub struct ConfigureRequest<'a> {
     pub workspace: &'a str,
     pub environment: &'a [(String, String)],
     pub agents: &'a [(String, String)],
+    /// Linux only: the private cluster installation file and launch intent.
+    pub cluster: Option<ClusterRequest<'a>>,
+}
+/// Owner input for the optional Linux `cluster` launch setting (ADR 0047).
+pub struct ClusterRequest<'a> {
+    pub config: &'a str,
+    pub intent: &'a str,
 }
 pub(crate) fn valid_principal(p: &str) -> bool {
     p != "arxd"
@@ -118,6 +126,12 @@ impl ServiceConfig {
         res: &impl Resolver,
     ) -> Result<Self, Error> {
         validate_platform_rights(l.platform(), r.rights)?;
+        // macOS and Windows refuse any cluster setting before observation.
+        if let Some(cluster) = &r.cluster
+            && (l.platform() != Platform::Linux || !launch_static(cluster.config, cluster.intent))
+        {
+            return Err(Error::Config);
+        }
         let mut environment = BTreeMap::new();
         for (key, value) in r.environment {
             if environment.insert(key.clone(), value.clone()).is_some() {
@@ -132,6 +146,30 @@ impl ServiceConfig {
         if client.kind != AccountKind::User {
             return Err(Error::Identity);
         }
+        let cluster = r
+            .cluster
+            .as_ref()
+            .map(|cluster| {
+                let daemon = res.account(DAEMON_ACCOUNT)?;
+                let daemon_uid = daemon
+                    .identity
+                    .parse::<u32>()
+                    .map_err(|_| Error::Identity)?;
+                if daemon.kind != AccountKind::User
+                    || daemon.administrative
+                    || daemon.identity == build.identity
+                    || daemon.identity == client.identity
+                {
+                    return Err(Error::Identity);
+                }
+                Ok(ServiceLaunch {
+                    config: cluster.config.into(),
+                    intent: cluster.intent.into(),
+                    daemon_uid,
+                    daemon_gid: daemon.gid.ok_or(Error::Identity)?,
+                })
+            })
+            .transpose()?;
         let wire = Wire {
             schema: "arxd-service/1".into(),
             client: Client {
@@ -159,7 +197,7 @@ impl ServiceConfig {
                 })
                 .collect(),
             granted_batch_right: false,
-            cluster: None,
+            cluster,
         };
         Self::parse(
             &serde_json::to_vec(&wire).map_err(|_| Error::Config)?,
@@ -257,6 +295,25 @@ impl ServiceConfig {
             || service_identity(&w.build_account.identity, self.platform)
         {
             return Err(Error::Identity);
+        }
+        if let Some(launch) = &w.cluster {
+            let daemon = launch.daemon_uid.to_string();
+            if self.platform != Platform::Linux
+                || !launch
+                    .config
+                    .to_str()
+                    .is_some_and(|config| launch_static(config, &launch.intent))
+            {
+                return Err(Error::Config);
+            }
+            if [launch.daemon_uid, launch.daemon_gid]
+                .iter()
+                .any(|id| *id == 0 || *id == u32::MAX)
+                || daemon == w.client.identity
+                || daemon == w.build_account.identity
+            {
+                return Err(Error::Identity);
+            }
         }
         let client = resolver
             .account(&w.client.identity)
@@ -409,6 +466,11 @@ impl ServiceConfig {
         }
         Ok(bytes)
     }
+}
+/// Static launch facts checked before any observation; `Child::spawn` and the
+/// worker still vet the file, layout and accounts at every start.
+fn launch_static(config: &str, intent: &str) -> bool {
+    posix_path(config) && INTENTS.contains(&intent)
 }
 fn service_identity(s: &str, os: Platform) -> bool {
     if os == Platform::Windows {
@@ -1051,6 +1113,7 @@ mod request_tests {
             workspace: if windows { r"C:\work" } else { "/work" },
             environment: env,
             agents,
+            cluster: None,
         }
     }
     #[test]
@@ -1255,5 +1318,347 @@ mod request_tests {
         for p in ["", "arxd", "a.b", "ä", &"a".repeat(65)] {
             assert!(!valid_principal(p));
         }
+    }
+}
+
+#[cfg(test)]
+mod cluster_launch_tests {
+    use super::*;
+    use std::cell::RefCell;
+    struct Accounts {
+        platform: Platform,
+        calls: RefCell<Vec<String>>,
+        daemon: Option<Account>,
+    }
+    impl Accounts {
+        fn new(platform: Platform) -> Self {
+            Self {
+                platform,
+                calls: RefCell::new(vec![]),
+                daemon: Some(Account {
+                    identity: "1100".into(),
+                    gid: Some(1100),
+                    kind: AccountKind::User,
+                    administrative: false,
+                }),
+            }
+        }
+    }
+    impl Resolver for Accounts {
+        fn account(&self, n: &str) -> Result<Account, Error> {
+            self.calls.borrow_mut().push(n.into());
+            if n == DAEMON_ACCOUNT {
+                return self
+                    .daemon
+                    .as_ref()
+                    .map_or(Err(Error::AccountMissing), |a| {
+                        Ok(Account {
+                            identity: a.identity.clone(),
+                            gid: a.gid,
+                            kind: a.kind,
+                            administrative: a.administrative,
+                        })
+                    });
+            }
+            let id = if n == "builder" { "1002" } else { "1001" };
+            Ok(Account {
+                identity: if self.platform == Platform::Windows {
+                    format!("S-1-5-21-100-200-300-{id}")
+                } else {
+                    id.into()
+                },
+                gid: (self.platform != Platform::Windows).then_some(1002),
+                kind: AccountKind::User,
+                administrative: false,
+            })
+        }
+        fn workspace_safe(&self, _: &str) -> Result<bool, Error> {
+            Ok(true)
+        }
+    }
+    fn request<'a>(
+        agents: &'a [(String, String)],
+        platform: Platform,
+        cluster: Option<ClusterRequest<'a>>,
+    ) -> ConfigureRequest<'a> {
+        ConfigureRequest {
+            build_account: "builder",
+            client_account: "client",
+            rights: Rights::Standard,
+            workspace: if platform == Platform::Windows {
+                r"C:\work"
+            } else {
+                "/work"
+            },
+            environment: &[],
+            agents,
+            cluster,
+        }
+    }
+    fn launch(intent: &str) -> Option<ClusterRequest<'_>> {
+        Some(ClusterRequest {
+            config: "/etc/arxcovo-cluster/cluster.json",
+            intent,
+        })
+    }
+    fn agents() -> Vec<(String, String)> {
+        vec![("test".into(), "a".repeat(64))]
+    }
+
+    #[test]
+    fn linux_records_each_intent_with_the_resolved_daemon_account() {
+        let layout = Layout::for_test(Platform::Linux);
+        let agents = agents();
+        for intent in INTENTS {
+            let r = Accounts::new(Platform::Linux);
+            let config = ServiceConfig::from_request(
+                &request(&agents, Platform::Linux, launch(intent)),
+                &layout,
+                &r,
+            )
+            .unwrap();
+            let bytes = config.serialized(false).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                value["cluster"],
+                serde_json::json!({
+                    "config": "/etc/arxcovo-cluster/cluster.json",
+                    "intent": intent,
+                    "daemon_uid": 1100,
+                    "daemon_gid": 1100,
+                })
+            );
+            assert_eq!(
+                &r.calls.borrow()[..3],
+                ["builder", "client", DAEMON_ACCOUNT]
+            );
+            // The written bytes reparse unchanged on Linux.
+            let reparsed = ServiceConfig::parse(&bytes, &layout, &r).unwrap();
+            assert_eq!(reparsed.serialized(false).unwrap(), bytes);
+            #[cfg(target_os = "linux")]
+            {
+                let launch = reparsed.cluster().unwrap();
+                assert_eq!(launch.intent, intent);
+                assert_eq!((launch.daemon_uid, launch.daemon_gid), (1100, 1100));
+            }
+        }
+    }
+
+    #[test]
+    fn omitted_cluster_options_keep_the_standalone_config_unchanged() {
+        for platform in [Platform::Linux, Platform::Macos, Platform::Windows] {
+            let layout = Layout::for_test(platform);
+            let r = Accounts::new(platform);
+            let agents = agents();
+            let config =
+                ServiceConfig::from_request(&request(&agents, platform, None), &layout, &r)
+                    .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&config.serialized(false).unwrap()).unwrap();
+            assert!(value.get("cluster").is_none());
+            assert!(!r.calls.borrow().iter().any(|n| n == DAEMON_ACCOUNT));
+        }
+    }
+
+    #[test]
+    fn macos_and_windows_refuse_cluster_before_any_observation() {
+        for platform in [Platform::Macos, Platform::Windows] {
+            let layout = Layout::for_test(platform);
+            let agents = agents();
+            let r = Accounts::new(platform);
+            assert!(matches!(
+                ServiceConfig::from_request(
+                    &request(&agents, platform, launch("join")),
+                    &layout,
+                    &r
+                ),
+                Err(Error::Config)
+            ));
+            assert!(r.calls.borrow().is_empty());
+            // A stored cluster setting is refused by full and startup parsing.
+            let linux = ServiceConfig::from_request(
+                &request(&agents, Platform::Linux, launch("join")),
+                &Layout::for_test(Platform::Linux),
+                &Accounts::new(Platform::Linux),
+            )
+            .unwrap();
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&linux.serialized(false).unwrap()).unwrap();
+            if platform == Platform::Windows {
+                value["client"]["identity"] = "S-1-5-21-100-200-300-1001".into();
+                value["build_account"]["identity"] = "S-1-5-21-100-200-300-1002".into();
+                value["build_account"]["gid"] = serde_json::Value::Null;
+                value["workspace"] = r"C:\work".into();
+            }
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert!(matches!(
+                ServiceConfig::parse(&bytes, &layout, &r),
+                Err(Error::Config)
+            ));
+            assert!(matches!(
+                ServiceConfig::parse_inventory(&bytes, &layout, &r),
+                Err(Error::Config)
+            ));
+            value.as_object_mut().unwrap().remove("cluster");
+            assert!(
+                ServiceConfig::parse(&serde_json::to_vec(&value).unwrap(), &layout, &r).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_launch_requests_refuse_before_any_observation() {
+        let layout = Layout::for_test(Platform::Linux);
+        let agents = agents();
+        for (config, intent) in [
+            ("cluster.json", "join"),
+            ("/etc/arxcovo-cluster/../cluster.json", "join"),
+            ("/etc/arxcovo-cluster/", "join"),
+            ("/", "join"),
+            ("C:\\cluster.json", "join"),
+            ("/etc/arxcovo-cluster/cluster.json", "founder"),
+            ("/etc/arxcovo-cluster/cluster.json", "Join"),
+            ("/etc/arxcovo-cluster/cluster.json", ""),
+        ] {
+            let r = Accounts::new(Platform::Linux);
+            let cluster = Some(ClusterRequest { config, intent });
+            assert!(
+                matches!(
+                    ServiceConfig::from_request(
+                        &request(&agents, Platform::Linux, cluster),
+                        &layout,
+                        &r
+                    ),
+                    Err(Error::Config)
+                ),
+                "{config} {intent}"
+            );
+            assert!(r.calls.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn daemon_account_must_be_a_distinct_standard_user() {
+        let layout = Layout::for_test(Platform::Linux);
+        let agents = agents();
+        let user = |identity: &str, gid, kind, administrative| {
+            Some(Account {
+                identity: identity.into(),
+                gid,
+                kind,
+                administrative,
+            })
+        };
+        for (daemon, expected) in [
+            (None, Error::AccountMissing),
+            (
+                user("1100", Some(1100), AccountKind::User, true),
+                Error::Identity,
+            ),
+            (
+                user("1100", Some(1100), AccountKind::Group, false),
+                Error::Identity,
+            ),
+            (
+                user("1100", None, AccountKind::User, false),
+                Error::Identity,
+            ),
+            (
+                user("1100", Some(0), AccountKind::User, false),
+                Error::Identity,
+            ),
+            (
+                user("0", Some(1100), AccountKind::User, false),
+                Error::Identity,
+            ),
+            (
+                user("1002", Some(1100), AccountKind::User, false),
+                Error::Identity,
+            ),
+            (
+                user("1001", Some(1100), AccountKind::User, false),
+                Error::Identity,
+            ),
+            (
+                user("arxd-cluster", Some(1100), AccountKind::User, false),
+                Error::Identity,
+            ),
+            (
+                user("4294967295", Some(1100), AccountKind::User, false),
+                Error::Identity,
+            ),
+        ] {
+            let mut r = Accounts::new(Platform::Linux);
+            r.daemon = daemon;
+            let result = ServiceConfig::from_request(
+                &request(&agents, Platform::Linux, launch("join")),
+                &layout,
+                &r,
+            );
+            assert!(result.err() == Some(expected));
+        }
+    }
+
+    #[test]
+    fn stored_launch_values_are_revalidated_on_every_parse() {
+        let layout = Layout::for_test(Platform::Linux);
+        let r = tests::FakeResolver::default();
+        let base = || {
+            let mut value = tests::fixture();
+            value["cluster"] = serde_json::json!({
+                "config": "/etc/arxcovo-cluster/cluster.json",
+                "intent": "recover-joiner",
+                "daemon_uid": 1100,
+                "daemon_gid": 1100,
+            });
+            value
+        };
+        assert!(tests::parse(base(), &r).is_ok());
+        for (pointer, value, expected) in [
+            (
+                "/cluster/config",
+                serde_json::json!("relative"),
+                Error::Config,
+            ),
+            (
+                "/cluster/config",
+                serde_json::json!("/a/../b"),
+                Error::Config,
+            ),
+            (
+                "/cluster/intent",
+                serde_json::json!("recover"),
+                Error::Config,
+            ),
+            ("/cluster/daemon_uid", serde_json::json!(0), Error::Identity),
+            (
+                "/cluster/daemon_uid",
+                serde_json::json!(u32::MAX),
+                Error::Identity,
+            ),
+            (
+                "/cluster/daemon_uid",
+                serde_json::json!(1001),
+                Error::Identity,
+            ),
+            (
+                "/cluster/daemon_uid",
+                serde_json::json!(1002),
+                Error::Identity,
+            ),
+            ("/cluster/daemon_gid", serde_json::json!(0), Error::Identity),
+        ] {
+            let mut v = base();
+            *v.pointer_mut(pointer).unwrap() = value;
+            let bytes = serde_json::to_vec(&v).unwrap();
+            assert!(tests::parse(v, &r).err() == Some(expected), "{pointer}");
+            assert!(
+                ServiceConfig::parse_inventory(&bytes, &layout, &r).err() == Some(expected),
+                "{pointer}"
+            );
+        }
+        let mut v = base();
+        v["cluster"]["extra"] = 1.into();
+        assert!(tests::parse(v, &r).err() == Some(Error::Config));
     }
 }

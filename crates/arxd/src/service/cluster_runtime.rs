@@ -31,6 +31,8 @@ const CLOSE: Duration = Duration::from_secs(10);
 
 use super::config::ServiceLaunch;
 
+pub(super) mod install;
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
@@ -1596,6 +1598,37 @@ impl Child {
         service: &super::config::ServiceConfig,
     ) -> Result<Self, super::ExitCode> {
         use super::ExitCode;
+        let stamp = Self::qualify(launch, layout, service)?;
+        let mut command =
+            std::process::Command::new(std::env::current_exe().map_err(|_| ExitCode::Layout)?);
+        command
+            .arg("cluster-service-worker")
+            .arg(&launch.config)
+            .arg("--cluster-intent")
+            .arg(&launch.intent);
+        Self::spawn_worker(
+            command,
+            WorkerIdentity::Dedicated(launch.daemon_uid, launch.daemon_gid),
+            Some(stamp),
+        )
+    }
+
+    /// Owner `service configure` runs the exact start-time checks before it
+    /// writes a `cluster` launch setting.
+    pub(super) fn preflight(
+        launch: &ServiceLaunch,
+        layout: &super::layout::Layout,
+        service: &super::config::ServiceConfig,
+    ) -> Result<(), super::ExitCode> {
+        Self::qualify(launch, layout, service).map(|_| ())
+    }
+
+    fn qualify(
+        launch: &ServiceLaunch,
+        layout: &super::layout::Layout,
+        service: &super::config::ServiceConfig,
+    ) -> Result<ConfigStamp, super::ExitCode> {
+        use super::ExitCode;
         use super::config::{AccountKind, Resolver};
         if !launch.config.is_absolute()
             || Intent::parse(&launch.intent).is_none()
@@ -1610,7 +1643,7 @@ impl Child {
             return Err(ExitCode::Permissions);
         }
         let account = super::native::NativeResolver
-            .account("arxd-cluster")
+            .account(super::cluster_install::DAEMON_ACCOUNT)
             .map_err(|_| ExitCode::Config)?;
         let uid = launch.daemon_uid.to_string();
         if account.kind != AccountKind::User
@@ -1636,19 +1669,7 @@ impl Child {
         if settings.daemon_gid != launch.daemon_gid {
             return Err(ExitCode::Config);
         }
-
-        let mut command =
-            std::process::Command::new(std::env::current_exe().map_err(|_| ExitCode::Layout)?);
-        command
-            .arg("cluster-service-worker")
-            .arg(&launch.config)
-            .arg("--cluster-intent")
-            .arg(&launch.intent);
-        Self::spawn_worker(
-            command,
-            WorkerIdentity::Dedicated(launch.daemon_uid, launch.daemon_gid),
-            Some(stamp),
-        )
+        Ok(stamp)
     }
 
     fn spawn_worker(
