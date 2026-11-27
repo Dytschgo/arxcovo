@@ -136,3 +136,28 @@ export const TERMINAL_SCRIPTS: Record<string, { lines: string[]; exitCode: numbe
   pwsh: { lines: ['PowerShell 7.5.4'], exitCode: 0 },
   'qemu-system-aarch64': { lines: ['QEMU emulator version 8.2.2'], exitCode: 0, stderr: ['warning: stand-in output, no VM started'] },
 };
+
+/**
+ * Per-minute CPU profile behind the stand-in's CPU history. Each series ends
+ * on the host's current sample. `gaps` are minutes-ago ranges (inclusive)
+ * with no sample, as after an arxd restart; a host without a profile has no
+ * history at all (pebble went offline across an arxd restart, so the server
+ * kept no buffer for it and answers all null).
+ */
+interface CpuProfile { seed: number; now: number; base: number; amp: number; gaps: [number, number][] }
+const CPU_PROFILES: Record<string, CpuProfile> = {
+  atlas: { seed: 1, now: 38, base: 42, amp: 16, gaps: [[18, 23], [200, 262]] },
+  harbor: { seed: 2, now: 21, base: 24, amp: 9, gaps: [] },
+  forge: { seed: 3, now: 84, base: 64, amp: 20, gaps: [[880, 1010]] },
+};
+
+/** One minute's mean CPU, `ago` minutes before the last complete minute; null when not sampled. */
+export function fixtureCpuMinute(hostId: string, ago: number): number | null {
+  const p = Object.hasOwn(CPU_PROFILES, hostId) ? CPU_PROFILES[hostId] : undefined;
+  if (!p || ago < 0 || ago >= 1440 || p.gaps.some(([a, b]) => ago >= a && ago <= b)) return null;
+  const wave = (m: number) => p.base + p.amp * Math.sin((m / 360) * Math.PI + p.seed) + 6 * Math.sin((m / 95) * Math.PI + p.seed * 2);
+  const noise = Math.abs(Math.sin(p.seed * 12.9898 + ago * 78.233) * 43758.5453) % 1;
+  // Ease toward the current sample over the last half hour.
+  const value = wave(ago) + (noise - 0.5) * 5 + (p.now - wave(0)) * Math.exp(-ago / 30);
+  return Math.min(99.5, Math.max(0.5, value));
+}

@@ -10,9 +10,10 @@ import {
   FIXTURE_VMS,
   STANDIN_MARKER,
   TERMINAL_SCRIPTS,
+  fixtureCpuMinute,
   isReadTool,
 } from './fixtures';
-import { activitySearch } from './http';
+import { abortError, activitySearch } from './http';
 import {
   ApiError,
   type ActivityEntry,
@@ -27,6 +28,7 @@ import {
   type CpuHistory,
   type CpuHistoryRange,
   type Host,
+  type ReadOptions,
   type Session,
   type TerminalCommand,
   type TerminalEvent,
@@ -51,23 +53,44 @@ export interface StandinOptions {
   hosts?: Host[];
   vms?: Vm[];
   activity?: ActivityEntry[];
+  /**
+   * One minute's mean CPU for a host, `ago` minutes before the last complete
+   * minute, or null when not sampled. Defaults to the fixture profiles.
+   */
+  cpuMinute?: (hostId: string, ago: number) => number | null;
   /** Force a method to reject, for error-state tests. */
   failures?: Partial<Record<'logout' | 'listHosts' | 'getHost' | 'getCpuHistory' | 'listCpuHistory' | 'listActivity' | 'listVms' | 'getVm' | 'openTerminal' | 'openConsole', ApiError>>;
 }
 
 const clone = <T,>(v: T): T => structuredClone(v);
 
-function emptyCpuHistory(hostId: string, range: CpuHistoryRange): CpuHistory {
+/**
+ * Builds a CPU history the way docs/design/night-orbit/CPU-HISTORY-API.md
+ * says arxd does: buckets aligned in UTC, each the mean of the minutes present
+ * (rounded to 0.1), and null when fewer than half of its minutes are present.
+ */
+export function standinCpuHistory(hostId: string, range: CpuHistoryRange, minute: (hostId: string, ago: number) => number | null): CpuHistory {
   const { bucketSeconds, points } = CPU_HISTORY_RANGES[range];
   const width = bucketSeconds * 1000;
   const lastMinuteEnd = Math.floor(FIXTURE_NOW / 60_000) * 60_000;
   const end = Math.ceil(lastMinuteEnd / width) * width;
-  return {
-    hostId, range, bucketSeconds,
-    from: new Date(end - points * width).toISOString(),
-    to: new Date(end).toISOString(),
-    samples: Array<null>(points).fill(null),
-  };
+  const from = end - points * width;
+  const perBucket = bucketSeconds / 60;
+  const samples: (number | null)[] = [];
+  for (let i = 0; i < points; i += 1) {
+    let sum = 0;
+    let present = 0;
+    for (let k = 0; k < perBucket; k += 1) {
+      const start = from + i * width + k * 60_000;
+      if (start >= lastMinuteEnd) break; // not yet sampled: the partial last bucket
+      const value = minute(hostId, (lastMinuteEnd - start) / 60_000 - 1);
+      if (value === null) continue;
+      sum += value;
+      present += 1;
+    }
+    samples.push(present * 2 < perBucket ? null : Math.round((sum / present) * 10) / 10);
+  }
+  return { hostId, range, bucketSeconds, from: new Date(from).toISOString(), to: new Date(end).toISOString(), samples };
 }
 
 export class StandinApi implements ArxApi {
@@ -86,19 +109,31 @@ export class StandinApi implements ArxApi {
       hosts: options.hosts ?? FIXTURE_HOSTS,
       vms: options.vms ?? FIXTURE_VMS,
       activity: options.activity ?? FIXTURE_ACTIVITY,
+      cpuMinute: options.cpuMinute ?? fixtureCpuMinute,
       failures: options.failures,
     };
   }
 
-  private delay<T>(value: () => T): Promise<T> {
+  /** Answers after the latency; an abort before then cancels it and rejects with the signal's reason. */
+  private delay<T>(value: () => T, signal?: AbortSignal): Promise<T> {
     return new Promise((resolve, reject) => {
-      this.opts.schedule(() => {
+      if (signal?.aborted) {
+        reject(abortError(signal));
+        return;
+      }
+      const onAbort = () => {
+        cancel();
+        reject(abortError(signal!));
+      };
+      const cancel = this.opts.schedule(() => {
+        signal?.removeEventListener('abort', onAbort);
         try {
           resolve(value());
         } catch (error) {
           reject(error);
         }
       }, this.opts.latencyMs);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 
@@ -166,21 +201,21 @@ export class StandinApi implements ArxApi {
     });
   }
 
-  getCpuHistory(hostId: string, range: CpuHistoryRange): Promise<CpuHistory> {
+  getCpuHistory(hostId: string, range: CpuHistoryRange, options: ReadOptions = {}): Promise<CpuHistory> {
     return this.delay(() => {
       this.guard('getCpuHistory');
       if (!Object.hasOwn(CPU_HISTORY_RANGES, range)) throw new ApiError('invalid_request', 'Invalid CPU history range.');
       if (!this.opts.hosts.some(host => host.id === hostId)) throw new ApiError('not_found', `No host named ${hostId}.`, 404);
-      return emptyCpuHistory(hostId, range);
-    });
+      return standinCpuHistory(hostId, range, this.opts.cpuMinute);
+    }, options.signal);
   }
 
-  listCpuHistory(range: '24h'): Promise<CpuHistory[]> {
+  listCpuHistory(range: '24h', options: ReadOptions = {}): Promise<CpuHistory[]> {
     return this.delay(() => {
       this.guard('listCpuHistory');
       if (range !== '24h') throw new ApiError('invalid_request', 'The CPU history batch requires a 24h range.');
-      return this.opts.hosts.map(host => emptyCpuHistory(host.id, range));
-    });
+      return this.opts.hosts.map(host => standinCpuHistory(host.id, range, this.opts.cpuMinute));
+    }, options.signal);
   }
 
   listActivity(query: ActivityQuery = {}): Promise<ActivityPage> {

@@ -19,6 +19,7 @@ import {
   CPU_HISTORY_RANGES,
   type CpuHistory,
   type CpuHistoryRange,
+  type ReadOptions,
   type Host,
   type Session,
   STREAM_CLOSE_CODES,
@@ -78,7 +79,20 @@ function errorFor(status: number, body: unknown): ApiError {
  * cancelling the stream as soon as it exceeds `limit`, whether or not a
  * Content-Length header is present.
  */
-export async function readBounded(response: Response, limit: number): Promise<string> {
+/** The rejection for an aborted request: the signal's reason when it is an ApiError, else a cancellation. */
+export function abortError(signal: AbortSignal): ApiError {
+  return signal.reason instanceof ApiError ? signal.reason : new ApiError('network', 'The request was cancelled.');
+}
+
+/**
+ * Reads at most `limit` bytes of the body. With a `signal`, an abort cancels
+ * the reader (so a stalled body read ends too) and rejects with the reason.
+ */
+export async function readBounded(response: Response, limit: number, signal?: AbortSignal): Promise<string> {
+  if (signal?.aborted) {
+    void response.body?.cancel().catch(() => undefined);
+    throw abortError(signal);
+  }
   const declared = Number(response.headers.get('Content-Length'));
   if (Number.isFinite(declared) && declared > limit) {
     void response.body?.cancel().catch(() => undefined);
@@ -89,9 +103,12 @@ export async function readBounded(response: Response, limit: number): Promise<st
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let total = 0;
   let text = '';
+  const onAbort = () => void reader.cancel().catch(() => undefined);
+  signal?.addEventListener('abort', onAbort, { once: true });
   try {
     for (;;) {
       const { done, value } = await reader.read();
+      if (signal?.aborted) throw abortError(signal);
       if (done) break;
       total += value.byteLength;
       if (total > limit) {
@@ -102,8 +119,11 @@ export async function readBounded(response: Response, limit: number): Promise<st
     }
     return text + decoder.decode();
   } catch (error) {
+    if (signal?.aborted) throw abortError(signal);
     if (error instanceof ApiError) throw error;
     throw new ApiError('bad_response', DEFAULT_MESSAGES.bad_response, response.status);
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
   }
 }
 
@@ -155,7 +175,7 @@ export class HttpApi implements ArxApi {
    * `expectStatus` pins the exact success status; any other 2xx is treated as
    * unconfirmed and rejects, so callers never mistake 200/202 for 204.
    */
-  private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown, expectStatus?: number): Promise<unknown> {
+  private async request(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown, expectStatus?: number, signal?: AbortSignal): Promise<unknown> {
     // The session this request is sent under, read with its CSRF token.
     const dispatched = this.generation;
     const headers: Record<string, string> = { Accept: 'application/json' };
@@ -175,16 +195,18 @@ export class HttpApi implements ArxApi {
         credentials: 'same-origin',
         cache: 'no-store',
         redirect: 'error',
+        ...(signal ? { signal } : {}),
       });
     } catch {
+      if (signal?.aborted) throw abortError(signal);
       throw new ApiError('network', DEFAULT_MESSAGES.network);
     }
     let text: string;
     try {
-      text = await readBounded(response, MAX_BODY_BYTES);
+      text = await readBounded(response, MAX_BODY_BYTES, signal);
     } catch (error) {
       // An unreadable error body still yields the status-based error below.
-      if (response.ok) throw error;
+      if (response.ok || signal?.aborted) throw error;
       text = '';
     }
     let parsed: unknown = null;
@@ -294,18 +316,18 @@ export class HttpApi implements ArxApi {
     return decodeHost(await this.request('GET', `${API_PREFIX}/hosts/${pathId(id)}`));
   }
 
-  async getCpuHistory(hostId: string, range: CpuHistoryRange): Promise<CpuHistory> {
+  async getCpuHistory(hostId: string, range: CpuHistoryRange, options: ReadOptions = {}): Promise<CpuHistory> {
     if (!Object.hasOwn(CPU_HISTORY_RANGES, range)) throw new ApiError('invalid_request', 'Invalid CPU history range.');
-    const history = decodeCpuHistory(await this.request('GET', `${API_PREFIX}/hosts/${pathId(hostId)}/cpu-history?range=${range}`));
+    const history = decodeCpuHistory(await this.request('GET', `${API_PREFIX}/hosts/${pathId(hostId)}/cpu-history?range=${range}`, undefined, undefined, options.signal));
     if (history.hostId !== hostId || history.range !== range) {
       throw new ApiError('bad_response', 'CPU history did not match the requested host and range.');
     }
     return history;
   }
 
-  async listCpuHistory(range: '24h'): Promise<CpuHistory[]> {
+  async listCpuHistory(range: '24h', options: ReadOptions = {}): Promise<CpuHistory[]> {
     if (range !== '24h') throw new ApiError('invalid_request', 'The CPU history batch requires a 24h range.');
-    return decodeCpuHistoryBatch(await this.request('GET', `${API_PREFIX}/hosts/cpu-history?range=${range}`));
+    return decodeCpuHistoryBatch(await this.request('GET', `${API_PREFIX}/hosts/cpu-history?range=${range}`, undefined, undefined, options.signal));
   }
 
   async listActivity(query: ActivityQuery = {}): Promise<ActivityPage> {
