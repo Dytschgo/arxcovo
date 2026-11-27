@@ -1,6 +1,7 @@
 import { useState, type CSSProperties } from 'react';
-import type { Host, VmKind } from '../../api/types';
+import type { ArxApi, CpuHistory, Host, VmKind } from '../../api/types';
 import { useInventory, useResource } from '../context';
+import { CpuTrace, hasSamples, usePolled, type Polled } from '../cpuHistory';
 import { boardTotals, groupBoard, type Allocation, type BoardTotals } from '../derive';
 import { formatBytes } from '../format';
 import { Icon } from '../icons';
@@ -10,7 +11,8 @@ import { ArchBadge, CapBar, Empty, HostStatus, Loaded, NullValue, OsBadge, Page,
 // The v1 Hosts view is the Night Orbit board: one column per host holding its
 // VM cards (docs/design/night-orbit/board.html). Migration is not shipped, so
 // cards don't move and there is no Move menu or drain; there is no join entry
-// because the dashboard API has no join-code endpoint.
+// because the dashboard API has no join-code endpoint. Each column head carries
+// a 24 h CPU trace from one batch request that never holds up the board.
 
 type KindFilter = VmKind | 'all';
 const KIND_FILTERS: { value: KindFilter; label: string }[] = [
@@ -44,6 +46,24 @@ export function Allocated({ host, allocated, label }: { host: Host; allocated: A
         : null}
     </div>
   );
+}
+
+const loadBoardHistory = async (api: ArxApi, signal: AbortSignal) => {
+  const series = await api.listCpuHistory('24h', { signal });
+  return new Map(series.filter(s => s.range === '24h').map(s => [s.hostId, s]));
+};
+
+/**
+ * The column's 24 h trace. While the batch loads the space stays empty (no
+ * layout shift); without history for this host (request failed, host not in
+ * the batch, or every bucket null) the band is hatched, never a flat 0 line.
+ */
+export function BoardTrace({ host, history }: { host: Host; history: Polled<Map<string, CpuHistory>> }) {
+  if (history.status === 'loading') return <div className="spark spark-wait" aria-hidden="true" />;
+  const series = history.status === 'ready' ? history.data.get(host.id) : undefined;
+  if (series && hasSamples(series)) return <CpuTrace history={series} os={host.os} className="spark" />;
+  const why = series ? 'No CPU samples in the last 24 hours' : 'CPU history unavailable';
+  return <div className="spark spark-na" data-null="true" title={why}><span className="visually-hidden">{why}</span></div>;
 }
 
 function Totals({ totals }: { totals: BoardTotals }) {
@@ -80,6 +100,7 @@ export function HostsView() {
     inventory.put(epoch, { hosts, vms });
     return { hosts, vms };
   }, []);
+  const history = usePolled('board:24h', loadBoardHistory, 60_000);
   const [kind, setKind] = useState<KindFilter>('all');
   const now = useNow(30_000);
 
@@ -104,6 +125,7 @@ export function HostsView() {
               <p className="legend">
                 <span><span className="kind" data-kind="test" aria-hidden="true" />test VM, expires</span>
                 <span><span className="kind" data-kind="static" aria-hidden="true" />static VM, never expires</span>
+                <span><span className="trace-key" aria-hidden="true" />CPU, last 24 h</span>
                 <span><span className="sw" aria-hidden="true" />unavailable</span>
               </p>
               <div className="board" role="region" aria-label="Hosts board" tabIndex={0}>
@@ -122,6 +144,7 @@ export function HostsView() {
                         </div>
                         <p className="ver">{host.osVersion}</p>
                         <CpuNow host={host} />
+                        <BoardTrace host={host} history={history} />
                         <Allocated host={host} allocated={allocated} label="allocated to VMs" />
                         {host.reachabilityReason
                           ? <p className="why"><Icon name={REASON_ICON[host.reachability]} />{host.reachabilityReason}</p>
