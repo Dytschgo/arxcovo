@@ -5,7 +5,7 @@ import { summarizeCpuHistory } from '../api/cpuHistory';
 import { DEMO_CREDENTIALS, FIXTURE_HOSTS } from '../api/fixtures';
 import { StandinApi, standinCpuHistory, type StandinOptions } from '../api/standin';
 import { ApiError, CPU_HISTORY_RANGES, type CpuHistory, type CpuHistoryRange } from '../api/types';
-import { HISTORY_TIMEOUT_MESSAGE, HISTORY_TIMEOUT_MS, agoText, moveHandle, traceGeometry, traceLabel, usePolled, windowText } from './cpuHistory';
+import { HISTORY_TIMEOUT_MESSAGE, HISTORY_TIMEOUT_MS, agoText, dragTarget, moveHandle, traceGeometry, traceLabel, usePolled, windowText } from './cpuHistory';
 import { AppProviders } from './context';
 
 async function signIn(api: StandinApi, hash: string) {
@@ -457,6 +457,15 @@ describe('bucket window', () => {
     expect(moveHandle(span(20, 20), 'end', 'ArrowLeft', 60)).toEqual(span(20, 20));
     expect(moveHandle(span(0, 143), 'end', 'PageUp', 144)).toEqual(span(0, 143));
     expect(moveHandle(span(0, 59), 'start', 'a', 60)).toBeNull();
+  });
+
+  test('a dragged edge lands on the nearest bucket boundary, clamped for its handle', () => {
+    expect(dragTarget(span(5, 5), 'start', 2.2 / 144, 144)).toEqual(span(2, 5));
+    expect(dragTarget(span(5, 5), 'start', 9 / 144, 144)).toEqual(span(5, 5));
+    expect(dragTarget(span(5, 5), 'start', -0.2, 144)).toEqual(span(0, 5));
+    expect(dragTarget(span(2, 5), 'end', 9.2 / 144, 144)).toEqual(span(2, 8));
+    expect(dragTarget(span(2, 5), 'end', 0, 144)).toEqual(span(2, 2));
+    expect(dragTarget(span(2, 5), 'end', 1.3, 144)).toEqual(span(2, 143));
   });
 
   test('the window reads as times before the end of the range', () => {

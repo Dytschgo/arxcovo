@@ -106,12 +106,12 @@ test('host detail: CPU history switches between 1h, 6h and 24h with avg and peak
   await expect(tile.getByText('Window: 30 min ago → 29 min ago · 1 bucket')).toBeVisible();
   await page.keyboard.press('End');
   await expect(end).toHaveAttribute('aria-valuenow', '59');
-  // Dragging the end handle to the middle of the track lands on whole buckets.
+  // Dragging the end handle moves the window edge by the pointer's travel: a quarter of the track is 15 buckets.
   const track = (await tile.locator('.brush').boundingBox())!;
   const handle = (await end.boundingBox())!;
   await page.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
   await page.mouse.down();
-  await page.mouse.move(track.x + track.width * 0.75, handle.y + handle.height / 2, { steps: 4 });
+  await page.mouse.move(handle.x + handle.width / 2 - track.width * 0.25, handle.y + handle.height / 2, { steps: 4 });
   await page.mouse.up();
   await expect(end).toHaveAttribute('aria-valuenow', '44');
   await expect(tile.locator('dt', { hasText: 'avg' }).locator('+ dd')).toHaveText(/^\d+%$/);
@@ -131,6 +131,82 @@ test('host detail: CPU history switches between 1h, 6h and 24h with avg and peak
   expect(await pebbleTile.textContent()).not.toMatch(/\b0%/);
   expect(await overflowX(page)).toBeLessThanOrEqual(0);
   await shot(page, '15-host-cpu-no-samples');
+});
+
+test('host detail: a one-bucket 24 h window keeps two separate handles, each draggable and focus-contrasted', async ({ page }) => {
+  await signIn(page, '#/hosts/atlas');
+  const tile = page.locator('section.tile', { has: page.getByRole('heading', { level: 2, name: 'CPU' }) });
+  await expect(tile.getByRole('img', { name: /^CPU over the last 24 hours/ })).toBeVisible();
+  const start = tile.getByRole('slider', { name: 'Window start' });
+  const end = tile.getByRole('slider', { name: 'Window end' });
+  await end.press('Home');
+  await expect(start).toHaveAttribute('aria-valuenow', '0');
+  await expect(end).toHaveAttribute('aria-valuenow', '0');
+  await expect(tile.getByText(/· 1 bucket$/)).toBeVisible();
+
+  // Geometry, read in one pass: handles, their focus outline reach (1px at 2px offset), and the tile.
+  const geometry = () => page.evaluate(() => {
+    const box = (el: Element) => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; };
+    const s = document.querySelector('.brush-h[data-handle="start"]')!;
+    const e = document.querySelector('.brush-h[data-handle="end"]')!;
+    const reach = (el: Element) => { const st = getComputedStyle(el); return parseFloat(st.outlineOffset) + parseFloat(st.outlineWidth || '1'); };
+    const center = (b: { left: number; right: number; top: number; bottom: number }) => [(b.left + b.right) / 2, (b.top + b.bottom) / 2] as const;
+    const hit = (b: { left: number; right: number; top: number; bottom: number }) => document.elementFromPoint(...center(b))?.closest('.brush-h')?.getAttribute('data-handle') ?? null;
+    const sb = box(s);
+    const eb = box(e);
+    return { start: sb, end: eb, reach: Math.max(reach(s), 3), tile: box(s.closest('section.tile')!), hitStart: hit(sb), hitEnd: hit(eb) };
+  });
+  const g = await geometry();
+  expect(g.start.right, 'the handles never overlap').toBeLessThan(g.end.left);
+  // Either handle's focus outline stops short of the other handle.
+  expect(g.end.left - g.start.right, JSON.stringify(g)).toBeGreaterThan(g.reach);
+  expect(g.start.left - g.reach).toBeGreaterThanOrEqual(g.tile.left);
+  expect(g.end.right + g.reach).toBeLessThanOrEqual(g.tile.right);
+  expect([g.hitStart, g.hitEnd]).toEqual(['start', 'end']);
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
+
+  // Focusing either handle in this state keeps every text and focus indicator at its contrast minimum.
+  for (const handle of [end, start]) {
+    await handle.focus();
+    const { contrast, opacityGroups } = await auditText(page);
+    expect.soft(contrast, 'one-bucket window').toEqual([]);
+    expect.soft(opacityGroups, 'one-bucket window: text inside an opacity group').toEqual([]);
+    // The focused outline sits over the tile or the band, never over the other (white) handle.
+    const outlineOverOther = await handle.evaluate(el => {
+      const r = el.getBoundingClientRect();
+      const o = parseFloat(getComputedStyle(el).outlineOffset) + parseFloat(getComputedStyle(el).outlineWidth);
+      const other = document.querySelector(`.brush-h:not([data-handle="${el.getAttribute('data-handle')}"])`)!.getBoundingClientRect();
+      return r.left - o < other.right && r.right + o > other.left;
+    });
+    expect(outlineOverOther).toBe(false);
+  }
+  expect.soft(await nonTextFailures(page), 'one-bucket window: non-text contrast (3:1)').toEqual([]);
+  await shot(page, '17-host-cpu-one-bucket');
+
+  // Window 5-5, then drag each handle from its centre: only that handle moves.
+  await end.press('End');
+  await start.focus();
+  for (let i = 0; i < 5; i += 1) await page.keyboard.press('ArrowRight');
+  await end.press('Home');
+  await expect(start).toHaveAttribute('aria-valuenow', '5');
+  await expect(end).toHaveAttribute('aria-valuenow', '5');
+  const width = (await tile.locator('.brush').boundingBox())!.width;
+  const bucket = width / 144;
+  const drag = async (handle: typeof start, dx: number) => {
+    const b = (await handle.boundingBox())!;
+    const [x, y] = [b.x + b.width / 2, b.y + b.height / 2];
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + dx, y, { steps: 4 });
+    await page.mouse.up();
+  };
+  await drag(start, -3.2 * bucket);
+  await expect(start).toHaveAttribute('aria-valuenow', '2');
+  await expect(end).toHaveAttribute('aria-valuenow', '5');
+  await drag(end, 3.2 * bucket);
+  await expect(end).toHaveAttribute('aria-valuenow', '8');
+  await expect(start).toHaveAttribute('aria-valuenow', '2');
+  expect(await overflowX(page)).toBeLessThanOrEqual(0);
 });
 
 test('host detail: tools, VMs, activity and terminal entry', async ({ page }) => {
@@ -418,6 +494,12 @@ for (const motion of ['no-preference', 'reduce'] as const) {
     await page.getByRole('slider', { name: 'Window end' }).press('PageDown');
     await expect(page.getByText(/^Window: 40 min ago → 5 min ago/)).toBeVisible();
     await audit('host CPU history, window narrowed');
+    await page.getByRole('group', { name: 'CPU history range' }).getByRole('button', { name: '24h' }).click();
+    const oneEnd = page.getByRole('slider', { name: 'Window end' });
+    await oneEnd.press('Home');
+    await expect(page.getByText(/· 1 bucket$/)).toBeVisible();
+    await oneEnd.focus();
+    await audit('host CPU history, one-bucket 24 h window, end handle focused');
     await page.goto('/#/hosts/pebble');
     await expect(page.getByText('no samples', { exact: true })).toBeVisible();
     await audit('host CPU history, no samples');

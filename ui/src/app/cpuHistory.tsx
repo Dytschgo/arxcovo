@@ -133,14 +133,31 @@ export function moveHandle(span: Span, handle: 'start' | 'end', key: string, n: 
   return { ...span, [handle]: next };
 }
 
+/** Which bucket edge a dragged handle edge lands on: the nearest boundary, clamped for that handle. */
+export function dragTarget(span: Span, handle: 'start' | 'end', edgeFraction: number, n: number): Span {
+  const boundary = Math.round(edgeFraction * n);
+  return handle === 'start'
+    ? { ...span, start: Math.min(span.end, Math.max(0, boundary)) }
+    : { ...span, end: Math.max(span.start, Math.min(n - 1, boundary - 1)) };
+}
+
 /**
  * Two handles that select whole buckets of the trace above them (ARIA
  * sliders: arrows move one bucket, Page Up/Down a twelfth of the range, Home
  * and End go to the limit). Dragging works too. The start handle never passes
  * the end handle.
+ *
+ * The handles are bookends: the start handle sits wholly left of the window's
+ * left edge and the end handle wholly right of its right edge, so even a
+ * one-bucket window on 24 h (under 5 px wide) keeps two separate pointer
+ * targets and a focus outline that never lands on the other handle. A drag
+ * moves the window edge by the pointer's travel, wherever the handle was grabbed.
  */
 export function BucketWindow({ n, bucketSeconds, value, onChange }: { n: number; bucketSeconds: number; value: Span; onChange(span: Span): void }) {
   const track = useRef<HTMLDivElement>(null);
+  /** Pointer x minus the dragged window edge's x at grab time. */
+  const grab = useRef<{ handle: 'start' | 'end'; offset: number } | null>(null);
+  const edgeX = (handle: 'start' | 'end', box: DOMRect) => box.left + ((handle === 'start' ? value.start : value.end + 1) / n) * box.width;
   const onKey = (handle: 'start' | 'end') => (event: KeyboardEvent) => {
     const next = moveHandle(value, handle, event.key, n);
     if (!next) return;
@@ -148,13 +165,10 @@ export function BucketWindow({ n, bucketSeconds, value, onChange }: { n: number;
     if (next.start !== value.start || next.end !== value.end) onChange(next);
   };
   const onDrag = (handle: 'start' | 'end') => (event: PointerEvent<HTMLDivElement>) => {
-    if (event.buttons !== 1 || !track.current) return;
+    if (event.buttons !== 1 || !track.current || grab.current?.handle !== handle) return;
     const box = track.current.getBoundingClientRect();
     if (box.width <= 0) return;
-    const at = ((event.clientX - box.left) / box.width) * n;
-    const next = handle === 'start'
-      ? { ...value, start: Math.min(value.end, Math.max(0, Math.floor(at))) }
-      : { ...value, end: Math.max(value.start, Math.min(n - 1, Math.ceil(at) - 1)) };
+    const next = dragTarget(value, handle, (event.clientX - grab.current.offset - box.left) / box.width, n);
     if (next.start !== value.start || next.end !== value.end) onChange(next);
   };
   const handleProps = (handle: 'start' | 'end') => {
@@ -175,10 +189,18 @@ export function BucketWindow({ n, bucketSeconds, value, onChange }: { n: number;
       style: { insetInlineStart: `${left * 100}%` },
       onKeyDown: onKey(handle),
       onPointerDown: (event: PointerEvent<HTMLDivElement>) => {
+        const box = track.current?.getBoundingClientRect();
+        grab.current = box ? { handle, offset: event.clientX - edgeX(handle, box) } : null;
         event.currentTarget.setPointerCapture?.(event.pointerId);
         event.currentTarget.focus();
       },
       onPointerMove: onDrag(handle),
+      onPointerUp: () => {
+        grab.current = null;
+      },
+      onPointerCancel: () => {
+        grab.current = null;
+      },
     };
   };
   return (
