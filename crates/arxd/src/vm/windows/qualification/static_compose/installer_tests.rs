@@ -536,15 +536,22 @@ fn held_docker_inputs_measure_rechecks_boot_files_and_receipt() {
     });
 }
 
-/// Standards P2 (PR #402 review 1): the `--full-docker` preflight and the
-/// foreground selection both bind held inputs to the selected M4 seal before
-/// any live measurement, and a refusal claims nothing in the output directory.
+/// Standards P2 (PR #402 reviews 1 and 2): the `--full-docker` preflight
+/// stage binds held inputs to the selected M4 seal before it opens the output
+/// directory or measures the live route, and a refusal leaves that real,
+/// empty output directory untouched.
 #[test]
-fn docker_inputs_bind_the_selected_m4_seal_before_live_measurement() {
+fn docker_preflight_stage_binds_the_selected_m4_seal_before_the_output() {
+    use super::super::docker_trial::bind_preflight_inputs;
     with_fixture(|f| {
         let env = MeasureEnv::new();
-        let evidence = env.dir.path().join("evidence");
-        fs::create_dir(&evidence).unwrap();
+        let output = env.dir.path().join("evidence");
+        fs::create_dir(&output).unwrap();
+        let evidence = local(output.to_str().unwrap()).unwrap();
+        let untouched = |when: &str| {
+            assert_eq!(fs::read_dir(&output).unwrap().count(), 0, "{when}");
+        };
+        let modified = fs::metadata(&output).unwrap().modified().unwrap();
         let held = f.hold().unwrap();
         let mut inputs = env.inputs(&held);
         let selected = inputs.m4_seal;
@@ -552,30 +559,45 @@ fn docker_inputs_bind_the_selected_m4_seal_before_live_measurement() {
         substituted[0] ^= 1;
         // The seal binding precedes even the target profile parse.
         assert_eq!(
-            inputs.bound_targets(substituted).err(),
+            bind_preflight_inputs(&inputs, substituted, &evidence).err(),
             Some(NativeRefusal::QualificationMissing)
         );
+        untouched("substituted seal, malformed targets");
         assert_eq!(
-            inputs.bound_targets(selected).err(),
+            bind_preflight_inputs(&inputs, selected, &evidence).err(),
             Some(NativeRefusal::NetworkFenceUnverified)
         );
         inputs.fixture[1] = env.hold_named(
             "fixture-targets.json",
             br#"{"public_tcp_target":"8.8.8.8:443","public_dns_target":"9.9.9.9:53"}"#,
         );
+        for seal in [substituted, [0; 32], [0x64; 32]] {
+            assert_eq!(
+                bind_preflight_inputs(&inputs, seal, &evidence).err(),
+                Some(NativeRefusal::QualificationMissing)
+            );
+            untouched("substituted seal");
+        }
+        assert_eq!(fs::metadata(&output).unwrap().modified().unwrap(), modified);
+        // Positive control: the selected seal yields the enrolled targets.
         assert_eq!(
-            inputs.bound_targets(selected).unwrap().addresses(),
+            bind_preflight_inputs(&inputs, selected, &evidence).unwrap(),
             [
                 std::net::Ipv4Addr::new(8, 8, 8, 8),
                 std::net::Ipv4Addr::new(9, 9, 9, 9)
             ]
         );
-        for seal in [substituted, [0; 32], [0x64; 32]] {
-            assert_eq!(
-                inputs.bound_targets(seal).err(),
-                Some(NativeRefusal::QualificationMissing)
-            );
-        }
-        assert_eq!(fs::read_dir(&evidence).unwrap().count(), 0);
+        untouched("selected seal");
+        // The stage reads the real output: a claimed directory is refused,
+        // but a substituted seal is refused first without opening it.
+        fs::write(output.join("claimed"), b"x").unwrap();
+        assert_eq!(
+            bind_preflight_inputs(&inputs, selected, &evidence).err(),
+            Some(NativeRefusal::PathCustodyUnverified)
+        );
+        assert_eq!(
+            bind_preflight_inputs(&inputs, substituted, &evidence).err(),
+            Some(NativeRefusal::QualificationMissing)
+        );
     });
 }

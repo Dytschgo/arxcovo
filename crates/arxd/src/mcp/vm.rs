@@ -383,6 +383,10 @@ pub(crate) struct Supervisor {
     /// backup dispatch looked up its session and before its transaction.
     #[cfg(test)]
     retire_static_after_lookup: AtomicBool,
+    /// Retires the fixture static network once inside the next fresh Compose
+    /// or backup admission, after its first in-transaction fence.
+    #[cfg(test)]
+    retire_static_in_admission: AtomicBool,
     /// Blocks the next early owner revocation after its transition recorded
     /// the stop obligations and before their runners are spawned.
     #[cfg(test)]
@@ -579,6 +583,8 @@ impl Supervisor {
             stall_sweep: Mutex::new(None),
             #[cfg(test)]
             retire_static_after_lookup: AtomicBool::new(false),
+            #[cfg(test)]
+            retire_static_in_admission: AtomicBool::new(false),
             #[cfg(test)]
             stall_revoked: Mutex::new(None),
             #[cfg(test)]
@@ -957,16 +963,36 @@ impl Supervisor {
         refusal.is_some()
     }
 
+    /// The rollback check of a fresh admission: an `Err` from the store
+    /// closure rolls back the fresh rows written in the same transaction.
+    fn commit_fresh_intent(
+        &self,
+        fenced: &std::cell::Cell<Option<NativeRefusal>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.fence_fresh_intent(fenced),
+            "static selection retired during admission"
+        );
+        Ok(())
+    }
+
     #[cfg(test)]
-    fn after_static_lookup(&self) {
-        if self
-            .retire_static_after_lookup
-            .swap(false, Ordering::AcqRel)
-        {
+    fn retire_static_if(&self, armed: &AtomicBool) {
+        if armed.swap(false, Ordering::AcqRel) {
             self.static_selection()
                 .expect("fixture static selection")
                 .retire_fixture_network();
         }
+    }
+
+    #[cfg(test)]
+    fn after_static_lookup(&self) {
+        self.retire_static_if(&self.retire_static_after_lookup);
+    }
+
+    #[cfg(test)]
+    fn during_static_admission(&self) {
+        self.retire_static_if(&self.retire_static_in_admission);
     }
 
     fn capability(&self, gate: &Gate) -> Value {
@@ -2684,6 +2710,14 @@ fn cleanup_wire(label: &str) -> Option<&'static str> {
     }
 }
 
+/// A store error after the fresh-admission check rolled back names the
+/// static refusal; any other store error stays `state_unavailable`.
+fn fresh_fault(fenced: &std::cell::Cell<Option<NativeRefusal>>, error: anyhow::Error) -> Fault {
+    fenced
+        .get()
+        .map_or_else(|| error.into(), |reason| Fault::new(native_reason(reason)))
+}
+
 impl VmInventory {
     fn compose_target(args: &mut Args) -> Outcome<compose::Target> {
         let vm = args.id("vm_id")?;
@@ -2792,15 +2826,22 @@ impl VmInventory {
             if self.supervisor.fence_fresh_intent(&fenced) {
                 return Ok(Err(compose::Fault::NotReady));
             }
-            db::admit(
+            let admitted = db::admit(
                 tx,
                 &self.principal,
                 &request,
                 session.generation,
                 session.wire_boot,
                 self.supervisor.controller.compose_now()?,
-            )
-        })?;
+            )?;
+            #[cfg(test)]
+            self.supervisor.during_static_admission();
+            if admitted.is_ok() {
+                self.supervisor.commit_fresh_intent(&fenced)?;
+            }
+            Ok(admitted)
+        });
+        let admission = admission.map_err(|error| fresh_fault(&fenced, error))?;
         let (intent, drive_key, repair) = match admission {
             Ok(intent) => (intent, key, false),
             Err(compose::Fault::RecoveryRequired(old_key)) => {
@@ -2964,7 +3005,7 @@ impl VmInventory {
             if self.supervisor.fence_fresh_intent(&fenced) {
                 return Ok(Err(BackupFault::NotReady));
             }
-            db::admit_backup(
+            let admitted = db::admit_backup(
                 tx,
                 &self.principal,
                 &target,
@@ -2973,14 +3014,21 @@ impl VmInventory {
                 session.wire_boot,
                 self.supervisor.controller.compose_now()?,
                 |tx, staging_bytes| {
+                    #[cfg(test)]
+                    self.supervisor.during_static_admission();
                     self.supervisor.controller.validate_compose_backup_disk(
                         tx,
                         self.supervisor.compose_backup.capacity(),
                         staging_bytes,
                     )
                 },
-            )
-        })?;
+            )?;
+            if admitted.is_ok() {
+                self.supervisor.commit_fresh_intent(&fenced)?;
+            }
+            Ok(admitted)
+        });
+        let admission = admission.map_err(|error| fresh_fault(&fenced, error))?;
 
         let intent = match admission {
             Ok(intent) => intent,
@@ -17112,6 +17160,28 @@ pub(crate) mod tests {
             assert_eq!(rows(), before, "{tool} wrote a fresh intent row");
         }
 
+        // The watch retires inside fresh admission, after the first in-store
+        // fence passed: inside the backup capacity callback, and once the
+        // Compose admission wrote its fresh rows. The transaction rolls back.
+        for (tool, n) in [("compose_start", 6122), ("compose_backup", 6123)] {
+            selection.revive_fixture_network();
+            supervisor
+                .retire_static_in_admission
+                .store(true, Ordering::Release);
+            let refused = call(&a, tool, args("calm-life", n)).await;
+            assert_eq!(
+                refused["reason"], "network_fence_unverified",
+                "{tool}: {refused}"
+            );
+            assert!(
+                !supervisor
+                    .retire_static_in_admission
+                    .load(Ordering::Acquire),
+                "{tool} reached fresh admission"
+            );
+            assert_eq!(rows(), before, "{tool} committed a fresh intent row");
+        }
+
         // Existing receipts on two projects, admitted while the selection is live.
         selection.revive_fixture_network();
         let session = supervisor.compose.session(vm_id).unwrap();
@@ -17148,12 +17218,22 @@ pub(crate) mod tests {
             supervisor
                 .retire_static_after_lookup
                 .store(true, Ordering::Release);
+            supervisor
+                .retire_static_in_admission
+                .store(true, Ordering::Release);
             let replay = call(&a, tool, args(project, n)).await;
             assert_eq!(replay["operation_id"], hex::encode(id), "{tool}: {replay}");
             assert_eq!(replay["state"], "pending", "{tool}: {replay}");
             assert!(
                 supervisor.static_refusal().is_some(),
                 "{tool} reached the hook"
+            );
+            // Replay answers before the fresh admission path.
+            assert!(
+                supervisor
+                    .retire_static_in_admission
+                    .swap(false, Ordering::AcqRel),
+                "{tool} replay entered fresh admission"
             );
         }
         assert_eq!(rows(), admitted);

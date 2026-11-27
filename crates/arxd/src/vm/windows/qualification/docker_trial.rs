@@ -88,15 +88,30 @@ pub(super) fn preflight(
     }
     let recipe = enrollment.recipe.hold(&m4.held, &m4.recipes, [1; 16])?;
     let inputs = enrollment.hold_inputs(&evidence, mode, &m4.held, &recipe)?;
-    let targets = inputs
-        .bound_targets(selected.selection().seal_sha256)?
-        .addresses();
+    let targets = bind_preflight_inputs(&inputs, selected.selection().seal_sha256, &evidence)?;
     let (_dependencies, watch) = inputs.measure_live(&targets)?;
     m4.require_current()?;
     // A complete input check grants no native effects or evidence claim.
     // Require the independent receiver and boot-bound HTTPS adapters first.
     watch.require_current()?;
     Err(NativeRefusal::NetworkFenceUnverified)
+}
+
+/// The preflight stage after input custody and before any live measurement:
+/// bind the held inputs to the selected M4 seal, then require the output to
+/// still be an empty directory. `evidence` is opened read-only here; a claim
+/// of the output may only follow a successful return.
+pub(super) fn bind_preflight_inputs(
+    inputs: &static_compose::HeldDockerInputs<'_>,
+    selected_m4: Hash,
+    evidence: &LocalPath,
+) -> Result<[std::net::Ipv4Addr; 2], NativeRefusal> {
+    let targets = inputs.bound_targets(selected_m4)?.addresses();
+    let output = PathPin::open(evidence, true, false)?;
+    if !sink::empty(&output.leaf)? {
+        return Err(REFUSED);
+    }
+    Ok(targets)
 }
 
 #[cfg(test)]
