@@ -22,7 +22,30 @@ The boot settlement adapter commits the static start and serial boot witness tog
 
 The deterministic Docker collector now negotiates real loopback TLS in its fake-QEMU journey before emitting a seal that the held foreground dossier reader verifies. The endpoint trial returns a fresh public certificate over the attributed serial pipe. The collector requires the exact certificate and boot-specific SNI and health body, between listener ownership checks. The detached boot stays offline, and the trial key remains in the endpoint guest's private runtime directory. The Compose install, detached, and public-egress argv require the enrolled 2 vCPU, 4 GiB RAM and 32 GiB disk envelope. See [ADR 0074](adr/0074-bind-docker-trial-https-to-serial.md).
 
-Native qualification still requires a checked QEMU trial host, an independent receiver capture adapter and an exclusive loopback port handoff. Native static operation still requires qualified template build, independent full copy, checked start and stop, and non-deleting durable recovery. The production boot owner must supply its verified origin and attributed pipe to the boot settlement adapter. Part B2f routing and publication begin after that settlement. The private route install runs with public publishing off. The opt-in Cloudflare flow then uses the same verified boot. Native VM boot, Docker, public-only networking, Windows custody, persistence and live Cloudflare publishing remain **unverified on real hardware**.
+The Docker collector requires a signature from the enrolled independent
+receiver before it releases guest execution. Its capture mailbox uses a
+private, held directory and bounded files. The result must match the exact
+challenge and measurement window. Windows holds an exclusive IPv4 loopback
+socket through checked suspended creation. The collector consumes the
+reservation once and requires attribution to the held child before allowing
+guest execution. The deterministic journey continues through HTTPS and the
+held foreground reader. See [ADR 0075](adr/0075-authenticate-docker-receiver-capture.md).
+
+The owner CLI still needs the native QEMU adapter for phase media staging,
+checked process creation, QMP and serial attribution, listener transfer and
+disposable release. It refuses during preflight before claiming evidence.
+The native static effects under `SelectedStatic` also remain gated. They need
+qualified template build, independent full copy, checked start and stop, and
+durable recovery that retains committed VM media. The production boot owner
+must pass the verified origin and attributed pipe to the existing settlement
+adapter.
+
+Part B2g begins after that native lifecycle can settle a verified boot. Its
+private route install must work with public publishing off. Its opt-in
+Cloudflare publication then uses the same boot and checks route retirement
+through cleanup. Native VM boot, Docker, public-only networking, Windows
+custody, persistence and live Cloudflare publishing remain
+**unverified on real hardware**.
 
 ## Enroll a dedicated acceptance VM
 

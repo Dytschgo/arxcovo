@@ -1,11 +1,12 @@
 //! Private witness inputs. Only the scoped digest and verdict enter records.
 use super::*;
 use crate::vm::public_egress::{PublicEgressPolicy, RouteObservation};
+use ring::signature::{ED25519, UnparsedPublicKey};
 use std::net::Ipv4Addr;
 
 const NETWORK: NativeRefusal = NativeRefusal::NetworkFenceUnverified;
 const ENDPOINT: NativeRefusal = NativeRefusal::GuestEndpointUnverified;
-const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+pub(in crate::vm::windows::qualification) const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 pub(in crate::vm::windows::qualification) const MAX_INVENTORY_BYTES: u64 = 32 * 1024;
 
 pub(in crate::vm::windows::qualification) struct RouteSample {
@@ -129,6 +130,15 @@ pub(in crate::vm::windows::qualification) struct Target {
 pub(in crate::vm::windows::qualification) struct ReceiverEnrollment {
     targets: Vec<Target>,
     fixture: Hash,
+    signer: Hash,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiverManifest {
+    version: u8,
+    signer: Hash,
+    targets: Vec<Target>,
 }
 
 impl ReceiverEnrollment {
@@ -139,9 +149,15 @@ impl ReceiverEnrollment {
         if bytes.len() as u64 > MAX_INVENTORY_BYTES {
             return Err(NETWORK);
         }
-        let mut targets: Vec<Target> = serde_json::from_slice(bytes).map_err(|_| NETWORK)?;
+        let ReceiverManifest {
+            version,
+            signer,
+            mut targets,
+        } = serde_json::from_slice(bytes).map_err(|_| NETWORK)?;
         targets.sort_unstable();
-        if targets.len() > 128
+        if version != 1
+            || signer == [0; 32]
+            || targets.len() > 128
             || targets.windows(2).any(|pair| pair[0] == pair[1])
             || targets.iter().any(|target| {
                 target.identity == [0; 32] || !target.case.transports().contains(&target.transport)
@@ -156,16 +172,50 @@ impl ReceiverEnrollment {
         {
             return Err(NETWORK);
         }
-        let binding = serde_json::to_vec(&("arx-docker-fixture-v2", fixture_inputs, digest(bytes)))
+        let binding = serde_json::to_vec(&("arx-docker-fixture-v3", fixture_inputs, digest(bytes)))
             .map_err(|_| NETWORK)?;
         Ok(Self {
             targets,
             fixture: digest(&binding),
+            signer,
         })
     }
 
     pub(in crate::vm::windows::qualification) fn fixture(&self) -> Hash {
         self.fixture
+    }
+
+    pub(super) fn require_armed(
+        &self,
+        request: &CaptureRequest<'_>,
+        signature: &[u8],
+    ) -> Result<(), NativeRefusal> {
+        self.authenticate(request, b"armed", &[], signature)
+    }
+
+    pub(super) fn capture_body<'a>(
+        &self,
+        request: &CaptureRequest<'_>,
+        reply: &'a [u8],
+    ) -> Result<&'a [u8], NativeRefusal> {
+        let (signature, body) = reply.split_at_checked(64).ok_or(NETWORK)?;
+        if body.is_empty() || body.len() > MAX_CAPTURE_BYTES {
+            return Err(NETWORK);
+        }
+        self.authenticate(request, b"completed", body, signature)?;
+        Ok(body)
+    }
+
+    fn authenticate(
+        &self,
+        request: &CaptureRequest<'_>,
+        phase: &[u8],
+        body: &[u8],
+        signature: &[u8],
+    ) -> Result<(), NativeRefusal> {
+        UnparsedPublicKey::new(&ED25519, self.signer)
+            .verify(&request.signing_message(phase, body)?, signature)
+            .map_err(|_| NETWORK)
     }
 
     pub(super) fn check_targets(
@@ -180,6 +230,52 @@ impl ReceiverEnrollment {
             return Err(NETWORK);
         }
         Ok(observed)
+    }
+}
+
+/// Private, canonical challenge for the enrolled capture observer. Each
+/// acknowledgement covers the exact challenge, including the route and
+/// inventory measured by the collector before the guest is allowed to run.
+#[derive(Clone, Copy, Serialize)]
+pub(in crate::vm::windows::qualification) struct CaptureRequest<'a> {
+    pub run: Id,
+    pub boot: Id,
+    pub generation: u64,
+    pub nonce: Id,
+    pub route: ObservedRoute,
+    pub topology: Hash,
+    pub policy: Hash,
+    pub targets: &'a [Target],
+    pub issued_ms: u64,
+    pub cutoff_ms: u64,
+}
+
+impl CaptureRequest<'_> {
+    fn signing_message(&self, phase: &[u8], body: &[u8]) -> Result<Vec<u8>, NativeRefusal> {
+        let challenge = serde_json::to_vec(self).map_err(|_| NETWORK)?;
+        Ok([
+            b"arx-docker-capture-v1\0".as_slice(),
+            phase,
+            b"\0",
+            &digest(&challenge),
+            &digest(body),
+        ]
+        .concat())
+    }
+
+    #[cfg(test)]
+    pub(in crate::vm::windows::qualification) fn fixture_sign(
+        &self,
+        phase: &[u8],
+        body: &[u8],
+        foreign: bool,
+    ) -> Vec<u8> {
+        use ring::signature::Ed25519KeyPair;
+        let seed = if foreign { [23; 32] } else { [17; 32] };
+        let key = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        key.sign(&self.signing_message(phase, body).unwrap())
+            .as_ref()
+            .to_vec()
     }
 }
 
@@ -336,6 +432,18 @@ pub(super) fn receivers(
     let canonical =
         serde_json::to_vec(&("arx-docker-receivers-v2", capture)).map_err(|_| NETWORK)?;
     Ok(digest(&canonical))
+}
+
+#[cfg(test)]
+pub(in crate::vm::windows::qualification) fn fixture_manifest() -> Vec<u8> {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    let key = Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
+    serde_json::to_vec(&ReceiverManifest {
+        version: 1,
+        signer: key.public_key().as_ref().try_into().unwrap(),
+        targets: fixture_targets(),
+    })
+    .unwrap()
 }
 
 #[cfg(test)]

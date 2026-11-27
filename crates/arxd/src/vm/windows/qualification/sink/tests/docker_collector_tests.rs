@@ -13,8 +13,8 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use trial::witness::{
-    self, Case, Counts, Drift, FlowEvent, Listener, ReceiverEnrollment, Receivers, RouteChange,
-    RouteSample, Target, Transport,
+    self, CaptureRequest, Case, Counts, Drift, FlowEvent, Listener, ReceiverEnrollment, Receivers,
+    RouteChange, RouteSample, Target, Transport,
 };
 
 const PACKAGES: Hash = [31; 32];
@@ -42,6 +42,15 @@ enum Fault {
     WrongOriginCertificate,
     WrongFixture,
     WrongReceiverBoot,
+    UnarmedReceiver,
+    ForeignArm,
+    ReplayedArm,
+    ReplayedCapture,
+    ForeignCapture,
+    TamperedCapture,
+    LostHandoff,
+    ForeignPrelaunchListener,
+    DriftWhileArming,
     WrongReceiverGeneration,
     MissingReceiver,
     MissingReceiverTransport,
@@ -89,6 +98,9 @@ struct Trace {
     launched: Vec<trial::Phase>,
     continued: Vec<trial::Phase>,
     listener_checks: usize,
+    startup_listeners: usize,
+    armed: bool,
+    socket: Option<std::net::TcpListener>,
     drained: Vec<trial::Phase>,
     disposed: bool,
 }
@@ -223,6 +235,9 @@ impl<'a> trial::Host for Host<'a> {
         if peer.is_some() {
             assert_eq!(trace.launched.last(), Some(&ticket.phase));
         }
+        if self.fault == Fault::DriftWhileArming && trace.armed && peer.is_some() {
+            return Err(NativeRefusal::NetworkFenceUnverified);
+        }
         if trace.continued.contains(&ticket.phase) {
             assert_eq!(ticket.phase, trial::Phase::Endpoint);
             assert_eq!(trace.listener_checks, 2);
@@ -283,7 +298,7 @@ impl<'a> trial::Host for Host<'a> {
         Ok(targets)
     }
 
-    fn prelaunch(
+    fn create_suspended(
         &mut self,
         boot: &trial::CheckedBoot<'_>,
         _: u64,
@@ -365,13 +380,43 @@ impl<'a> trial::Host for Host<'a> {
             std::fs::File::create_new(self.orphan.as_str()).unwrap();
             return Err(NativeRefusal::JobUnverified);
         }
+        if self.fault == Fault::LostHandoff && ticket.phase == trial::Phase::PublicFixture {
+            drop(
+                plan.static_origin_lease()
+                    .unwrap()
+                    .take_for_handoff()
+                    .unwrap(),
+            );
+        }
         Ok(peer(ticket.phase, self.fault))
+    }
+
+    fn prelaunch(
+        &mut self,
+        peer_id: trial::PeerId,
+        socket: Option<std::net::TcpListener>,
+        _: u64,
+        _: &Shutdown,
+    ) -> Result<(), NativeRefusal> {
+        let mut trace = self.trace.borrow_mut();
+        let phase = *trace.launched.last().unwrap();
+        assert_eq!(peer_id, peer(phase, self.fault));
+        assert_eq!(
+            socket.is_some(),
+            matches!(phase, trial::Phase::PublicFixture | trial::Phase::Endpoint)
+        );
+        assert!(trace.socket.is_none());
+        trace.socket = socket;
+        Ok(())
     }
 
     fn cont(&mut self, peer_id: trial::PeerId, _: u64, _: &Shutdown) -> Result<(), NativeRefusal> {
         let mut trace = self.trace.borrow_mut();
         let phase = *trace.launched.last().unwrap();
         assert_eq!(peer(phase, self.fault), peer_id);
+        if phase == trial::Phase::PublicFixture {
+            assert!(trace.armed);
+        }
         trace.continued.push(phase);
         Ok(())
     }
@@ -383,7 +428,15 @@ impl<'a> trial::Host for Host<'a> {
         _: u64,
     ) -> Result<Listener, NativeRefusal> {
         let mut trace = self.trace.borrow_mut();
-        assert_eq!(trace.continued.last(), Some(&trial::Phase::Endpoint));
+        let phase = *trace.launched.last().unwrap();
+        let address = trace.socket.as_ref().unwrap().local_addr().unwrap();
+        assert_eq!(address, (std::net::Ipv4Addr::LOCALHOST, port).into());
+        if trace.continued.last() != Some(&phase) {
+            trace.startup_listeners += 1;
+            let pid = peer.pid + u32::from(self.fault == Fault::ForeignPrelaunchListener);
+            return Ok(Listener::fixture(port, pid));
+        }
+        assert_eq!(phase, trial::Phase::Endpoint);
         trace.listener_checks += 1;
         // Model a foreign listener that replaces the original during HTTPS.
         match self.fault {
@@ -400,7 +453,11 @@ impl<'a> trial::Host for Host<'a> {
         ticket: trial::Ticket,
         cutoff: u64,
     ) -> Result<trial::Release, NativeRefusal> {
-        self.trace.borrow_mut().drained.push(ticket.phase);
+        {
+            let mut trace = self.trace.borrow_mut();
+            trace.drained.push(ticket.phase);
+            drop(trace.socket.take());
+        }
         if ticket.phase == trial::Phase::Endpoint {
             match self.fault {
                 Fault::Late => self.time.set(records::MAX_TRIAL_MS + 10),
@@ -461,7 +518,7 @@ struct Guest<'a> {
     fault: Fault,
     challenge: Option<Challenge>,
     runtime: &'a tokio::runtime::Runtime,
-    port: &'a OriginPortLease,
+    trace: &'a RefCell<Trace>,
 }
 
 impl trial::Guest for Guest<'_> {
@@ -491,7 +548,15 @@ impl trial::Guest for Guest<'_> {
             }
             Ok(Some(TrialRequest::DockerTrialProvision { challenge })) => {
                 assert_eq!(self.challenge, Some(challenge));
-                let certificate_der = origin_peer(self.runtime, self.port, challenge, self.fault);
+                let listener = self
+                    .trace
+                    .borrow()
+                    .socket
+                    .as_ref()
+                    .unwrap()
+                    .try_clone()
+                    .unwrap();
+                let certificate_der = origin_peer(self.runtime, listener, challenge, self.fault);
                 let mut echoed = challenge;
                 if self.fault == Fault::WrongOriginGeneration {
                     echoed.generation += 1;
@@ -548,17 +613,43 @@ impl trial::Guest for Guest<'_> {
 struct Capture<'a> {
     fault: Fault,
     trace: &'a RefCell<Trace>,
+    armed: Option<Hash>,
 }
 
 impl trial::Capture for Capture<'_> {
+    fn arm(&mut self, request: &CaptureRequest<'_>) -> Result<Vec<u8>, NativeRefusal> {
+        let mut trace = self.trace.borrow_mut();
+        assert_eq!(trace.launched.last(), Some(&trial::Phase::PublicFixture));
+        assert_eq!(trace.startup_listeners, 1);
+        assert!(trace.continued.is_empty());
+        assert!(!trace.armed);
+        trace.armed = true;
+        self.armed = Some(digest(&serde_json::to_vec(request).unwrap()));
+        let mut replay = CaptureRequest { ..*request };
+        replay.nonce[0] ^= 1;
+        let signature = match self.fault {
+            Fault::UnarmedReceiver => Vec::new(),
+            Fault::ReplayedArm => replay.fixture_sign(b"armed", &[], false),
+            _ => request.fixture_sign(b"armed", &[], self.fault == Fault::ForeignArm),
+        };
+        Ok(signature)
+    }
+
     fn fixture(
         &mut self,
-        peer: trial::PeerId,
-        ticket: trial::Ticket,
-        targets: &[Target],
+        request: &CaptureRequest<'_>,
         window: std::ops::Range<u64>,
     ) -> Result<Vec<u8>, NativeRefusal> {
-        assert_eq!(self.trace.borrow().continued.last(), Some(&ticket.phase));
+        assert_eq!(
+            self.trace.borrow().continued.last(),
+            Some(&trial::Phase::PublicFixture)
+        );
+        assert_eq!(
+            self.armed.take(),
+            Some(digest(&serde_json::to_vec(request).unwrap()))
+        );
+        assert!(request.issued_ms < window.start);
+        let targets = request.targets;
         let mut before = witness::ObservedRoute::from(fixture_route());
         let mut after = before;
         if self.fault != Fault::NoRouteChange {
@@ -568,10 +659,10 @@ impl trial::Capture for Capture<'_> {
             before.interface_luid += 2;
         }
         let mut capture = Receivers {
-            run: ticket.scope.run,
-            boot: peer.boot,
-            generation: ticket.challenge.generation,
-            nonce: ticket.challenge.nonce,
+            run: request.run,
+            boot: request.boot,
+            generation: request.generation,
+            nonce: request.nonce,
             route_change: RouteChange {
                 at_ms: window.start + 8,
                 before,
@@ -696,7 +787,6 @@ impl trial::Capture for Capture<'_> {
             Fault::MissingReceiver => {
                 capture.observations.pop();
             }
-            Fault::MalformedReceiver => return Ok(b"{".to_vec()),
             Fault::WrongReceiverTarget => denied.target.identity[0] ^= 1,
             Fault::MissingBeforeControl => denied.before = 0,
             Fault::MissingAfterControl => denied.after = 0,
@@ -706,13 +796,30 @@ impl trial::Capture for Capture<'_> {
             _ => {}
         }
         let json = serde_json::to_string(&capture).unwrap();
-        if self.fault == Fault::FixtureBoundStockRow {
-            assert!(json.contains(r#""case":"Host""#));
-            return Ok(json
-                .replacen(r#""case":"Host""#, r#""case":"StockTest""#, 1)
-                .into_bytes());
+        let mut body = match self.fault {
+            Fault::MalformedReceiver => b"{".to_vec(),
+            Fault::FixtureBoundStockRow => {
+                assert!(json.contains(r#""case":"Host""#));
+                json.replacen(r#""case":"Host""#, r#""case":"StockTest""#, 1)
+                    .into_bytes()
+            }
+            _ => json.into_bytes(),
+        };
+        let mut replay = CaptureRequest { ..*request };
+        replay.boot[0] ^= 1;
+        let signer = if self.fault == Fault::ReplayedCapture {
+            &replay
+        } else {
+            request
+        };
+        let mut reply =
+            signer.fixture_sign(b"completed", &body, self.fault == Fault::ForeignCapture);
+        if self.fault == Fault::TamperedCapture {
+            // The modified JSON still parses and contains the same observations.
+            body.push(b' ');
         }
-        Ok(json.into_bytes())
+        reply.extend(body);
+        Ok(reply)
     }
 }
 
@@ -720,7 +827,7 @@ impl trial::Capture for Capture<'_> {
 // makes the same certificate, SNI and HTTP checks for the emitted dossier.
 fn origin_peer(
     runtime: &tokio::runtime::Runtime,
-    port: &OriginPortLease,
+    listener: std::net::TcpListener,
     challenge: Challenge,
     fault: Fault,
 ) -> Vec<u8> {
@@ -757,7 +864,7 @@ fn origin_peer(
     } else {
         challenge.origin_health()
     };
-    let listener = port.fixture_listener().unwrap();
+    listener.set_nonblocking(true).unwrap();
     runtime.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         let (socket, _) = listener.accept().await.unwrap();
@@ -819,7 +926,7 @@ fn collect(fault: Fault) {
     let (mut dependencies, baseline, _) = docker_fixture(&evidence);
     dependencies.policy = digest(&policy_bytes());
     dependencies.origin_profile = trial::origin_profile_pin();
-    let manifest = serde_json::to_vec(&witness::fixture_targets()).unwrap();
+    let manifest = witness::fixture_manifest();
     let receiver_enrollment =
         ReceiverEnrollment::from_manifest(&manifest, [[51; 32], [52; 32], [53; 32]]).unwrap();
     dependencies.network_fixture = receiver_enrollment.fixture();
@@ -1031,11 +1138,12 @@ fn collect(fault: Fault) {
             fault,
             challenge: None,
             runtime: &runtime,
-            port: &ports[1],
+            trace: &trace,
         },
         capture: Capture {
             fault,
             trace: &trace,
+            armed: None,
         },
         packages: PACKAGES,
         dependencies: dependencies.clone(),
@@ -1061,6 +1169,12 @@ fn collect(fault: Fault) {
             | Fault::ChangedRoute
             | Fault::ChangedTopology
             | Fault::ReplacedPolicy
+            | Fault::UnarmedReceiver
+            | Fault::ForeignArm
+            | Fault::ReplayedArm
+            | Fault::LostHandoff
+            | Fault::ForeignPrelaunchListener
+            | Fault::DriftWhileArming
     );
     let inventory_refusal = matches!(
         fault,
@@ -1111,6 +1225,7 @@ fn collect(fault: Fault) {
         assert_eq!(trace.launched, phases);
         assert_eq!(trace.continued, phases);
         assert_eq!(trace.listener_checks, 2);
+        assert_eq!(trace.startup_listeners, 2);
         let seal = read(&output, COMPLETE);
         let selection = records::DockerSelection {
             seal_sha256: records::digest(&seal),
@@ -1336,4 +1451,97 @@ fn docker_collector_refuses_missing_foreign_and_malformed_witnesses() {
     ] {
         collect(fault);
     }
+}
+
+#[test]
+fn docker_collector_requires_the_enrolled_observer_before_guest_execution() {
+    for fault in [
+        Fault::UnarmedReceiver,
+        Fault::ForeignArm,
+        Fault::ReplayedArm,
+        Fault::DriftWhileArming,
+    ] {
+        collect(fault);
+    }
+}
+
+#[test]
+fn docker_collector_authenticates_capture_bytes_against_the_exact_request() {
+    for fault in [
+        Fault::ForeignCapture,
+        Fault::ReplayedCapture,
+        Fault::TamperedCapture,
+    ] {
+        collect(fault);
+    }
+}
+
+#[test]
+fn docker_collector_requires_the_held_port_and_the_suspended_child_as_listener() {
+    for fault in [Fault::LostHandoff, Fault::ForeignPrelaunchListener] {
+        collect(fault);
+    }
+}
+
+#[test]
+fn docker_receiver_mailbox_exchanges_private_bounded_frames() {
+    use trial::Capture;
+    use trial::capture_mailbox::Mailbox;
+
+    crate::service::windows::set_current_token_owner().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, path) = private_dir(dir.path(), "receiver-mailbox");
+    let cancel = Shutdown::default();
+    let mut mailbox =
+        Mailbox::open(&path, sid(&owner), &[], boot::uptime(), cancel.clone()).unwrap();
+    assert!(Mailbox::open(&path, sid(&owner), &[&path], boot::uptime(), cancel.clone()).is_err());
+    let request = CaptureRequest {
+        run: [61; 16],
+        boot: [62; 16],
+        generation: 1,
+        nonce: [63; 16],
+        route: fixture_route().into(),
+        topology: [64; 32],
+        policy: [65; 32],
+        targets: &[],
+        issued_ms: 0,
+        cutoff_ms: 5000,
+    };
+    // A separate observer reads the committed request and publishes the
+    // acknowledgement and capture through atomic, non-replacing renames.
+    let encoded = serde_json::to_vec(&request).unwrap();
+    let acknowledgement = request.fixture_sign(b"armed", &[], false);
+    let observer_path = path.clone();
+    let observer = std::thread::spawn(move || {
+        let file = |name| observer_path.join(name).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if std::fs::read(file("request.json").as_str()).is_ok_and(|body| body == encoded) {
+                std::fs::write(file("armed.tmp").as_str(), &acknowledgement).unwrap();
+                std::fs::rename(file("armed.tmp").as_str(), file("armed.sig").as_str()).unwrap();
+                while Instant::now() < deadline {
+                    if std::fs::read(file("started.json").as_str()).is_ok() {
+                        // A valid acknowledgement cannot grant an oversized response.
+                        std::fs::write(
+                            file("capture.tmp").as_str(),
+                            vec![0; 65 + witness::MAX_CAPTURE_BYTES],
+                        )
+                        .unwrap();
+                        std::fs::rename(file("capture.tmp").as_str(), file("capture.bin").as_str())
+                            .unwrap();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("mailbox did not publish both frames");
+    });
+    let reply = mailbox.arm(&request).unwrap();
+    assert_eq!(reply, request.fixture_sign(b"armed", &[], false));
+    assert!(mailbox.fixture(&request, 0..request.cutoff_ms).is_err());
+    observer.join().unwrap();
+    assert!(mailbox.fixture(&request, 0..request.cutoff_ms).is_err());
+    assert!(Mailbox::open(&path, sid(&owner), &[], boot::uptime(), cancel).is_err());
 }

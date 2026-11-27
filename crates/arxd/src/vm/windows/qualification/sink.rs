@@ -855,7 +855,7 @@ fn nt_open(
 
 /// Rename the open entry to `name` under the held directory. An existing
 /// final name is never replaced.
-fn rename_within(file: &File, dir: &File, name: &str) -> io::Result<()> {
+pub(super) fn rename_within(file: &File, dir: &File, name: &str) -> io::Result<()> {
     let units: Vec<u16> = name.encode_utf16().collect();
     let length = units.len() * 2;
     let size = size_of::<FILE_RENAME_INFORMATION>() + length;

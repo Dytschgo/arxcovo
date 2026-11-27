@@ -1,5 +1,5 @@
-//! Disposable Docker qualification. The native witness adapter is a separate
-//! boundary. Only the deterministic tests can currently supply its peer.
+//! Disposable Docker qualification. The collector verifies separately signed
+//! receiver observations. The native QEMU host remains gated.
 use super::*;
 use crate::vm::{
     Id,
@@ -15,10 +15,11 @@ use arx_guest::compose::{COMPOSE_PROTOCOL_VERSION, ComposeResponse};
 use arx_guest::docker_trial::{BootMode, Challenge, TrialRequest, TrialResponse};
 use std::io::Write;
 
+pub(super) mod capture_mailbox;
 mod origin;
 pub(super) use origin::profile_pin as origin_profile_pin;
 pub(in crate::vm::windows) mod witness;
-use witness::{Listener, ObservedRoute, ReceiverEnrollment, RouteSample, Target};
+use witness::{CaptureRequest, Listener, ObservedRoute, ReceiverEnrollment, RouteSample, Target};
 
 const REFUSED: NativeRefusal = NativeRefusal::PathCustodyUnverified;
 // Simultaneous worst-case allocation of the fixture, original and both
@@ -91,10 +92,27 @@ pub(super) fn preflight(
     let recipe = enrollment.recipe.hold(&m4.held, &m4.recipes, [1; 16])?;
     let inputs = enrollment.hold_inputs(&evidence, mode, &m4.held, &recipe)?;
     let targets = bind_preflight_inputs(&inputs, selected.selection().seal_sha256, &evidence)?;
+    if let Some(mailbox) = &enrollment.receiver_mailbox {
+        let mailbox = local(mailbox)?;
+        let forbidden = [
+            &path,
+            &evidence,
+            &scope.production.root.path,
+            &scope.recipe.root.path,
+            &m4.held.trial.path,
+        ];
+        capture_mailbox::Mailbox::open(
+            &mailbox,
+            user_sid(&user),
+            &forbidden,
+            boot::uptime(),
+            Shutdown::default(),
+        )?;
+    }
     let (_dependencies, watch) = inputs.measure_live(&targets)?;
     m4.require_current()?;
     // A complete input check grants no native effects or evidence claim.
-    // Require the independent receiver and boot-bound HTTPS adapters first.
+    // Native host construction still gates the collector and its mailbox.
     watch.require_current()?;
     Err(NativeRefusal::NetworkFenceUnverified)
 }
@@ -406,13 +424,22 @@ pub(super) trait Host {
         cutoff: u64,
     ) -> Result<RouteSample, NativeRefusal>;
     fn receiver_targets(&mut self, ticket: Ticket) -> Result<Vec<Target>, NativeRefusal>;
-    // Checked create through QMP prelaunch, with guest execution still paused.
-    fn prelaunch(
+    // Return only after verifying the suspended child, Job and executable.
+    fn create_suspended(
         &mut self,
         boot: &CheckedBoot<'_>,
         cutoff: u64,
         cancel: &Shutdown,
     ) -> Result<PeerId, NativeRefusal>;
+    // Resume the process through the checked edge, release the reserved
+    // socket there, then prove QMP prelaunch with the guest vCPUs still paused.
+    fn prelaunch(
+        &mut self,
+        peer: PeerId,
+        origin: Option<std::net::TcpListener>,
+        cutoff: u64,
+        cancel: &Shutdown,
+    ) -> Result<(), NativeRefusal>;
     fn cont(&mut self, peer: PeerId, cutoff: u64, cancel: &Shutdown) -> Result<(), NativeRefusal>;
     fn listener(&mut self, peer: PeerId, port: u16, cutoff: u64)
     -> Result<Listener, NativeRefusal>;
@@ -431,11 +458,10 @@ pub(super) trait Guest {
 }
 
 pub(super) trait Capture {
+    fn arm(&mut self, request: &CaptureRequest<'_>) -> Result<Vec<u8>, NativeRefusal>;
     fn fixture(
         &mut self,
-        peer: PeerId,
-        ticket: Ticket,
-        targets: &[Target],
+        request: &CaptureRequest<'_>,
         window: std::ops::Range<u64>,
     ) -> Result<Vec<u8>, NativeRefusal>;
 }
@@ -467,6 +493,7 @@ struct RunningBoot<'a, 'plan> {
     plan: &'a CommandPlan<'plan>,
     started_ms: u64,
     route: Option<ObservedRoute>,
+    capture: Option<CaptureRequest<'a>>,
 }
 
 impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
@@ -474,7 +501,13 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
         &mut self,
         phase: Phase,
         cutoff: u64,
-        verify: impl FnOnce(&mut H, &mut G, &mut C, RunningBoot<'_, '_>) -> Result<T, NativeRefusal>,
+        verify: impl FnOnce(
+            &mut H,
+            &mut G,
+            &mut C,
+            &ReceiverEnrollment,
+            RunningBoot<'_, '_>,
+        ) -> Result<T, NativeRefusal>,
     ) -> Result<(T, PeerId), NativeRefusal> {
         let available = self.host.headroom()?;
         if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
@@ -525,10 +558,28 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
             if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
                 return Err(NativeRefusal::QualificationMissing);
             }
-            let peer = self.host.prelaunch(&boot, cutoff, self.cancel)?;
+            let peer = self.host.create_suspended(&boot, cutoff, self.cancel)?;
             spawned = Some(peer);
             if peer.pid == 0 || peer.boot == [0; 16] {
                 return Err(NativeRefusal::GuestEndpointUnverified);
+            }
+            let origin = boot.argv().static_origin_lease();
+            let socket = origin
+                .map(|lease| {
+                    lease
+                        .take_for_handoff()
+                        .ok_or(NativeRefusal::GuestEndpointUnverified)
+                })
+                .transpose()?;
+            if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
+                return Err(NativeRefusal::QualificationMissing);
+            }
+            self.host.prelaunch(peer, socket, cutoff, self.cancel)?;
+            if let Some(lease) = origin {
+                let port = lease.port();
+                self.host
+                    .listener(peer, port, cutoff)?
+                    .check(port, peer.pid)?;
             }
             let route = if public {
                 Some(witness::route(
@@ -537,6 +588,39 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                     Some(peer),
                     &self.dependencies,
                 )?)
+            } else {
+                None
+            };
+            let capture = if phase == Phase::PublicFixture {
+                let route = route.ok_or(NativeRefusal::NetworkFenceUnverified)?;
+                let request = CaptureRequest {
+                    run: ticket.scope.run,
+                    boot: peer.boot,
+                    generation: ticket.challenge.generation,
+                    nonce: ticket.challenge.nonce,
+                    route,
+                    topology: self.dependencies.topology,
+                    policy: self.dependencies.policy,
+                    targets: &targets,
+                    issued_ms: self.host.clock().mono_ms,
+                    cutoff_ms: cutoff,
+                };
+                let acknowledgement = self.capture.arm(&request)?;
+                self.receiver_enrollment
+                    .require_armed(&request, &acknowledgement)?;
+                if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
+                    return Err(NativeRefusal::QualificationMissing);
+                }
+                let fresh_route = witness::route(
+                    self.host.route(&boot, Some(peer), cutoff)?,
+                    &boot,
+                    Some(peer),
+                    &self.dependencies,
+                )?;
+                if route != fresh_route {
+                    return Err(NativeRefusal::NetworkFenceUnverified);
+                }
+                Some(request)
             } else {
                 None
             };
@@ -549,6 +633,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                 &mut self.host,
                 &mut self.guest,
                 &mut self.capture,
+                &self.receiver_enrollment,
                 RunningBoot {
                     peer,
                     ticket,
@@ -556,6 +641,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                     plan: boot.argv(),
                     started_ms,
                     route,
+                    capture,
                 },
             )?;
             // The fixture deliberately exercises drift. The installed endpoint
@@ -606,16 +692,19 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                 loaded_artifacts: dependencies.loaded_artifacts,
             }),
             Stage::PublicIpv4Network => {
-                let (receiver_witness, peer) =
-                    self.run_boot(Phase::PublicFixture, cutoff, |host, _, capture, boot| {
-                        let raw = capture.fixture(
-                            boot.peer,
-                            boot.ticket,
-                            boot.targets,
-                            boot.started_ms..cutoff,
-                        )?;
-                        witness::receivers(&raw, &boot, host.clock().mono_ms)
-                    })?;
+                let (receiver_witness, peer) = self.run_boot(
+                    Phase::PublicFixture,
+                    cutoff,
+                    |host, _, capture, receiver_enrollment, boot| {
+                        let request = boot
+                            .capture
+                            .as_ref()
+                            .ok_or(NativeRefusal::NetworkFenceUnverified)?;
+                        let reply = capture.fixture(request, boot.started_ms..cutoff)?;
+                        let raw = receiver_enrollment.capture_body(request, &reply)?;
+                        witness::receivers(raw, &boot, host.clock().mono_ms)
+                    },
+                )?;
                 *fixture = Some(peer);
                 Ok(Observation::DockerPublicIpv4 {
                     policy: dependencies.policy,
@@ -629,8 +718,8 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                 })
             }
             Stage::DockerRecipe => {
-                self.run_boot(Phase::Install, cutoff, |_, _, _, _| Ok(()))?;
-                self.run_boot(Phase::Detached, cutoff, |_, guest, _, boot| {
+                self.run_boot(Phase::Install, cutoff, |_, _, _, _, _| Ok(()))?;
+                self.run_boot(Phase::Detached, cutoff, |_, guest, _, _, boot| {
                     health(guest, boot.peer, boot.ticket.challenge, packages, cutoff)
                 })?;
                 if !self.host.copies_independent_and_original_unchanged() {
@@ -646,7 +735,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
             Stage::InstalledGuestEndpoint => {
                 let runtime = self.runtime;
                 let cancel = self.cancel;
-                self.run_boot(Phase::Endpoint, cutoff, |host, guest, _, boot| {
+                self.run_boot(Phase::Endpoint, cutoff, |host, guest, _, _, boot| {
                     let peer = boot.peer;
                     let challenge = boot.ticket.challenge;
                     if !fixture.is_some_and(|first| first.boot != peer.boot) {
