@@ -27,7 +27,8 @@ pub(crate) use production::{
     BuildSeal, FinalizedPair, GenerationGuards, HeldStartRefusal, HelperSettlement, HelperTarget,
     InstallerSettlement, LaunchPermit, LaunchPermitBinding, LaunchRequest, LaunchTarget,
     NativeLaunch, NativeRecovery, ProductionWorkspace, ReleasedGeneration, StartCreation,
-    StartPair, StartRefusal, TEST_RESOURCES, WorkspaceBinding, binding_from_scope,
+    StartPair, StartRefusal, StaticMachine, StaticRecipe, TEST_RESOURCES, WorkspaceBinding,
+    binding_from_scope,
 };
 #[cfg(test)]
 pub(crate) use production::{FixtureQualification, consume_checked};

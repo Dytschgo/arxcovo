@@ -163,6 +163,7 @@ impl PreparedStaticDossier {
             token: m4.held.token.clone(),
             patched: held.patched,
             stock: held.stock,
+            stock_inventory: held.stock_inventory,
             release: held.release,
             inputs: [
                 held.profile,
@@ -194,19 +195,20 @@ pub(crate) struct StaticDossier {
     _rows: Vec<File>,
     pub(crate) evidence: VerifiedDockerEvidence,
     pub(crate) seal_sha256: Hash,
-    watch: route_watch::RouteWatch,
+    pub(super) watch: route_watch::RouteWatch,
     policy: PublicEgressPolicy,
-    policy_file: PathPin,
+    pub(super) policy_file: PathPin,
     reviewed: PathPin,
     public_targets: [std::net::Ipv4Addr; 2],
     dependencies: DockerDependencies,
     token: Arc<VmToken>,
-    patched: inventory::PatchedBundle,
-    stock: inventory::Bundle,
+    pub(super) patched: inventory::PatchedBundle,
+    pub(super) stock: inventory::Bundle,
+    pub(super) stock_inventory: Hash,
     release: [PathPin; 2],
     inputs: [PathPin; 4],
     fixture: [PathPin; 3],
-    recipe: ComposeInstallerInputs,
+    pub(super) recipe: ComposeInstallerInputs,
 }
 
 impl StaticDossier {
@@ -221,6 +223,14 @@ impl StaticDossier {
             &self.public_targets,
             self.dependencies.topology,
         )
+    }
+
+    pub(super) fn public_dns(&self) -> std::net::Ipv4Addr {
+        self.public_targets[1]
+    }
+
+    pub(crate) fn retirement(&self) -> Shutdown {
+        self.watch.retirement()
     }
 
     fn require_inputs_current(&self) -> Result<(), NativeRefusal> {
@@ -271,6 +281,8 @@ pub(super) struct ComposeInstallerInputs {
     pub(super) bootstrap_packages: Hash,
     pub(super) seed: Vec<u8>,
     pub(super) detached_health: String,
+    pub(super) web_seed: Vec<u8>,
+    pub(super) web_health: Vec<String>,
 }
 
 /// The receipt pin is supplied independently by owner enrollment after the
@@ -493,8 +505,12 @@ impl ComposeInstallerInputs {
         };
         let bootstrap_packages =
             arx_guest::docker_trial::package_digest([containerd, engine, cli, plugin]);
+        let guest_bytes = held_bytes(&guest, MAX_GUEST)?;
+        let web_seed = web
+            .render_seed(generation, &guest_bytes)
+            .map_err(|_| REFUSAL)?;
         let seed = recipe
-            .render_seed(generation, &held_bytes(&guest, MAX_GUEST)?)
+            .render_seed(generation, &guest_bytes)
             .map_err(|_| REFUSAL)?;
         Ok(Self {
             medium,
@@ -514,6 +530,8 @@ impl ComposeInstallerInputs {
             bootstrap_packages,
             seed,
             detached_health: recipe.detached_health(),
+            web_seed,
+            web_health: web.detached_checks(),
         })
     }
 
@@ -545,7 +563,10 @@ impl ComposeInstallerInputs {
         Ok(())
     }
 
-    fn stock_inventory(&self, stock_distribution: &Distribution) -> Result<Hash, NativeRefusal> {
+    pub(super) fn stock_inventory(
+        &self,
+        stock_distribution: &Distribution,
+    ) -> Result<Hash, NativeRefusal> {
         self.recheck()?;
         let stock_receipt = ArtifactPin {
             size: stock_distribution.receipt_bytes,
@@ -585,7 +606,7 @@ pub(super) struct StockBootInputs<'a> {
 }
 
 impl<'a> StockBootInputs<'a> {
-    fn hold(
+    pub(super) fn hold(
         bundle: &'a inventory::Bundle,
         inventory: Hash,
         firmware_pin: ArtifactPin,

@@ -1,7 +1,23 @@
 //! Static generations have independent custody roles and no TEST cleanup route.
 use super::*;
+pub(super) const MIGRATE_V18: &str = "
+CREATE TABLE vm_static_custody (
+    generation BLOB PRIMARY KEY REFERENCES vm_generations(id),
+    volume BLOB NOT NULL CHECK(length(volume)=8),
+    production BLOB NOT NULL CHECK(length(production)=16),
+    directory BLOB NOT NULL CHECK(length(directory)=16 AND directory<>production),
+    lease BLOB NOT NULL CHECK(length(lease)=16 AND lease<>directory AND lease<>production)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER vm_static_custody_insert BEFORE INSERT ON vm_static_custody
+    WHEN NOT EXISTS (SELECT 1 FROM vm_generations g JOIN vm_static_instances s ON s.id=g.static_id
+        WHERE g.id=NEW.generation AND g.active=1 AND s.state=1)
+    BEGIN SELECT RAISE(ABORT,'invalid static custody'); END;
+CREATE TRIGGER vm_static_custody_update BEFORE UPDATE ON vm_static_custody
+    BEGIN SELECT RAISE(ABORT,'immutable static custody'); END;
+";
+
 use crate::vm::static_web::{StaticName, StaticProvenance, StaticState};
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 use crate::vm::{CandidateSlot, CopyFailure};
 
 pub(crate) struct StaticRow {
@@ -20,7 +36,7 @@ pub(crate) fn host_id(db: &Connection) -> Result<Id> {
     )?)
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn origin_generation(db: &Connection, vm: Id) -> Result<Id> {
     Ok(db.query_row(
         "SELECT origin_generation FROM vm_static_instances WHERE id=?1",
@@ -248,15 +264,25 @@ pub(crate) fn active_pair(
     principal: &str,
     vm: Id,
 ) -> Result<Option<(PairSlots, [ArtifactEvidence; 2])>> {
+    pair_in_state(db, principal, vm, StaticState::Stopped)
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+fn pair_in_state(
+    db: &Connection,
+    principal: &str,
+    vm: Id,
+    state: StaticState,
+) -> Result<Option<(PairSlots, [ArtifactEvidence; 2])>> {
     let mut stmt = db.prepare(
         "SELECT g.id,a.role,a.object_key,a.volume_id,a.directory_id,a.file_id,a.content_digest,a.bytes
          FROM vm_static_instances s JOIN vm_generations g ON g.static_id=s.id AND g.active=1
          JOIN vm_artifacts a ON a.generation_id=g.id AND a.state='active'
-         WHERE s.id=?1 AND s.principal=?2 AND s.state=1 AND a.role IN ('static_disk','static_vars')
+         WHERE s.id=?1 AND s.principal=?2 AND s.state=?3 AND a.role IN ('static_disk','static_vars')
          ORDER BY a.role",
     )?;
     let rows = stmt
-        .query_map(params![vm, principal], |row| {
+        .query_map(params![vm, principal, state as i64], |row| {
             let role = match row.get::<_, String>(1)?.as_str() {
                 "static_disk" => "static_disk",
                 "static_vars" => "static_vars",
@@ -369,7 +395,7 @@ pub(super) fn settle_operation(
     Ok(Some(status))
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn allocate_id(db: &Connection) -> Result<Id> {
     for _ in 0..4 {
         let id = new_id()?;
@@ -390,7 +416,7 @@ pub(crate) fn allocate_id(db: &Connection) -> Result<Id> {
     anyhow::bail!("VM identity unavailable")
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn name_occupied(db: &Connection, name: &StaticName) -> Result<bool> {
     Ok(count(
         db,
@@ -399,7 +425,7 @@ pub(crate) fn name_occupied(db: &Connection, name: &StaticName) -> Result<bool> 
     )? != 0)
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn source(
     db: &Connection,
     template: Id,
@@ -443,7 +469,7 @@ pub(crate) fn source(
         .optional()?)
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn compose_source(
     db: &Connection,
     template: Id,
@@ -458,7 +484,7 @@ pub(crate) fn compose_source(
     source(db, template, inputs, recipe.recipe_sha256)
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn reserve(
     db: &Connection,
     vm: Id,
@@ -490,7 +516,7 @@ pub(crate) fn reserve(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn settle_create(
     db: &Connection,
     activity: i64,
@@ -586,7 +612,7 @@ pub(crate) fn settle_create(
 /// Dispose of a never-activated candidate whose worker proved both slots
 /// absent: only its own planned rows, generation and reservation. Any
 /// recorded effect keeps the whole candidate quarantined and charged.
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn release_candidate(db: &Connection, vm: Id, slots: PairSlots) -> Result<()> {
     ensure!(
         count(
@@ -616,7 +642,7 @@ fn release_candidate(db: &Connection, vm: Id, slots: PairSlots) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 fn independent_pair(db: &Connection, source: Id, pair: [ArtifactEvidence; 2]) -> Result<bool> {
     let mut query = db.prepare("SELECT volume_id,file_id FROM vm_artifacts WHERE generation_id=?1 AND role IN ('disk','vars')")?;
     let files = query
@@ -826,4 +852,94 @@ fn compose_source_refuses_a_swapped_sealed_pair() -> Result<()> {
         );
         Ok(())
     })
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+pub(crate) mod native {
+    use super::*;
+    use crate::store::vm::native::Scope;
+
+    pub(crate) fn bind(db: &Connection, scope: Scope) -> Result<()> {
+        let volume = scope.production.volume;
+        ensure!(
+            scope.workspace.volume == volume && scope.lease.volume == volume,
+            "invalid static custody volume"
+        );
+        db.execute(
+            "INSERT INTO vm_static_custody(generation,volume,production,directory,lease)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![
+                scope.generation,
+                volume.to_be_bytes(),
+                scope.production.file,
+                scope.workspace.file,
+                scope.lease.file
+            ],
+        )?;
+        Ok(())
+    }
+
+    type Custody = (Scope, PairSlots, [ArtifactEvidence; 2]);
+
+    pub(crate) fn custody(
+        db: &Connection,
+        principal: &str,
+        vm: Id,
+        state: StaticState,
+    ) -> Result<Option<Custody>> {
+        let Some((slots, pair)) = pair_in_state(db, principal, vm, state)? else {
+            return Ok(None);
+        };
+        let generation = slots.disk.generation;
+        let scope = db.query_row(
+            "SELECT volume,production,directory,lease FROM vm_static_custody WHERE generation=?1",
+            [generation],
+            |row| {
+                let volume = u64::from_be_bytes(row.get(0)?);
+                let identity = |column| -> rusqlite::Result<FileIdentity> {
+                    Ok(FileIdentity { volume, file: row.get(column)? })
+                };
+                Ok(Scope {
+                    generation,
+                    production: identity(1)?,
+                    workspace: identity(2)?,
+                    lease: identity(3)?,
+                })
+            },
+        ).optional()?;
+        Ok(scope
+            .filter(|scope| {
+                pair.iter().all(|file| {
+                    file.directory == scope.workspace.file
+                        && file.identity.volume == scope.workspace.volume
+                })
+            })
+            .map(|scope| (scope, slots, pair)))
+    }
+
+    pub(crate) fn recovery(db: &Connection, claim: StaticRecovery) -> Result<Option<Custody>> {
+        if recovery_rows(db, Some(claim.vm))?.as_slice() != [claim] {
+            return Ok(None);
+        }
+        let principal: String = db.query_row(
+            "SELECT principal FROM vm_static_instances WHERE id=?1",
+            [claim.vm],
+            |row| row.get(0),
+        )?;
+        Ok(custody(db, &principal, claim.vm, StaticState::Recovering)?
+            .filter(|(scope, _, _)| scope.generation == claim.generation))
+    }
+
+    pub(crate) fn runtime_lost(db: &Connection, vm: Id, now: i64) -> Result<()> {
+        if count(
+            db,
+            "SELECT count(*) FROM vm_static_instances WHERE id=?1 AND state=2",
+            [vm],
+        )? == 1
+        {
+            super::super::compose::finish_retired(db, vm, now)?;
+            begin_recovery(db, vm, now)?;
+        }
+        Ok(())
+    }
 }

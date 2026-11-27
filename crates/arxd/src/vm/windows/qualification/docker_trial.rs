@@ -16,8 +16,8 @@ use arx_guest::docker_trial::{BootMode, Challenge, TrialRequest, TrialResponse};
 use std::io::Write;
 
 pub(super) mod capture_mailbox;
-mod native;
-mod origin;
+pub(super) mod native;
+pub(super) mod origin;
 pub(super) use origin::profile_pin as origin_profile_pin;
 pub(in crate::vm::windows) mod witness;
 use witness::{CaptureRequest, Listener, ObservedRoute, ReceiverEnrollment, RouteSample, Target};

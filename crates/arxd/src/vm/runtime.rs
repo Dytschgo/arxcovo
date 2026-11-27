@@ -531,6 +531,17 @@ pub(crate) trait ReaperRuntime {
     /// interrupted boot. True requires the same independent process, worker
     /// and Job release proof as [`ReaperRuntime::quiesce`] for this exact VM
     /// and generation. It grants no artifact authority. Closed by default.
+    /// Settle while the native workspace lease and both writer exclusions
+    /// are still held. Fixture runtimes can use their in-memory release proof.
+    fn with_static_release(
+        &self,
+        claim: crate::store::vm::static_vm::StaticRecovery,
+        deadline: Instant,
+        settle: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        self.static_released(claim.vm, claim.generation, deadline) && settle()
+    }
+
     fn static_released(&self, vm: super::Id, generation: super::Id, deadline: Instant) -> bool {
         let _ = (vm, generation, deadline);
         false
@@ -898,17 +909,26 @@ pub(crate) mod publication {
     #[derive(Clone, Default)]
     pub(crate) struct Retirement {
         token: Shutdown,
+        route: Option<Shutdown>,
         fence: Arc<std::sync::Mutex<()>>,
     }
 
     impl Retirement {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        pub(crate) fn on_route(route: Shutdown) -> Self {
+            Self {
+                route: Some(route),
+                ..Self::default()
+            }
+        }
+
         pub(crate) fn retire(&self) {
             let _fence = self.fence();
             self.token.cancel();
         }
 
         pub(crate) fn is_retired(&self) -> bool {
-            self.token.is_cancelled()
+            self.token.is_cancelled() || self.route.as_ref().is_some_and(Shutdown::is_cancelled)
         }
 
         pub(crate) fn token(&self) -> &Shutdown {

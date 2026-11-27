@@ -497,7 +497,9 @@ fn reopen(created: PathPin, mutable: bool) -> Result<PathPin, NativeRefusal> {
     (held.identity == id).then_some(held).ok_or(REFUSED)
 }
 
-fn duplicate(pin: &PathPin) -> Result<PathPin, NativeRefusal> {
+pub(in crate::vm::windows::qualification) fn duplicate(
+    pin: &PathPin,
+) -> Result<PathPin, NativeRefusal> {
     let duplicate = |file: &File| file.try_clone().map_err(|_| REFUSED);
     Ok(PathPin {
         _ancestors: pin

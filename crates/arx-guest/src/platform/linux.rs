@@ -22,6 +22,7 @@ use arx_guest::compose_backup::{
 use arx_guest::{MAX_SCRIPT, ScriptExecution, ScriptExecutor, ScriptOutcome, serve_with_compose};
 
 mod docker_trial;
+mod static_origin;
 
 const PORT: &str = "org.arxcovo.agent.0";
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
@@ -48,10 +49,12 @@ pub(crate) fn serve_virtio() -> Result<(), &'static str> {
         )
         .map_err(|_| "Compose trial bootstrap failed");
     }
-    let compose = match compose_finalized() {
-        Ok(false) => None,
-        Ok(true) => Some(qualify_compose().ok_or("Compose guest qualification failed")?),
-        Err(_) => return Err("Compose guest marker refused"),
+    let is_compose = compose_finalized().map_err(|_| "Compose guest marker refused")?;
+    static_origin::prepare(&port, is_compose).map_err(|_| "static origin refused")?;
+    let compose = if is_compose {
+        Some(qualify_compose().ok_or("Compose guest qualification failed")?)
+    } else {
+        None
     };
     // Design §3: the script runner shares the guest network namespace and has
     // no ingress-isolation witness for UID/GID 65534, so legacy scripts stay

@@ -31,10 +31,16 @@ type Interface = (u32, u64);
 struct WatchContext {
     policy: PublicEgressPolicy,
     changed: AtomicBool,
+    retired: Shutdown,
     interfaces: OnceLock<BTreeSet<Interface>>,
 }
 
 impl WatchContext {
+    fn retire(&self) {
+        self.changed.store(true, Ordering::Release);
+        self.retired.cancel();
+    }
+
     fn on_uplink(&self, interface: Interface) -> bool {
         let uplink = self.policy.uplink();
         interface.0 == uplink.interface_index || interface.1 == uplink.interface_luid
@@ -84,6 +90,7 @@ impl RouteWatch {
         let context = Arc::new(WatchContext {
             policy: policy.clone(),
             changed: AtomicBool::new(false),
+            retired: Shutdown::default(),
             interfaces: OnceLock::new(),
         });
         // Context belongs to the returned registrations and remains alive
@@ -112,7 +119,11 @@ impl RouteWatch {
     }
 
     pub(in crate::vm::windows::qualification) fn retire(&self) {
-        self.context.changed.store(true, Ordering::Release);
+        self.context.retire();
+    }
+
+    pub(in crate::vm::windows::qualification) fn retirement(&self) -> Shutdown {
+        self.context.retired.clone()
     }
 
     pub(super) fn require_baseline(
@@ -133,7 +144,7 @@ impl RouteWatch {
         policy: &PublicEgressPolicy,
         public_targets: &[Ipv4Addr],
     ) -> Result<(RouteObservation, Hash), NativeRefusal> {
-        sample_while_current(&self.context.changed, || {
+        let observed = sample_while_current(&self.context.changed, || {
             if policy != &self.context.policy {
                 return Err(NETWORK);
             }
@@ -142,7 +153,11 @@ impl RouteWatch {
                 return Err(NETWORK);
             }
             Ok((route, fingerprint))
-        })
+        });
+        if observed.is_err() {
+            self.context.retire();
+        }
+        observed
     }
 }
 
@@ -169,7 +184,7 @@ fn sample_while_current<T>(
 unsafe fn mark_changed(context: *const c_void, relevant: impl FnOnce(&WatchContext) -> bool) {
     let context = unsafe { &*context.cast::<WatchContext>() };
     if relevant(context) {
-        context.changed.store(true, Ordering::Release);
+        context.retire();
     }
 }
 
@@ -529,6 +544,7 @@ mod tests {
         let context = WatchContext {
             policy: policy(),
             changed: AtomicBool::new(false),
+            retired: Shutdown::default(),
             interfaces: OnceLock::from(BTreeSet::from([(7, 8)])),
         };
         let pointer = (&raw const context).cast();
@@ -566,6 +582,7 @@ mod tests {
         let context = WatchContext {
             policy: policy(),
             changed: AtomicBool::new(false),
+            retired: Shutdown::default(),
             interfaces: OnceLock::new(),
         };
         let changed = &context.changed;
@@ -576,6 +593,10 @@ mod tests {
             Ok(2)
         });
         assert_eq!(result, Err(NETWORK));
+        assert!(
+            context.retired.is_cancelled(),
+            "in-flight work must observe route retirement"
+        );
         assert_eq!(
             sample_while_current::<()>(changed, || panic!("retired sample retried")),
             Err(NETWORK)

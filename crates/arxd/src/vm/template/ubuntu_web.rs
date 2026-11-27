@@ -135,6 +135,22 @@ impl IsoPoolManifest<'_> {
     }
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn rebind_seed(seed: &[u8], generation: Id) -> Result<Vec<u8>, RecipeError> {
+    if generation == [0; 16] {
+        return Err(RecipeError::Unqualified);
+    }
+    let mut files = cidata_files(seed).ok_or(RecipeError::Unqualified)?;
+    let meta = super::ubuntu::nocloud_meta(generation);
+    files[5] = meta.as_bytes();
+    let mut output = Vec::new();
+    Image::new(files)
+        .ok_or(RecipeError::Unqualified)?
+        .write(&mut output)
+        .map_err(|error| RecipeError::Write(error.kind()))?;
+    Ok(output)
+}
+
 fn valid_token(value: &str, max: usize, allowed: impl Fn(u8) -> bool) -> bool {
     (1..=max).contains(&value.len()) && value.bytes().all(allowed)
 }
@@ -297,6 +313,10 @@ impl<'a> UbuntuWebRecipe<'a> {
     /// Run on a detached verification boot, in addition to the base health
     /// contract. This inspects the inert configuration without a private key.
     pub fn detached_health(&self) -> String {
+        self.detached_health_with_packages(self.package_checks("").trim_end())
+    }
+
+    fn detached_health_with_packages(&self, verify: &str) -> String {
         let mut hashes = String::new();
         for (path, bytes) in [
             ("nginx.conf", NGINX_CONFIG),
@@ -312,20 +332,35 @@ impl<'a> UbuntuWebRecipe<'a> {
         }
         DETACHED_PROFILE
             .replace("{pins}", hashes.trim_end())
-            .replace("{verify}", self.package_checks("").trim_end())
+            .replace("{verify}", verify)
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn detached_checks(&self) -> Vec<String> {
+        let mut checks = vec![super::UBUNTU_DETACHED_HEALTH.to_owned()];
+        checks.extend(self.manifest.packages.chunks(8).map(|packages| {
+            let verify = packages
+                .iter()
+                .map(|package| Self::package_check(package, ""))
+                .collect::<String>();
+            self.detached_health_with_packages(verify.trim_end())
+        }));
+        checks
     }
 
     fn package_checks(&self, root: &str) -> String {
         self.manifest
             .packages
             .iter()
-            .map(|package| {
-                VERIFY_LINE
-                    .replace("{root}", root)
-                    .replace("{name}", package.name)
-                    .replace("{version}", package.version)
-            })
+            .map(|package| Self::package_check(package, root))
             .collect()
+    }
+
+    fn package_check(package: &PoolPackage<'_>, root: &str) -> String {
+        VERIFY_LINE
+            .replace("{root}", root)
+            .replace("{name}", package.name)
+            .replace("{version}", package.version)
     }
 }
 

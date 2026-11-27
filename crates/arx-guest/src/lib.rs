@@ -3,6 +3,7 @@ pub mod compose_backup;
 pub mod docker_trial;
 pub mod protocol;
 pub mod session;
+pub mod static_origin;
 
 pub use compose::ComposeService;
 pub use protocol::{

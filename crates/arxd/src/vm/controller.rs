@@ -491,6 +491,28 @@ impl<C: Clock> VmController<C> {
         wire_boot: u64,
         current: impl Fn() -> bool,
     ) -> Result<()> {
+        self.finish_selected_static_start(worker, vm, origin, Some(wire_boot), current)
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn finish_static_web_start(
+        &self,
+        worker: &PendingOperation,
+        vm: Id,
+        origin: &super::runtime::publication::Origin,
+        current: impl Fn() -> bool,
+    ) -> Result<()> {
+        self.finish_selected_static_start(worker, vm, origin, None, current)
+    }
+
+    fn finish_selected_static_start(
+        &self,
+        worker: &PendingOperation,
+        vm: Id,
+        origin: &super::runtime::publication::Origin,
+        wire_boot: Option<u64>,
+        current: impl Fn() -> bool,
+    ) -> Result<()> {
         self.check_worker(worker)?;
         self.store.transact(|db| {
             let now = self.clock.now();
@@ -522,7 +544,9 @@ impl<C: Clock> VmController<C> {
                     == Status::Succeeded,
                 "static start settlement unavailable"
             );
-            store::compose::register_boot(db, vm, origin.generation, wire_boot)?;
+            if let Some(wire_boot) = wire_boot {
+                store::compose::register_boot(db, vm, origin.generation, wire_boot)?;
+            }
             ensure!(live(), "static boot retired");
             Ok(())
         })
@@ -1066,6 +1090,35 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn commit_static_build(
+        &self,
+        worker: &PendingOperation,
+        slots: BuildSlots,
+        request: BuildRequest<'_>,
+        scope: store::native::Scope,
+        proof: [ArtifactEvidence; 2],
+        current: impl Fn() -> bool,
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let live = || current() && self.clock.now().monotonic < worker.deadline;
+            ensure!(live(), "static build retired");
+            store::publish_native_build(
+                db,
+                worker.activity_id,
+                slots,
+                request,
+                Guest::UbuntuX86_64,
+                scope,
+                proof,
+                utc(self.clock.now())?,
+            )?;
+            ensure!(live(), "static build retired");
+            Ok(())
+        })
+    }
+
     /// Whether the controller's clock has reached the worker's deadline.
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[cfg_attr(
@@ -1482,17 +1535,25 @@ impl<C: Clock> VmController<C> {
             let released = start
                 .checked_add(STATIC_RELEASE_BUDGET)
                 .is_some_and(|deadline| {
-                    runtime.static_released(claim.vm, claim.generation, deadline)
-                        && self.clock.now().monotonic < deadline
+                    runtime.with_static_release(claim, deadline, &mut || {
+                        self.store
+                            .transact(|db| {
+                                let now = self.clock.now();
+                                if now.monotonic >= deadline {
+                                    return Ok(false);
+                                }
+                                store::static_vm::settle_recovery(db, claim, true, utc(now)?)
+                            })
+                            .unwrap_or(false)
+                    })
                 });
-            if self
-                .store
-                .transact(|db| {
-                    store::static_vm::settle_recovery(db, claim, released, utc(self.clock.now())?)
-                })
-                .is_err()
-            {
-                uncertain = true;
+            if !released {
+                uncertain |= self
+                    .store
+                    .transact(|db| {
+                        store::static_vm::settle_recovery(db, claim, false, utc(self.clock.now())?)
+                    })
+                    .is_err();
             }
             if reserved {
                 self.schedule.lock().unwrap().ordinary_owed = false;
@@ -2144,7 +2205,7 @@ impl<C: Clock> VmController<C> {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
     pub(crate) fn foreground_operation_ref(&self, principal: &str, receipt: i64) -> Result<Id> {
         self.store.transact(|db| {
             Ok(db.query_row(
@@ -2432,7 +2493,7 @@ impl<C: Clock> VmController<C> {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(crate) fn admit_static(
         &self,
@@ -2524,7 +2585,7 @@ impl<C: Clock> VmController<C> {
         }))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
     pub(crate) fn finish_static(
         &self,
         worker: &PendingOperation,
@@ -2544,6 +2605,40 @@ impl<C: Clock> VmController<C> {
             };
             store::static_vm::settle_create(db, worker.activity_id, slots, outcome, utc(clock)?)
         })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn commit_static_copy(
+        &self,
+        worker: &PendingOperation,
+        slots: PairSlots,
+        scope: store::native::Scope,
+        evidence: [ArtifactEvidence; 2],
+        current: impl Fn() -> bool,
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let live = || current() && self.clock.now().monotonic < worker.deadline;
+            ensure!(
+                live() && scope.generation == slots.disk.generation,
+                "static copy retired"
+            );
+            let now = utc(self.clock.now())?;
+            ensure!(
+                store::static_vm::settle_create(db, worker.activity_id, slots, Ok(evidence), now)?
+                    == Status::Succeeded,
+                "static copy did not verify"
+            );
+            store::static_vm::native::bind(db, scope)?;
+            ensure!(live(), "static copy retired");
+            Ok(())
+        })
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn static_run_lost(&self, vm: Id) -> Result<()> {
+        self.store
+            .transact(|db| store::static_vm::native::runtime_lost(db, vm, utc(self.clock.now())?))
     }
 
     /// The committed pair of an owned, stopped TEST VM, for a fresh identity
