@@ -208,26 +208,48 @@ impl Settings {
         ordinary: &[&Path],
         expected: Option<ConfigStamp>,
     ) -> anyhow::Result<(Self, ConfigStamp)> {
-        Self::vetted_pass(path, uid, ordinary, expected)
+        Self::vetted_layout(path, None, uid, ordinary, expected)
             .map(|(settings, stamp, _)| (settings, stamp))
     }
 
     /// `vetted`, also returning the pinned component handles so a caller can
     /// bind the observed file and directory identities to its own descriptors.
-    fn vetted_pass(
+    /// With `staged`, the configuration is an unnamed (`O_TMPFILE`) file that
+    /// will be linked at `path`. It is adopted at that position instead of
+    /// being opened by name, must have no link yet, and is read from its
+    /// current offset. Every other check is the same.
+    fn vetted_layout(
         path: &Path,
+        staged: Option<File>,
         uid: u32,
         ordinary: &[&Path],
         expected: Option<ConfigStamp>,
     ) -> anyhow::Result<(Self, ConfigStamp, LayoutPass)> {
         let mut pass = LayoutPass::new()?;
-        if !pass.open(path, true)? {
-            return Err(refusal());
-        }
+        let links = match staged {
+            None => {
+                if !pass.open(path, true)? {
+                    return Err(refusal());
+                }
+                1
+            }
+            Some(file) => {
+                let parent = path.parent().ok_or_else(refusal)?;
+                if !pass.open(parent, false)?
+                    || !pass.0[parent].1.is_dir()
+                    || pass.0.contains_key(path)
+                {
+                    return Err(refusal());
+                }
+                let metadata = file.metadata().map_err(|_| refusal())?;
+                pass.0.insert(path.to_path_buf(), (file, metadata));
+                0
+            }
+        };
         let (file, metadata) = &pass.0[path];
         if uid == 0
             || !metadata.is_file()
-            || metadata.nlink() != 1
+            || metadata.nlink() != links
             || metadata.uid() != uid
             || metadata.mode() & 0o077 != 0
         {

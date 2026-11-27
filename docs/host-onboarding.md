@@ -194,9 +194,27 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`):
       - the complete layout passes the runtime's own loader
         (`Settings::vetted`) with the installed service roots as ordinary
         roots: directory owners and modes as in step b, no symlinks, disjoint
-        objects. A founder file gets a fresh random cluster ID.
+        objects. A founder file gets a fresh random cluster ID;
+      - the output directory (`/etc/arxcovo-cluster`, `root:root 0755` in
+        step b) is owned by root and writable by nobody else, sticky or not.
+        Its ancestors are owned by root or `arxd-cluster` and are not
+        writable by others unless root-owned and sticky. The command walks
+        them without following symlinks before it creates anything;
+      - `arxd-cluster` can search every directory leading to the file, to
+        each private directory and to the control directory. The operator
+        can search every directory leading to the control directory. Root
+        could open a layout that these accounts cannot reach, so the
+        command checks their owner, group and other search bits itself.
+        Step b grants this through the `0755` parents and the `2710` control
+        directory.
 
-      It then publishes the file atomically as `arxd-cluster`, mode `0600`.
+      It then writes the content as an unnamed file in the output directory
+      (Linux `O_TMPFILE`, available on ext4, XFS, Btrfs and tmpfs), owned by
+      `arxd-cluster` with mode `0600`. It checks that file with the runtime
+      loader, then links it once at the final name. The link never replaces
+      an existing file. A refusal before the link leaves nothing behind. On
+      a filesystem without `O_TMPFILE` the command refuses with
+      `cluster-config-io`.
       Refusals print `arxd: <token>` with a fixed exit code:
       `cluster-config-argument`, `cluster-config-account`,
       `cluster-config-address` and `cluster-config-layout` exit 3;

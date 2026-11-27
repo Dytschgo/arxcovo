@@ -36,14 +36,35 @@ impl Fixture {
             ("pki/custody", 0o700),
             ("history", 0o700),
             ("control", 0o2710),
-            ("config", 0o700),
         ] {
             let dir = fixture.path(name);
             std::fs::create_dir(&dir).unwrap();
             fixture.qualify(&dir, mode);
         }
-        fixture.qualify(fixture.root.path(), 0o700);
+        // The output directory belongs to the publishing caller and is
+        // searchable by the daemon; the root lets the operator's control
+        // group reach the control directory.
+        std::fs::create_dir(fixture.path("config")).unwrap();
+        fixture.chmod("config", 0o711);
+        fixture.qualify(fixture.root.path(), 0o710);
         fixture
+    }
+
+    fn chmod(&self, name: &str, mode: u32) {
+        std::fs::set_permissions(self.path(name), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn access(&self) -> Access {
+        Access {
+            daemon: Identity {
+                uid: self.uid,
+                groups: vec![self.gid],
+            },
+            owner: Identity {
+                uid: self.ids().owner_uid,
+                groups: vec![self.gid],
+            },
+        }
     }
 
     fn qualify(&self, path: &Path, mode: u32) {
@@ -90,8 +111,10 @@ impl Fixture {
         }
     }
 
-    fn vet(&self) -> impl Fn(&Path) -> Option<Vetted> + '_ {
-        move |path: &Path| vetted_objects(path, self.uid, &[])
+    fn vet(&self) -> impl Fn(&Path, Option<&File>) -> Option<Vetted> + '_ {
+        move |path: &Path, staged: Option<&File>| {
+            vetted_objects(path, staged, self.uid, &[], &self.access())
+        }
     }
 
     fn entries(&self, name: &str) -> Vec<String> {
@@ -172,17 +195,26 @@ fn refused_layouts_publish_nothing() {
     let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
     let out = fixture.path("config/cluster.json");
     let mut seen = Vec::new();
-    let refused = write_private(&out, &bytes, (fixture.uid, fixture.gid), |path: &Path| {
-        // The temporary file is complete and private when it is vetted.
-        let metadata = std::fs::symlink_metadata(path).unwrap();
-        assert_eq!(metadata.mode() & 0o7777, 0o600);
-        assert_eq!(std::fs::read(path).unwrap(), bytes);
-        seen.push(path.to_path_buf());
-        None
-    });
+    let refused = write_private(
+        &out,
+        &bytes,
+        (fixture.uid, fixture.gid),
+        |path: &Path, staged: Option<&File>| {
+            // The staged file is complete, private and unnamed when vetted.
+            let file = staged.expect("the first check sees the staged file");
+            let metadata = file.metadata().unwrap();
+            assert_eq!(metadata.mode() & 0o7777, 0o600);
+            assert_eq!(metadata.nlink(), 0);
+            assert_eq!((metadata.uid(), metadata.gid()), (fixture.uid, fixture.gid));
+            let mut content = vec![0; bytes.len()];
+            std::os::unix::fs::FileExt::read_exact_at(file, &mut content, 0).unwrap();
+            assert_eq!(content, bytes);
+            seen.push(path.to_path_buf());
+            None
+        },
+    );
     assert_eq!(refused, Err(InstallError::Layout));
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].parent(), out.parent());
+    assert_eq!(seen, std::slice::from_ref(&out));
     assert!(fixture.entries("config").is_empty());
     // A group-readable private directory fails the runtime loader.
     fixture.qualify(&fixture.path("state"), 0o750);
@@ -243,14 +275,16 @@ fn a_published_file_that_fails_its_final_vet_is_removed() {
     let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
     let out = fixture.path("config/cluster.json");
     let calls = std::cell::Cell::new(0);
-    let result = write_private(&out, &bytes, (fixture.uid, fixture.gid), |path: &Path| {
-        calls.set(calls.get() + 1);
-        if path == out {
-            None
-        } else {
-            vetted_objects(path, fixture.uid, &[])
-        }
-    });
+    let access = fixture.access();
+    let result = write_private(
+        &out,
+        &bytes,
+        (fixture.uid, fixture.gid),
+        |path: &Path, staged: Option<&File>| {
+            calls.set(calls.get() + 1);
+            staged.and_then(|_| vetted_objects(path, staged, fixture.uid, &[], &access))
+        },
+    );
     assert_eq!(result, Err(InstallError::Layout));
     assert_eq!(calls.get(), 2);
     assert!(fixture.entries("config").is_empty());
@@ -274,20 +308,32 @@ fn layout_checks_must_observe_the_created_file_and_qualified_directory() {
             parent: (v.parent.0, v.parent.1 ^ 1),
         },
     ];
+    let access = fixture.access();
     for forged in forgeries {
-        let result = write_private(&out, &bytes, (fixture.uid, fixture.gid), |path: &Path| {
-            vetted_objects(path, fixture.uid, &[]).map(forged)
-        });
+        let result = write_private(
+            &out,
+            &bytes,
+            (fixture.uid, fixture.gid),
+            |path: &Path, staged: Option<&File>| {
+                vetted_objects(path, staged, fixture.uid, &[], &access).map(forged)
+            },
+        );
         assert_eq!(result, Err(InstallError::Layout));
         assert!(fixture.entries("config").is_empty());
     }
-    // The genuine identities are exactly the created file and its directory.
+    // The genuine identities are exactly the staged inode, which is the
+    // published file, and the qualified directory.
     let mut observed = Vec::new();
-    write_private(&out, &bytes, (fixture.uid, fixture.gid), |path: &Path| {
-        let vetted = vetted_objects(path, fixture.uid, &[]);
-        observed.push(vetted);
-        vetted
-    })
+    write_private(
+        &out,
+        &bytes,
+        (fixture.uid, fixture.gid),
+        |path: &Path, staged: Option<&File>| {
+            let vetted = vetted_objects(path, staged, fixture.uid, &[], &access);
+            observed.push(vetted);
+            vetted
+        },
+    )
     .unwrap();
     let file = std::fs::symlink_metadata(&out).unwrap();
     let dir = std::fs::symlink_metadata(fixture.path("config")).unwrap();
@@ -303,7 +349,8 @@ fn every_ancestor_is_qualified_before_anything_is_created() {
     let fixture = Fixture::new();
     let r = fixture.request(Role::Founder);
     let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
-    let never = |_: &Path| -> Option<Vetted> { panic!("nothing is created or vetted") };
+    let never =
+        |_: &Path, _: Option<&File>| -> Option<Vetted> { panic!("nothing is created or vetted") };
     // A symlink above the immediate parent is refused during the walk.
     std::fs::create_dir(fixture.path("real")).unwrap();
     fixture.qualify(&fixture.path("real"), 0o700);
@@ -332,7 +379,7 @@ fn every_ancestor_is_qualified_before_anything_is_created() {
             ),
             Err(InstallError::Layout)
         );
-        fixture.qualify(fixture.root.path(), 0o700);
+        fixture.qualify(fixture.root.path(), 0o710);
         assert!(fixture.entries("config").is_empty());
     }
     // An ancestor owned by another account is refused.
@@ -366,6 +413,187 @@ fn every_ancestor_is_qualified_before_anything_is_created() {
         ),
         Err(InstallError::Argument)
     );
+}
+
+#[test]
+fn output_directory_is_caller_owned_and_writable_by_nobody_else() {
+    let fixture = Fixture::new();
+    let r = fixture.request(Role::Founder);
+    let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
+    let out = fixture.path("config/cluster.json");
+    let never =
+        |_: &Path, _: Option<&File>| -> Option<Vetted> { panic!("nothing is staged or vetted") };
+    // Group- or world-writable output directories, sticky or not, would let
+    // another writer change names during publication or rollback.
+    for mode in [0o731, 0o713, 0o1733, 0o1777] {
+        fixture.chmod("config", mode);
+        assert_eq!(
+            write_private(&out, &bytes, (fixture.uid, fixture.gid), never),
+            Err(InstallError::Layout),
+            "{mode:o}"
+        );
+        assert!(fixture.entries("config").is_empty());
+    }
+    fixture.chmod("config", 0o711);
+    // SAFETY: geteuid takes no pointers.
+    if unsafe { libc::geteuid() } == 0 {
+        // A daemon-owned output directory is refused.
+        let config = fixture.path("config");
+        std::os::unix::fs::chown(&config, Some(fixture.uid), Some(fixture.gid)).unwrap();
+        assert_eq!(
+            write_private(&out, &bytes, (fixture.uid, fixture.gid), never),
+            Err(InstallError::Layout)
+        );
+        std::os::unix::fs::chown(&config, Some(0), Some(0)).unwrap();
+        assert!(fixture.entries("config").is_empty());
+    }
+}
+
+#[test]
+fn a_destination_created_before_the_link_is_never_replaced() {
+    let fixture = Fixture::new();
+    let r = fixture.request(Role::Founder);
+    let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
+    let out = fixture.path("config/cluster.json");
+    let access = fixture.access();
+    // The name appears after the early existence check and after the staged
+    // file passed its checks: linkat refuses with EEXIST.
+    let result = write_private(
+        &out,
+        &bytes,
+        (fixture.uid, fixture.gid),
+        |path: &Path, staged: Option<&File>| {
+            let vetted = vetted_objects(path, staged, fixture.uid, &[], &access);
+            assert!(vetted.is_some());
+            std::fs::write(&out, b"planted").unwrap();
+            vetted
+        },
+    );
+    assert_eq!(result, Err(InstallError::Exists));
+    assert_eq!(std::fs::read(&out).unwrap(), b"planted");
+    assert_eq!(fixture.entries("config"), ["cluster.json"]);
+}
+
+#[test]
+fn search_permission_uses_owner_group_and_other_bits() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("d");
+    std::fs::create_dir(&dir).unwrap();
+    // SAFETY: geteuid takes no pointers.
+    if unsafe { libc::geteuid() } == 0 {
+        // Root bypasses the bits; give the directory an ordinary owner.
+        std::os::unix::fs::chown(&dir, Some(65534), Some(65534)).unwrap();
+    }
+    let probe = |mode: u32| {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        std::fs::symlink_metadata(&dir).unwrap()
+    };
+    let metadata = probe(0o700);
+    let stranger_uid = if metadata.uid() == u32::MAX - 1 {
+        u32::MAX - 2
+    } else {
+        u32::MAX - 1
+    };
+    let owner = Identity {
+        uid: metadata.uid(),
+        groups: vec![],
+    };
+    let member = Identity {
+        uid: stranger_uid,
+        groups: vec![metadata.gid()],
+    };
+    let other = Identity {
+        uid: stranger_uid,
+        groups: vec![],
+    };
+    let root_identity = Identity {
+        uid: 0,
+        groups: vec![],
+    };
+    for (mode, by_owner, by_member, by_other) in [
+        (0o700, true, false, false),
+        (0o710, true, true, false),
+        (0o701, true, false, true),
+        (0o711, true, true, true),
+        // POSIX picks the owner class first, then the group class.
+        (0o071, false, true, true),
+        (0o601, false, false, true),
+        (0o000, false, false, false),
+    ] {
+        let metadata = probe(mode);
+        assert_eq!(owner.searches(&metadata), by_owner, "{mode:o}");
+        assert_eq!(member.searches(&metadata), by_member, "{mode:o}");
+        assert_eq!(other.searches(&metadata), by_other, "{mode:o}");
+        assert!(root_identity.searches(&metadata));
+    }
+    probe(0o700);
+    let file = root.path().join("f");
+    std::fs::write(&file, b"").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o711)).unwrap();
+    let file = std::fs::symlink_metadata(&file).unwrap();
+    assert!(!owner.searches(&file));
+    assert!(!root_identity.searches(&file));
+}
+
+#[test]
+fn runtime_identities_must_search_every_directory_they_traverse() {
+    let fixture = Fixture::new();
+    let r = fixture.request(Role::Founder);
+    let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
+    let out = fixture.path("config/cluster.json");
+    // The operator cannot reach the control directory through a 0700
+    // ancestor that root publication itself could open.
+    fixture.qualify(fixture.root.path(), 0o700);
+    assert_eq!(
+        write_private(&out, &bytes, (fixture.uid, fixture.gid), fixture.vet()),
+        Err(InstallError::Layout)
+    );
+    assert!(fixture.entries("config").is_empty());
+    fixture.qualify(fixture.root.path(), 0o710);
+    write_private(&out, &bytes, (fixture.uid, fixture.gid), fixture.vet()).unwrap();
+    let check = || Settings::vetted_layout(&out, None, fixture.uid, &[], None).unwrap();
+    let (settings, _, pass) = check();
+    assert!(fixture.access().permits(&pass, &settings, &out));
+    // The configuration path: an identity that reaches the fixture root
+    // through its group cannot pass a 0700 output directory it does not own.
+    let stranger_uid = if fixture.uid == u32::MAX - 1 {
+        u32::MAX - 2
+    } else {
+        u32::MAX - 1
+    };
+    let stranger = Identity {
+        uid: stranger_uid,
+        groups: vec![],
+    };
+    let member = Identity {
+        uid: stranger_uid,
+        groups: vec![fixture.gid],
+    };
+    assert!(chain_searchable(&pass, &out, false, &member));
+    assert!(!chain_searchable(&pass, &out, false, &stranger));
+    fixture.chmod("config", 0o700);
+    let (settings, _, pass) = check();
+    assert!(!chain_searchable(&pass, &out, false, &member));
+    // SAFETY: geteuid takes no pointers.
+    if unsafe { libc::geteuid() } == 0 {
+        // A root-owned 0700 output directory: the daemon cannot open the file.
+        let (settings, _, pass) = check();
+        assert!(!fixture.access().permits(&pass, &settings, &out));
+    }
+    // Private directories and the control directory count for the daemon,
+    // and the control directory for the operator.
+    let blocked = Access {
+        daemon: stranger.clone(),
+        owner: fixture.access().owner,
+    };
+    assert!(!blocked.permits(&pass, &settings, &out));
+    let blocked = Access {
+        daemon: fixture.access().daemon,
+        owner: stranger,
+    };
+    fixture.chmod("config", 0o711);
+    let (settings, _, pass) = check();
+    assert!(!blocked.permits(&pass, &settings, &out));
 }
 
 /// A minimal POSIX ACL xattr: version 2 with user, group and other entries.

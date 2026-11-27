@@ -266,6 +266,12 @@ impl Roles {
     }
 }
 
+/// Current primary and supplementary groups of a local account, for owner
+/// publication's effective search-permission check.
+pub(super) fn account_groups(uid: u32) -> Option<Vec<u32>> {
+    groups(uid).ok()
+}
+
 fn groups(uid: u32) -> Result<Vec<libc::gid_t>, Failure> {
     let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
     let mut result = std::ptr::null_mut();

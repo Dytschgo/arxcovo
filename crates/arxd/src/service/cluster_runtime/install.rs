@@ -3,9 +3,10 @@
 //! Root only. The bytes must pass the runtime's own schema, endpoint, role and
 //! route checks, the owner-socket route must pass the ADR 0046 owner, mode and
 //! ACL policy, and the complete layout must pass `Settings::vetted` with the
-//! installed service roots as ordinary roots, before a non-replacing atomic
-//! publication bound to the qualified directory and file descriptors. A
-//! refusal leaves no new file behind.
+//! installed service roots as ordinary roots, and the daemon and operator must
+//! be able to search every directory they traverse at run time. The content
+//! is staged as an unnamed file in a caller-owned directory and published
+//! once with a non-replacing link. A refusal leaves no new file behind.
 use super::{Route, Settings, cluster_owner, covers, interfaces, object};
 use crate::cluster::consensus::activation::peer_endpoint;
 use crate::service::{
@@ -17,7 +18,7 @@ use crate::service::{
 use std::{
     ffi::CString,
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Seek, Write},
     net::IpAddr,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -45,6 +46,17 @@ pub(in crate::service) fn publish(request: &Request, layout: &Layout) -> Result<
         return Err(InstallError::Address);
     }
     socket_route(&settings)?;
+    let groups = |uid| cluster_owner::account_groups(uid).ok_or(InstallError::Account);
+    let access = Access {
+        daemon: Identity {
+            uid: ids.daemon_uid,
+            groups: groups(ids.daemon_uid)?,
+        },
+        owner: Identity {
+            uid: ids.owner_uid,
+            groups: groups(ids.owner_uid)?,
+        },
+    };
     // The same ordinary roots `Child::spawn` uses, except the service
     // workspace, which `service configure` checks once it names this file.
     let mut ordinary = layout
@@ -58,7 +70,7 @@ pub(in crate::service) fn publish(request: &Request, layout: &Layout) -> Result<
         Path::new(&request.out),
         &bytes,
         (ids.daemon_uid, ids.daemon_gid),
-        |path| vetted_objects(path, ids.daemon_uid, &ordinary),
+        |path, staged| vetted_objects(path, staged, ids.daemon_uid, &ordinary, &access),
     )?;
     Ok(ids.daemon_uid)
 }
@@ -209,9 +221,100 @@ struct Vetted {
     parent: Object,
 }
 
-/// Runs the runtime loader on `path` and reports the identities it pinned.
-fn vetted_objects(path: &Path, uid: u32, ordinary: &[&Path]) -> Option<Vetted> {
-    let (_, _, pass) = Settings::vetted_pass(path, uid, ordinary, None).ok()?;
+/// A runtime identity: a UID with its current primary and supplementary GIDs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Identity {
+    uid: u32,
+    groups: Vec<u32>,
+}
+
+impl Identity {
+    /// Effective POSIX search permission on a directory from its owner, group
+    /// and other bits. Root publication bypasses these bits, so they are
+    /// checked for the identity that must traverse the path at run time.
+    fn searches(&self, metadata: &std::fs::Metadata) -> bool {
+        let bit = if self.uid == 0 {
+            return metadata.is_dir();
+        } else if metadata.uid() == self.uid {
+            0o100
+        } else if self.groups.contains(&metadata.gid()) {
+            0o010
+        } else {
+            0o001
+        };
+        metadata.is_dir() && metadata.mode() & bit != 0
+    }
+}
+
+/// Every pinned component from `/` down to `path`'s parent, and `path`
+/// itself when `inclusive`, is searchable by `who`.
+fn chain_searchable(
+    pass: &super::LayoutPass,
+    path: &Path,
+    inclusive: bool,
+    who: &Identity,
+) -> bool {
+    let start = if inclusive { Some(path) } else { path.parent() };
+    start.is_some_and(|dir| {
+        dir.ancestors().all(|component| {
+            pass.0
+                .get(component)
+                .is_some_and(|(_, metadata)| who.searches(metadata))
+        })
+    })
+}
+
+/// The runtime identities whose access the layout must grant.
+struct Access {
+    daemon: Identity,
+    owner: Identity,
+}
+
+impl Access {
+    /// The daemon reaches the configuration file, every private directory and
+    /// the control directory; the operator reaches the control directory.
+    fn permits(&self, pass: &super::LayoutPass, settings: &Settings, config: &Path) -> bool {
+        let Some(control) = settings.owner_socket.parent() else {
+            return false;
+        };
+        chain_searchable(pass, config, false, &self.daemon)
+            && [
+                &settings.workspace,
+                &settings.state,
+                &settings.credentials,
+                &settings.wrap,
+                &settings.custody,
+                &settings.history,
+            ]
+            .iter()
+            .all(|dir| chain_searchable(pass, dir, true, &self.daemon))
+            && chain_searchable(pass, control, true, &self.daemon)
+            && chain_searchable(pass, control, true, &self.owner)
+    }
+}
+
+/// Runs the runtime loader on `path` (or on the unnamed `staged` file adopted
+/// at `path`), requires the runtime identities' access, and reports the
+/// identities the loader pinned.
+fn vetted_objects(
+    path: &Path,
+    staged: Option<&File>,
+    uid: u32,
+    ordinary: &[&Path],
+    access: &Access,
+) -> Option<Vetted> {
+    let staged = match staged {
+        Some(file) => {
+            let mut reader = file.try_clone().ok()?;
+            reader.rewind().ok()?;
+            Some(reader)
+        }
+        None => None,
+    };
+    let (settings, _, pass) = Settings::vetted_layout(path, staged, uid, ordinary, None).ok()?;
+    if !access.permits(&pass, &settings, path) {
+        return None;
+    }
     Some(Vetted {
         file: object(&pass.0.get(path)?.1),
         parent: object(&pass.0.get(path.parent()?)?.1),
@@ -260,17 +363,9 @@ fn entry(dir: &File, name: &CString) -> Result<Option<Object>, InstallError> {
     Ok(Some((stat.st_dev, stat.st_ino)))
 }
 
-/// Removes `name` from `dir` only while it is still `expected`.
-fn remove_if(dir: &File, name: &CString, expected: Object) {
-    if entry(dir, name).ok().flatten() == Some(expected) {
-        // SAFETY: dir is live and name is a single NUL-terminated component.
-        unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
-    }
-}
-
-/// One directory component: owned by root or the daemon, and not writable by
+/// An ancestor component: owned by root or the daemon, and not writable by
 /// group or others unless root-owned and sticky (the native startup rule).
-fn qualify_directory(dir: &File, daemon: u32) -> Result<(), InstallError> {
+fn qualify_ancestor(dir: &File, daemon: u32) -> Result<(), InstallError> {
     let metadata = dir.metadata().map_err(|_| InstallError::Layout)?;
     let mode = metadata.mode();
     if !metadata.is_dir()
@@ -282,9 +377,21 @@ fn qualify_directory(dir: &File, daemon: u32) -> Result<(), InstallError> {
     Ok(())
 }
 
+/// The output directory: owned by the publishing caller (root in production)
+/// and writable by nobody else, with no sticky exception. Only the caller can
+/// then create, rename or remove names in it, so the single link and any
+/// rollback cannot race another writer.
+fn qualify_parent(dir: &File, caller: u32) -> Result<(), InstallError> {
+    let metadata = dir.metadata().map_err(|_| InstallError::Layout)?;
+    if !metadata.is_dir() || metadata.uid() != caller || metadata.mode() & 0o022 != 0 {
+        return Err(InstallError::Layout);
+    }
+    Ok(())
+}
+
 /// Opens `parent` one component at a time from `/`, never following a
 /// symlink, and qualifies every component before anything is created.
-fn open_parent(parent: &Path, daemon: u32) -> Result<File, InstallError> {
+fn open_parent(parent: &Path, daemon: u32, caller: u32) -> Result<File, InstallError> {
     let mut components = parent.components();
     if components.next() != Some(Component::RootDir) {
         return Err(InstallError::Argument);
@@ -296,20 +403,20 @@ fn open_parent(parent: &Path, daemon: u32) -> Result<File, InstallError> {
         })
         .collect::<Option<Vec<_>>>()
         .ok_or(InstallError::Argument)?;
+    if names.is_empty() {
+        return Err(InstallError::Argument);
+    }
     let mut dir = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")
         .map_err(|_| InstallError::Layout)?;
-    qualify_directory(&dir, daemon)?;
+    qualify_ancestor(&dir, daemon)?;
     for (index, name) in names.iter().enumerate() {
-        // Intermediate components are path handles; the final directory is
-        // opened for reading so it can be synced after publication.
-        let access = if index + 1 == names.len() {
-            libc::O_RDONLY
-        } else {
-            libc::O_PATH
-        };
+        let last = index + 1 == names.len();
+        // Intermediate components are path handles; the output directory is
+        // opened for reading so it can stage, link and sync.
+        let access = if last { libc::O_RDONLY } else { libc::O_PATH };
         // SAFETY: dir is a live directory descriptor and name is one
         // NUL-terminated component. The returned descriptor is owned.
         let fd = unsafe {
@@ -324,65 +431,57 @@ fn open_parent(parent: &Path, daemon: u32) -> Result<File, InstallError> {
         }
         // SAFETY: openat succeeded and returned a new descriptor.
         dir = unsafe { File::from_raw_fd(fd) };
-        qualify_directory(&dir, daemon)?;
+        if last {
+            qualify_parent(&dir, caller)?;
+        } else {
+            qualify_ancestor(&dir, daemon)?;
+        }
     }
     Ok(dir)
 }
 
 /// Creates `out` with mode 0600 owned by `owner`, never replacing an entry.
 ///
-/// The parent is walked and qualified before anything is created. Its
-/// descriptor and the created file's descriptor stay open throughout. `vet`
-/// runs on the complete temporary file, then on the published name, and must
-/// report exactly those two descriptors' identities each time. Rename and
-/// rollback act through the qualified directory descriptor, and rollback
-/// removes a name only while it still refers to the created file.
+/// The parent is walked and qualified before anything is created, and only
+/// the caller can change names in it. The content is staged as an unnamed
+/// `O_TMPFILE` inode in that directory, so no temporary name ever exists.
+/// `vet` first checks the staged file adopted at `out`, then the published
+/// name, and must report exactly the staged file's and the directory
+/// descriptor's identities each time. A single `linkat` through
+/// `/proc/self/fd` publishes that inode and fails with `EEXIST` rather than
+/// replace anything. A failure before the link leaves nothing to remove.
 fn write_private(
     out: &Path,
     bytes: &[u8],
     owner: (u32, u32),
-    mut vet: impl FnMut(&Path) -> Option<Vetted>,
+    mut vet: impl FnMut(&Path, Option<&File>) -> Option<Vetted>,
 ) -> Result<(), InstallError> {
     let parent = out.parent().ok_or(InstallError::Argument)?;
     let name = CString::new(out.file_name().ok_or(InstallError::Argument)?.as_bytes())
         .map_err(|_| InstallError::Argument)?;
-    let dir = open_parent(parent, owner.0)?;
+    // SAFETY: geteuid takes no pointers.
+    let caller = unsafe { libc::geteuid() };
+    let dir = open_parent(parent, owner.0, caller)?;
     let parent_object = identity(&dir)?;
     if entry(&dir, &name)?.is_some() {
         return Err(InstallError::Exists);
     }
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random).map_err(|_| InstallError::Io)?;
-    let temporary = format!(".arxd-cluster-config.{:016x}", u64::from_be_bytes(random));
-    let temporary_name = CString::new(temporary.as_bytes()).map_err(|_| InstallError::Io)?;
-    // SAFETY: dir is live and temporary_name is one NUL-terminated component.
+    // SAFETY: dir is live and "." names that directory.
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
-            temporary_name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            c".".as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
             0o600 as libc::c_uint,
         )
     };
     if fd == -1 {
+        // No O_TMPFILE support on this filesystem: refuse rather than stage
+        // under a mutable name.
         return Err(InstallError::Io);
     }
     // SAFETY: openat returned a new descriptor owned here.
     let mut file = unsafe { File::from_raw_fd(fd) };
-    let file_object = match identity(&file) {
-        Ok(object) => object,
-        Err(error) => {
-            // SAFETY: O_CREAT|O_EXCL just created this name in dir.
-            unsafe { libc::unlinkat(dir.as_raw_fd(), temporary_name.as_ptr(), 0) };
-            return Err(error);
-        }
-    };
-    let mut guard = Temporary {
-        dir: &dir,
-        name: &temporary_name,
-        object: file_object,
-        armed: true,
-    };
     file.write_all(bytes).map_err(|_| InstallError::Io)?;
     // SAFETY: fd is the live descriptor owned by file.
     if unsafe { libc::fchown(fd, owner.0, owner.1) } != 0 || unsafe { libc::fchmod(fd, 0o600) } != 0
@@ -391,21 +490,22 @@ fn write_private(
     }
     file.sync_all().map_err(|_| InstallError::Io)?;
     let expected = Vetted {
-        file: file_object,
+        file: identity(&file)?,
         parent: parent_object,
     };
-    if vet(&parent.join(&temporary)) != Some(expected) {
+    if vet(out, Some(&file)) != Some(expected) {
         return Err(InstallError::Layout);
     }
-    // SAFETY: both names are single NUL-terminated components in dir.
+    let source = CString::new(format!("/proc/self/fd/{fd}")).map_err(|_| InstallError::Io)?;
+    // SAFETY: source names this process's live staged descriptor, dir is the
+    // qualified directory and name is one NUL-terminated component.
     let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            dir.as_raw_fd(),
-            temporary_name.as_ptr(),
+        libc::linkat(
+            libc::AT_FDCWD,
+            source.as_ptr(),
             dir.as_raw_fd(),
             name.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            libc::AT_SYMLINK_FOLLOW,
         )
     };
     if rc != 0 {
@@ -416,39 +516,23 @@ fn write_private(
             InstallError::Io
         });
     }
-    guard.armed = false;
-    drop(guard);
-    let refusal = if entry(&dir, &name)? != Some(file_object) {
-        // Another writer replaced the published name; it is not ours to remove.
-        return Err(InstallError::Io);
-    } else if dir.sync_all().is_err() {
+    let refusal = if entry(&dir, &name)? != Some(expected.file) || dir.sync_all().is_err() {
         Some(InstallError::Io)
-    } else if vet(out) != Some(expected) {
+    } else if vet(out, None) != Some(expected) {
         Some(InstallError::Layout)
     } else {
         None
     };
     if let Some(error) = refusal {
-        remove_if(&dir, &name, file_object);
+        // Only the caller can change names in the qualified directory, so the
+        // name still refers to the linked file when it is removed.
+        if entry(&dir, &name).ok().flatten() == Some(expected.file) {
+            // SAFETY: dir is live and name is a single NUL-terminated component.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+        }
         return Err(error);
     }
-    drop(file);
     Ok(())
-}
-
-struct Temporary<'a> {
-    dir: &'a File,
-    name: &'a CString,
-    object: Object,
-    armed: bool,
-}
-
-impl Drop for Temporary<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            remove_if(self.dir, self.name, self.object);
-        }
-    }
 }
 
 #[cfg(test)]
