@@ -1513,6 +1513,128 @@ fn docker_collector_requires_the_held_port_and_the_suspended_child_as_listener()
     }
 }
 
+fn mailbox_request() -> CaptureRequest<'static> {
+    CaptureRequest {
+        run: [61; 16],
+        boot: [62; 16],
+        generation: 1,
+        nonce: [63; 16],
+        route: fixture_route().into(),
+        topology: [64; 32],
+        policy: [65; 32],
+        origin_port: 43112,
+        targets: &[],
+        issued_ms: 10,
+        cutoff_ms: 5000,
+    }
+}
+
+fn publish_mailbox_frame(path: &LocalPath, name: &str, bytes: &[u8]) {
+    let staging = path.join("observer.tmp").unwrap();
+    let destination = path.join(name).unwrap();
+    std::fs::write(staging.as_str(), bytes).unwrap();
+    std::fs::rename(staging.as_str(), destination.as_str()).unwrap();
+}
+
+fn arm_mailbox(
+    mailbox: &mut trial::capture_mailbox::Mailbox,
+    path: &LocalPath,
+    request: &CaptureRequest<'_>,
+) -> Hash {
+    use trial::Capture;
+
+    let encoded = serde_json::to_vec(request).unwrap();
+    let signature = request.fixture_sign(b"armed", &[], false);
+    let mut reply = Some(&signature);
+    let armed = mailbox
+        .arm(request, &mut || {
+            if let Some(reply) = reply.take() {
+                let actual = std::fs::read(path.join("request.json").unwrap().as_str()).unwrap();
+                assert_eq!(actual, encoded);
+                publish_mailbox_frame(path, "armed.sig", reply);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(armed, signature);
+    digest(&encoded)
+}
+
+#[test]
+fn capture_mailbox_fixture_round_trips_the_started_record_and_signed_frame() {
+    use trial::Capture;
+    use trial::capture_mailbox::Mailbox;
+
+    crate::service::windows::set_current_token_owner().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, path) = private_dir(dir.path(), "receiver-mailbox");
+    let origin = boot::uptime();
+    let mut mailbox = Mailbox::open(&path, sid(&owner), &[], origin, Shutdown::default()).unwrap();
+    let request = mailbox_request();
+    let challenge = arm_mailbox(&mut mailbox, &path, &request);
+
+    let start = request.issued_ms + 1;
+    let cutoff = request.cutoff_ms;
+    let body = br#"{"fixture":"complete"}"#;
+    let mut frame = request.fixture_sign(b"completed", body, false);
+    frame.extend_from_slice(body);
+    let mut reply = Some(&frame);
+
+    // The synchronous liveness hook can model the observer as soon as the
+    // mailbox publishes started.json, with no scheduling or polling delay.
+    let received = mailbox
+        .fixture(&request, start..cutoff, &mut || {
+            if let Some(reply) = reply.take() {
+                let started = std::fs::read(path.join("started.json").unwrap().as_str()).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&started).unwrap(),
+                    serde_json::json!({
+                        "request_sha256": challenge,
+                        "origin_uptime_ms": origin,
+                        "window_start_ms": start,
+                        "cutoff_ms": cutoff
+                    })
+                );
+                publish_mailbox_frame(&path, "capture.bin", reply);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(received, frame);
+}
+
+#[test]
+fn capture_mailbox_fixture_refuses_a_foreign_challenge_or_invalid_window() {
+    use trial::Capture;
+    use trial::capture_mailbox::Mailbox;
+
+    crate::service::windows::set_current_token_owner().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let request = mailbox_request();
+    let foreign = CaptureRequest {
+        nonce: [66; 16],
+        ..request
+    };
+    let start = request.issued_ms;
+    let cutoff = request.cutoff_ms;
+    for (name, challenge, window) in [
+        ("foreign", &foreign, start..cutoff),
+        ("before-issue", &request, (start - 1)..cutoff),
+        ("wrong-cutoff", &request, start..(cutoff - 1)),
+    ] {
+        let (owner, path) = private_dir(dir.path(), name);
+        let mut mailbox =
+            Mailbox::open(&path, sid(&owner), &[], boot::uptime(), Shutdown::default()).unwrap();
+        arm_mailbox(&mut mailbox, &path, &request);
+        assert_eq!(
+            mailbox.fixture(challenge, window, &mut || panic!("polled after {name}")),
+            Err(NativeRefusal::NetworkFenceUnverified),
+            "{name}"
+        );
+        assert!(!std::path::Path::new(path.join("started.json").unwrap().as_str()).exists());
+    }
+}
+
 #[test]
 fn docker_receiver_mailbox_exchanges_private_bounded_frames() {
     use trial::Capture;

@@ -400,6 +400,10 @@ pub(crate) struct PrivateRoutes {
 }
 
 impl PrivateRoutes {
+    pub(crate) fn targets(&self) -> &[arx_guest::compose::routing::RouteTarget] {
+        &self.routes
+    }
+
     #[cfg(any(test, all(windows, target_arch = "x86_64")))]
     pub(crate) fn applies_to(&self, vm: Id) -> bool {
         self.vm == vm

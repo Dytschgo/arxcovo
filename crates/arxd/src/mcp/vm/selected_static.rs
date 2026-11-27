@@ -29,11 +29,10 @@ impl SelectedStatic {
         Ok(Self(Source::Native(Arc::new(dossier))))
     }
 
-    pub(super) fn refusal(&self, supervisor: &Supervisor) -> Option<NativeRefusal> {
-        let _ = supervisor;
+    pub(super) fn refusal(&self, _supervisor: &Supervisor) -> Option<NativeRefusal> {
         match self.0 {
             #[cfg(all(windows, target_arch = "x86_64"))]
-            Source::Native(ref dossier) => Self::runtime_current(dossier, supervisor).err(),
+            Source::Native(ref dossier) => Self::runtime_current(dossier, _supervisor).err(),
             #[cfg(test)]
             Source::Fixture(ref fixture) => (!fixture.network_live.load(Ordering::Acquire))
                 .then_some(NativeRefusal::NetworkFenceUnverified),
