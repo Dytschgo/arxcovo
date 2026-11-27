@@ -515,14 +515,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
     }
 
     pub async fn status(&mut self, cancel: &Shutdown) -> Result<RunStatus, ChannelError> {
-        if self.installer.is_some() {
+        if self.started && self.installer.is_some() {
             return Err(ChannelError::Unexpected);
         }
+        let mut events = self.installer.take().unwrap_or_default();
+        let deadline = setup_deadline(events.installer.as_ref().map(|installer| installer.stage));
         let mut stream = self.stream.take().ok_or(ChannelError::Closed)?;
-        let status = bounded(cancel, Instant::now() + SETUP, async {
-            let result = stream
-                .command(Command::Status, &mut Events::default())
-                .await?;
+        let status = bounded(cancel, deadline, async {
+            let result = stream.command(Command::Status, &mut events).await?;
             let status: Status =
                 serde_json::from_value(result).map_err(|_| ChannelError::Invalid)?;
             if status.running != (status.status == RunStatus::Running) {
@@ -531,6 +531,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Qmp<R, W> {
             Ok(status.status)
         })
         .await?;
+        self.installer = events.installer.is_some().then_some(events);
         self.stream = Some(stream);
         Ok(status)
     }
@@ -804,6 +805,79 @@ fn empty(value: Value) -> Result<(), ChannelError> {
 mod accelerator_tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn installer_status_preserves_the_stage_for_dispatch() {
+        use crate::vm::runtime::{InstallerBudget, InstallerPhase, InstallerRecipe};
+
+        let (host, simulated) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(host);
+        let stage = InstallerBudget::start(InstallerRecipe::Ubuntu)
+            .stage(InstallerPhase::UbuntuInstall, Duration::from_secs(5))
+            .unwrap();
+        let mut qmp = Qmp {
+            stream: Some(Stream {
+                reader: BufReader::new(reader),
+                writer,
+                next_id: 1,
+                pending: Vec::new(),
+            }),
+            started: false,
+            installer: Some(Events {
+                installer: Some(InstallerEvents {
+                    stage,
+                    progress: None,
+                    stop_by: None,
+                    resets: 0,
+                    active: false,
+                }),
+                ..Events::default()
+            }),
+        };
+        let cancel = Shutdown::default();
+        tokio::join!(
+            async {
+                let mut peer = BufReader::new(simulated);
+                for (name, id, reply) in [
+                    (
+                        "query-status",
+                        1,
+                        r#"{"running":false,"status":"prelaunch"}"#,
+                    ),
+                    (
+                        "query-status",
+                        2,
+                        r#"{"running":false,"status":"prelaunch"}"#,
+                    ),
+                    ("cont", 3, "{}"),
+                ] {
+                    let mut command = String::new();
+                    peer.read_line(&mut command).await.unwrap();
+                    assert_eq!(
+                        command,
+                        format!("{{\"execute\":\"{name}\",\"id\":{id}}}\r\n")
+                    );
+                    peer.get_mut()
+                        .write_all(format!("{{\"return\":{reply},\"id\":{id}}}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            },
+            async {
+                assert_eq!(qmp.status(&cancel).await, Ok(RunStatus::Prelaunch));
+                assert_eq!(qmp.release_startup_hold(&cancel, || true).await, Ok(()));
+                assert!(
+                    qmp.installer
+                        .as_ref()
+                        .unwrap()
+                        .installer
+                        .as_ref()
+                        .unwrap()
+                        .active
+                );
+            },
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn silent_accelerator_respects_setup_deadline_and_cancellation() {

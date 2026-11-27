@@ -1,10 +1,9 @@
 # Owner runbook for static Docker qualification
 
-**Status: unverified on real hardware.** The Windows `--full-docker` entry point
-currently refuses before claiming output or starting native effects. Complete
-the read-only preparation below as needed. Run the trial command only with a
-reviewed release that wires checked native creation, live route enforcement,
-private receiver capture and the boot-bound HTTPS exchange.
+Native VM boot, Docker, public-only networking, Windows custody, persistence
+and live Cloudflare publishing are **unverified on real hardware**. Part B2g
+wires `--full-docker` to the checked Windows x64 QEMU phase host. Use the
+exact reviewed release and independent receiver procedure below.
 
 Use the [Windows host setup](dev-host-setup.md#native-qualification-runbook)
 for the non-elevated current-user/WHPX checks and the
@@ -19,13 +18,22 @@ Leave existing VMs, their hypervisor settings and the old Lab Manager untouched.
   evidence root. The workspace and evidence root must be disjoint from one
   another and from the production store. Stop the daemon for the trial. The
   production store is a read-only identity input and stays outside all guest
-  and helper arguments.
+  and helper arguments. In the private Docker enrollment, set
+  `trial_workspace.path` to an existing empty, owner-private directory
+  below the M4 recipe root on its held fixed-cap volume. Set
+  `trial_workspace.identity` to the directory pin object with numeric
+  `volume` and 16-byte `file`. Put the empty evidence directory on the
+  enrolled outer D: volume. Each run needs a fresh workspace and evidence
+  directory. The run also requires an empty private `receiver_mailbox`.
 - Verify the measured 200 GiB aggregate cap, 50 GiB D: reserve, 16 GiB RAM
   reserve and at least half the effective CPU cores available to the owner.
   Check actual free capacity for all simultaneous disks, VARS, media,
   fixtures and helpers. The static guest uses 2 vCPUs and 4 GiB RAM, with
-  a 6 GiB Job and a separate 1 GiB WHPX allowance. The diskless control
-  uses its own 2 GiB Job limit.
+  a 6 GiB single-process Job and a separate 1 GiB WHPX allowance. The
+  Docker trial uses the selected same-boot M4 TEST seal for shared baseline
+  and stock-control evidence, including the diskless control. The Docker
+  workspace peak reservation is 133 GiB for four independent pairs and
+  installer seed headroom.
 - Supply the stock 11.1.3 bundle and the reviewed E1a QEMU 11.1.3 patched
   distribution with static libslirp 4.9.7, build `11.1.3-arx-egress-2`.
   Independently verify the QEMU source archive and signature, libslirp
@@ -34,7 +42,9 @@ Leave existing VMs, their hypervisor settings and the old Lab Manager untouched.
   firmware roles including initial VARS. Obtain any omitted length or role
   pin from independently reviewed bytes before enrolling. Keep the stock
   bundle for restricted install, detached health, and stock controls. Use
-  the patched bundle only for the public-egress boots.
+  the patched bundle only for the public-egress boots. This release requires
+  byte-identical firmware code and initial VARS across the stock and patched
+  bundles so the endpoint can boot the installed copy with its paired VARS.
   [E1a receipt](../tools/qemu/public-egress-receipt.json)
 - Supply the official Ubuntu 24.04.3 live-server amd64 ISO, pinned installer
   and guest artifacts, and the reviewed Ubuntu web pool. Authenticate Ubuntu
@@ -42,8 +52,11 @@ Leave existing VMs, their hypervisor settings and the old Lab Manager untouched.
   including the Docker key fingerprint and bytes. Verify exact archives,
   versions including epochs, base-package inventory, the signed closure and
   the bounded read-only `ARXCOMPOSE` dependency medium.
-- Provide a disposable root-capable Ubuntu fixture with the pinned guest
-  network profile and a digest-pinned benign container. Independently
+- Provide a disposable root-capable Ubuntu fixture as a standalone qcow2 v3
+  image of at most 8 GiB with 64 KiB clusters, a 32 GiB virtual disk and no\n  external backing.
+  Prepare it for UEFI and the enrolled guest network profile and include the
+  digest-pinned benign container. The independent observer runs the fixture
+  measurements against those enrolled inputs. Independently
   enroll the policy and complete topology/deny inventory, the public
   TCP/UDP and recursive DNS receivers, the denial targets, and the bounded
   receiver-capture and controlled route-drift procedures. Pin the private
@@ -175,12 +188,12 @@ from the production, trial, recipe and evidence areas.
 
 ## Exchange receiver evidence
 
-The mailbox protocol is covered by deterministic tests. The owner CLI still
-requires a checked native QEMU host before it can run the exchange.
+The mailbox protocol is covered by deterministic tests. Keep the mailbox on the\nqualifier host and the signer and signing key on the independent observer.
 
 1. Give the independent observer the bytes of `request.json` from a fresh
    private mailbox. The request binds the run, boot, generation, nonce,
-   route, policy, topology and complete receiver inventory. Keep the request
+   route, policy, topology and complete receiver inventory. The private
+   `origin_port` identifies the fixture listener for the LAN inbound case. Keep the request
    and all measurement content private.
 2. After arming the enrolled receivers, have the observer sign the sequence
    `arx-docker-capture-v1`, a NUL byte, `armed`, a NUL byte, the SHA-256 of
@@ -210,13 +223,13 @@ requires a checked native QEMU host before it can run the exchange.
    daemon. Keep the private receiver/control observers armed before any
    test attempt. Confirm they observe tagged positive controls before and
    after each window. A guest timeout by itself yields no denial verdict.
-2. Use separate stock TEST enrollment and evidence for the TEST comparison.
+2. Produce the same-boot TEST seal with the exact reviewed release used for
+   Docker qualification. Use separate stock TEST enrollment and evidence.
    Follow the reviewed [native TEST sequence](dev-host-setup.md#native-qualification-runbook).
    Exercise the same working public receivers. Retain independent counts
    and the original TEST seal for the later comparison. Recheck the
    Docker host pins and owner reserves after the stock run.
-3. Once the native Docker release has been reviewed and opened, invoke its
-   exact pinned runner once with a fresh, existing empty evidence directory.
+3. Invoke the exact pinned runner from the reviewed release with a fresh,\n   existing empty evidence directory.
    Fill these three paths from the reviewed private enrollment and verified
    release. Keep them out of transcripts and shared logs.
 
@@ -245,8 +258,10 @@ requires a checked native QEMU host before it can run the exchange.
    identifiable TCP and UDP flows with observed deliveries before the route
    changes. Capture one changed route from the enrolled uplink, the closure
    of each established flow and refused traffic tagged to each flow after
-   that transition. Restore the original enrolled topology before the
-   installed boot and resample. The
+   that transition. Restore the original enrolled topology before delivering
+   the signed capture. The qualifier checks that the original watch retired,
+   settles the fixture child, and arms a replacement watch on the original
+   topology before the restricted installer starts. The
    installed boot must bind the exclusive IPv4 loopback listener to the
    held child, verify exact port and boot with a bounded HTTPS exchange pinned
    to the certificate and SNI supplied for that boot, complete the exact Compose v3 hello, and release

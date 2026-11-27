@@ -229,6 +229,7 @@ fn measure_fresh<'a>(
 /// authority and cannot claim the selected TEST evidence directory.
 pub(super) struct QualifierTestInputs {
     pub(super) held: Held,
+    pub(super) limits: Limits,
     pub(super) recipes: launch::RecipeInputs,
     dependencies: Dependencies,
     evidence: VerifiedEvidence,
@@ -265,8 +266,10 @@ impl QualifierTestInputs {
         if recipes.projection.recipes != evidence.recipes {
             return Err(reason);
         }
+        let limits = *observed(&observations.limits).ok_or(reason)?;
         Ok(Self {
             held,
+            limits,
             recipes,
             dependencies,
             evidence,

@@ -1,5 +1,5 @@
 //! Disposable Docker qualification. The collector verifies separately signed
-//! receiver observations. The native QEMU host remains gated.
+//! receiver observations before sealing the checked native QEMU trial.
 use super::*;
 use crate::vm::{
     Id,
@@ -16,6 +16,7 @@ use arx_guest::docker_trial::{BootMode, Challenge, TrialRequest, TrialResponse};
 use std::io::Write;
 
 pub(super) mod capture_mailbox;
+mod native;
 mod origin;
 pub(super) use origin::profile_pin as origin_profile_pin;
 pub(in crate::vm::windows) mod witness;
@@ -42,24 +43,33 @@ pub(super) fn require_enrollment(bytes: &[u8]) -> Result<(), NativeRefusal> {
     }
 }
 
-pub(super) fn preflight(
+impl From<NativeRefusal> for RunError {
+    fn from(reason: NativeRefusal) -> Self {
+        Self::Native(reason)
+    }
+}
+
+pub(super) fn qualify(
     enrollment: &str,
     evidence: &str,
-) -> Result<std::convert::Infallible, NativeRefusal> {
-    let user = current_user().map_err(|_| NativeRefusal::IdentityUnverified)?;
+    runtime: &tokio::runtime::Runtime,
+    cancel: &Shutdown,
+) -> Result<Outcome, RunError> {
+    let user = current_user().map_err(|_| RunError::Native(NativeRefusal::IdentityUnverified))?;
     let path = local(enrollment)?;
     let evidence = local(evidence)?;
     let source = PathPin::open(&path, false, false)?;
     if path.overlaps(&evidence) || !sink::held_private(&source.leaf, user_sid(&user)) {
-        return Err(REFUSED);
+        return Err(RunError::Native(REFUSED));
     }
     let bytes = read_bounded(&source.leaf, MAX_ENROLLMENT_BYTES)
         .map_err(|_| NativeRefusal::QualificationMissing)?;
+    require_enrollment(&bytes)?;
     let enrollment = static_compose::enrollment::Enrollment::parse(&bytes)?;
     let profile = enrollment.runtime_profile.file();
     let profile = static_compose::hold_file(profile.path, profile.pin, MAX_ENROLLMENT_BYTES)?;
     if profile.path.overlaps(&evidence) || !sink::held_private(&profile.leaf, user_sid(&user)) {
-        return Err(REFUSED);
+        return Err(RunError::Native(REFUSED));
     }
     let config = crate::config::VmRuntimeProfile::parse(&static_compose::held_bytes(
         &profile,
@@ -74,7 +84,7 @@ pub(super) fn preflight(
         .into_iter()
         .any(|path| path.overlaps(&evidence))
     {
-        return Err(REFUSED);
+        return Err(RunError::Native(REFUSED));
     }
     let mode = CollectMode::QualifierReview;
     let m4 = foreground::QualifierTestInputs::open(&selected)?;
@@ -85,36 +95,105 @@ pub(super) fn preflight(
         &m4.held.trial.path,
     ]
     .into_iter()
-    .any(|path| path.overlaps(&evidence))
+    .any(|root| root.overlaps(&evidence) || root.overlaps(&path))
     {
-        return Err(REFUSED);
+        return Err(RunError::Native(REFUSED));
     }
-    let recipe = enrollment.recipe.hold(&m4.held, &m4.recipes, [1; 16])?;
+    let mut seed = [0; 16];
+    getrandom::fill(&mut seed).map_err(|_| REFUSED)?;
+    let recipe = enrollment.recipe.hold(&m4.held, &m4.recipes, seed)?;
     let inputs = enrollment.hold_inputs(&evidence, mode, &m4.held, &recipe)?;
     let targets = bind_preflight_inputs(&inputs, selected.selection().seal_sha256, &evidence)?;
-    if let Some(mailbox) = &enrollment.receiver_mailbox {
-        let mailbox = local(mailbox)?;
-        let forbidden = [
-            &path,
-            &evidence,
-            &scope.production.root.path,
-            &scope.recipe.root.path,
-            &m4.held.trial.path,
-        ];
-        capture_mailbox::Mailbox::open(
-            &mailbox,
-            user_sid(&user),
-            &forbidden,
-            boot::uptime(),
-            Shutdown::default(),
-        )?;
-    }
-    let (_dependencies, watch) = inputs.measure_live(&targets)?;
+    let workspace = enrollment.trial_workspace.as_ref().ok_or(REFUSED)?;
+    let (root, execution_root) = native::hold_workspace(&m4, workspace)?;
+    let evidence_pin = capacity::walk(
+        &capacity::MountManager,
+        &m4.held.volumes[1],
+        &evidence,
+        true,
+        true,
+    )?;
+    let origin_ms = boot::uptime();
+    let anchor = boot::capture(origin_ms)?;
+    let mailbox = local(
+        enrollment
+            .receiver_mailbox
+            .as_deref()
+            .ok_or(NativeRefusal::NetworkFenceUnverified)?,
+    )?;
+    let forbidden = [
+        &path,
+        &evidence,
+        &scope.production.root.path,
+        &scope.recipe.root.path,
+        &m4.held.trial.path,
+        &inputs.stock.root.path,
+        &inputs.patched.bundle.root.path,
+    ];
+    let capture = capture_mailbox::Mailbox::open(
+        &mailbox,
+        user_sid(&user),
+        &forbidden,
+        origin_ms,
+        cancel.clone(),
+    )?;
+    let (dependencies, watch) = inputs.measure_live(&targets)?;
     m4.require_current()?;
-    // A complete input check grants no native effects or evidence claim.
-    // Native host construction still gates the collector and its mailbox.
+    let stock = inputs.stock_boot_inputs()?;
+    let receiver_enrollment = inputs.receiver_enrollment()?;
+    let assets = native::Assets::hold(&inputs, &stock)?;
+    let cwd = m4.held.trial.path.join("paused-cwd").map_err(|_| REFUSED)?;
+    native::preclaim(&m4, &root, &cwd, &inputs, user_sid(&user))?;
+    inventory::binding(&source)?;
     watch.require_current()?;
-    Err(NativeRefusal::NetworkFenceUnverified)
+    if cancel.is_cancelled() || boot::uptime().saturating_sub(origin_ms) >= MAX_TRIAL_MS {
+        return Err(RunError::Incomplete);
+    }
+    let private_values = [
+        path.as_str(),
+        evidence.as_str(),
+        mailbox.as_str(),
+        root.path.as_str(),
+        selected.dossier().as_str(),
+        selected.enrollment().as_str(),
+        inputs.stock.root.path.as_str(),
+        inputs.patched.bundle.root.path.as_str(),
+    ];
+    let evidence =
+        sink::EvidenceDir::claim(evidence_pin, user_sid(&user), &private_values, anchor)?;
+    let custody = Custody::claim(root, &evidence, user_sid(&user))?;
+    let journal = custody.journal.try_clone().map_err(|_| REFUSED)?;
+    let host = native::PhaseHost::new(native::HostInputs {
+        m4: &m4,
+        source: &source,
+        inputs: &inputs,
+        assets: &assets,
+        root: &execution_root,
+        journal: &journal,
+        scope: custody.scope,
+        cwd,
+        targets,
+        receivers: &receiver_enrollment,
+        watch,
+        topology: dependencies.topology,
+        anchor,
+        runtime,
+        cancel,
+    });
+    Run {
+        host,
+        guest: native::Serial,
+        capture,
+        dependencies,
+        stock: &stock,
+        receiver_enrollment: receiver_enrollment.clone(),
+        packages: recipe.bootstrap_packages,
+        custody,
+        evidence: &evidence,
+        cancel,
+        runtime,
+    }
+    .run()
 }
 
 /// The preflight stage after input custody and before any live measurement:
@@ -446,23 +525,31 @@ pub(super) trait Host {
     fn drain(&mut self, ticket: Ticket, cutoff: u64) -> Result<Release, NativeRefusal>;
     fn dispose(&mut self, scope: Scope, cutoff: u64) -> Result<WorkspaceRelease, NativeRefusal>;
     fn copies_independent_and_original_unchanged(&mut self) -> bool;
+    fn fixture_current(&mut self, peer: PeerId, cutoff: u64) -> Result<(), NativeRefusal>;
+    fn after_fixture(&mut self, cutoff: u64) -> Result<(), NativeRefusal>;
 }
 
-pub(super) trait Guest {
+pub(super) trait Guest<H> {
     fn exchange(
         &mut self,
         peer: PeerId,
         frame: Vec<u8>,
         cutoff: u64,
+        host: &mut H,
     ) -> Result<Reply, NativeRefusal>;
 }
 
 pub(super) trait Capture {
-    fn arm(&mut self, request: &CaptureRequest<'_>) -> Result<Vec<u8>, NativeRefusal>;
+    fn arm(
+        &mut self,
+        request: &CaptureRequest<'_>,
+        current: &mut dyn FnMut() -> Result<(), NativeRefusal>,
+    ) -> Result<Vec<u8>, NativeRefusal>;
     fn fixture(
         &mut self,
         request: &CaptureRequest<'_>,
         window: std::ops::Range<u64>,
+        current: &mut dyn FnMut() -> Result<(), NativeRefusal>,
     ) -> Result<Vec<u8>, NativeRefusal>;
 }
 
@@ -471,7 +558,7 @@ pub(super) struct Run<'a, H, G, C> {
     pub(super) guest: G,
     pub(super) capture: C,
     pub(super) dependencies: DockerDependencies,
-    pub(super) stock: static_compose::StockBootInputs<'a>,
+    pub(super) stock: &'a static_compose::StockBootInputs<'a>,
     pub(super) receiver_enrollment: ReceiverEnrollment,
     pub(super) packages: Hash,
     pub(super) custody: Custody,
@@ -496,7 +583,7 @@ struct RunningBoot<'a, 'plan> {
     capture: Option<CaptureRequest<'a>>,
 }
 
-impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
+impl<H: Host, G: Guest<H>, C: Capture> Run<'_, H, G, C> {
     fn run_boot<T>(
         &mut self,
         phase: Phase,
@@ -601,11 +688,20 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                     route,
                     topology: self.dependencies.topology,
                     policy: self.dependencies.policy,
+                    origin_port: origin.ok_or(REFUSED)?.port(),
                     targets: &targets,
                     issued_ms: self.host.clock().mono_ms,
                     cutoff_ms: cutoff,
                 };
-                let acknowledgement = self.capture.arm(&request)?;
+                let acknowledgement = self.capture.arm(&request, &mut || {
+                    witness::route(
+                        self.host.route(&boot, Some(peer), cutoff)?,
+                        &boot,
+                        Some(peer),
+                        &self.dependencies,
+                    )
+                    .map(|_| ())
+                })?;
                 self.receiver_enrollment
                     .require_armed(&request, &acknowledgement)?;
                 if self.cancel.is_cancelled() || self.host.clock().mono_ms >= cutoff {
@@ -700,11 +796,15 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                             .capture
                             .as_ref()
                             .ok_or(NativeRefusal::NetworkFenceUnverified)?;
-                        let reply = capture.fixture(request, boot.started_ms..cutoff)?;
+                        let reply =
+                            capture.fixture(request, boot.started_ms..cutoff, &mut || {
+                                host.fixture_current(boot.peer, cutoff)
+                            })?;
                         let raw = receiver_enrollment.capture_body(request, &reply)?;
                         witness::receivers(raw, &boot, host.clock().mono_ms)
                     },
                 )?;
+                self.host.after_fixture(cutoff)?;
                 *fixture = Some(peer);
                 Ok(Observation::DockerPublicIpv4 {
                     policy: dependencies.policy,
@@ -719,8 +819,15 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
             }
             Stage::DockerRecipe => {
                 self.run_boot(Phase::Install, cutoff, |_, _, _, _, _| Ok(()))?;
-                self.run_boot(Phase::Detached, cutoff, |_, guest, _, _, boot| {
-                    health(guest, boot.peer, boot.ticket.challenge, packages, cutoff)
+                self.run_boot(Phase::Detached, cutoff, |host, guest, _, _, boot| {
+                    health(
+                        host,
+                        guest,
+                        boot.peer,
+                        boot.ticket.challenge,
+                        packages,
+                        cutoff,
+                    )
                 })?;
                 if !self.host.copies_independent_and_original_unchanged() {
                     return Err(REFUSED);
@@ -741,14 +848,16 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                     if !fixture.is_some_and(|first| first.boot != peer.boot) {
                         return Err(NativeRefusal::GuestEndpointUnverified);
                     }
-                    health(guest, peer, challenge, packages, cutoff)?;
+                    health(host, guest, peer, challenge, packages, cutoff)?;
                     let provision: TrialResponse = exchange(
+                        host,
                         guest,
                         peer,
                         &TrialRequest::DockerTrialProvision { challenge },
                         cutoff,
                     )?;
                     let ack: ComposeResponse = exchange(
+                        host,
                         guest,
                         peer,
                         &arx_guest::docker_trial::compose_hello(challenge),
@@ -976,14 +1085,16 @@ fn release_in_time(
     in_time(cancel, start, trial_cutoff, now) && now.mono_ms < release_cutoff
 }
 
-fn health(
-    guest: &mut impl Guest,
+fn health<H>(
+    host: &mut H,
+    guest: &mut impl Guest<H>,
     peer: PeerId,
     challenge: Challenge,
     packages: Hash,
     cutoff: u64,
 ) -> Result<(), NativeRefusal> {
     let reply: TrialResponse = exchange(
+        host,
         guest,
         peer,
         &TrialRequest::DockerTrialHealth { challenge },
@@ -1000,8 +1111,9 @@ fn health(
     Ok(())
 }
 
-fn exchange<Req: arx_guest::protocol::Message, Rep: arx_guest::protocol::Message>(
-    guest: &mut impl Guest,
+fn exchange<H, Req: arx_guest::protocol::Message, Rep: arx_guest::protocol::Message>(
+    host: &mut H,
+    guest: &mut impl Guest<H>,
     peer: PeerId,
     request: &Req,
     cutoff: u64,
@@ -1009,7 +1121,7 @@ fn exchange<Req: arx_guest::protocol::Message, Rep: arx_guest::protocol::Message
     let refused = NativeRefusal::GuestEndpointUnverified;
     let mut frame = Vec::new();
     arx_guest::write_frame(&mut frame, request).map_err(|_| refused)?;
-    let reply = guest.exchange(peer, frame, cutoff)?;
+    let reply = guest.exchange(peer, frame, cutoff, host)?;
     let mut bytes = reply.frame.as_slice();
     if reply.peer != peer || bytes.len() > arx_guest::MAX_FRAME + 4 {
         return Err(refused);

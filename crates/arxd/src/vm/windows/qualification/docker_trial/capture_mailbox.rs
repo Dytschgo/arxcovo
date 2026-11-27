@@ -60,11 +60,17 @@ impl Mailbox {
         max: u64,
         cutoff_ms: u64,
         wait: Duration,
+        current: &mut dyn FnMut() -> Result<(), NativeRefusal>,
     ) -> Result<Vec<u8>, NativeRefusal> {
         let local_cutoff = boot::uptime().saturating_add(wait.as_millis() as u64);
         let cutoff = local_cutoff.min(self.origin_ms.saturating_add(cutoff_ms));
+        let mut next_sample = 0;
         loop {
             self.require_current()?;
+            if boot::uptime() >= next_sample {
+                current()?;
+                next_sample = boot::uptime().saturating_add(1000);
+            }
             if boot::uptime() >= cutoff {
                 return Err(NETWORK);
             }
@@ -80,6 +86,10 @@ impl Mailbox {
                     if boot::uptime() >= cutoff {
                         return Err(NETWORK);
                     }
+                    current()?;
+                    if boot::uptime() >= cutoff {
+                        return Err(NETWORK);
+                    }
                     return Ok(bytes);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -92,9 +102,14 @@ impl Mailbox {
 }
 
 impl Capture for Mailbox {
-    fn arm(&mut self, request: &CaptureRequest<'_>) -> Result<Vec<u8>, NativeRefusal> {
+    fn arm(
+        &mut self,
+        request: &CaptureRequest<'_>,
+        current: &mut dyn FnMut() -> Result<(), NativeRefusal>,
+    ) -> Result<Vec<u8>, NativeRefusal> {
         let encoded = serde_json::to_vec(request).map_err(|_| NETWORK)?;
         if self.armed.is_some()
+            || request.origin_port == 0
             || request.issued_ms >= request.cutoff_ms
             || request.cutoff_ms > MAX_TRIAL_MS
             || !sink::empty(&self.root.leaf)?
@@ -102,7 +117,7 @@ impl Capture for Mailbox {
             return Err(NETWORK);
         }
         self.write(".request.tmp", "request.json", &encoded)?;
-        let reply = self.reply("armed.sig", 64, request.cutoff_ms, ARM_WAIT)?;
+        let reply = self.reply("armed.sig", 64, request.cutoff_ms, ARM_WAIT, current)?;
         self.armed = Some(digest(&encoded));
         Ok(reply)
     }
@@ -111,6 +126,7 @@ impl Capture for Mailbox {
         &mut self,
         request: &CaptureRequest<'_>,
         window: Range<u64>,
+        current: &mut dyn FnMut() -> Result<(), NativeRefusal>,
     ) -> Result<Vec<u8>, NativeRefusal> {
         let encoded = serde_json::to_vec(request).map_err(|_| NETWORK)?;
         let challenge = digest(&encoded);
@@ -141,6 +157,7 @@ impl Capture for Mailbox {
             (64 + witness::MAX_CAPTURE_BYTES) as u64,
             window.end,
             CAPTURE_WAIT,
+            current,
         )
     }
 }

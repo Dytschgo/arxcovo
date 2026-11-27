@@ -78,7 +78,9 @@ pub(in crate::vm::windows::qualification) struct RouteWatch {
 }
 
 impl RouteWatch {
-    pub(super) fn arm(policy: &PublicEgressPolicy) -> Result<Self, NativeRefusal> {
+    pub(in crate::vm::windows::qualification) fn arm(
+        policy: &PublicEgressPolicy,
+    ) -> Result<Self, NativeRefusal> {
         let context = Arc::new(WatchContext {
             policy: policy.clone(),
             changed: AtomicBool::new(false),
@@ -109,6 +111,10 @@ impl RouteWatch {
             .ok_or(NETWORK)
     }
 
+    pub(in crate::vm::windows::qualification) fn retire(&self) {
+        self.context.changed.store(true, Ordering::Release);
+    }
+
     pub(super) fn require_baseline(
         &self,
         policy: &PublicEgressPolicy,
@@ -117,12 +123,12 @@ impl RouteWatch {
     ) -> Result<(), NativeRefusal> {
         let (_, observed) = self.observe(policy, public_targets)?;
         if observed != expected {
-            self.context.changed.store(true, Ordering::Release);
+            self.retire();
         }
         self.require_current()
     }
 
-    pub(super) fn observe(
+    pub(in crate::vm::windows::qualification) fn observe(
         &self,
         policy: &PublicEgressPolicy,
         public_targets: &[Ipv4Addr],

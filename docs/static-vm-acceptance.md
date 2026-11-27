@@ -4,7 +4,7 @@ The local journey checks Calm Life and a synthetic second project through a PID-
 
 ## Native adapter status
 
-The Windows x64 foreground accepts the owner-local `test_vms.static_compose` opt-in with `test_vms.enabled: true`. It verifies and holds the enrolled roots before opening the store and serving MCP. It can verify a Docker-class dossier against independently held inputs, a separately pinned Design §2 receipt bound to the selected M4 TEST seal, and the live IPv4 topology. `--full-docker` preflight reads the M4 TEST selection from the pinned Docker runtime profile. It verifies the selected TEST seal with the production store stopped, then checks the Compose recipe, stock and patched distributions, fixture inputs, policy and live route topology. The preflight grants no native effects and leaves the output directory unclaimed. The reviewed comparison witness is added for foreground selection after dossier emission because it names the final seal digest.
+The Windows x64 foreground accepts the owner-local `test_vms.static_compose` opt-in with `test_vms.enabled: true`. It verifies and holds the enrolled roots before opening the store and serving MCP. It can verify a Docker-class dossier against independently held inputs, a separately pinned Design §2 receipt bound to the selected M4 TEST seal, and the live IPv4 topology. `--full-docker` preflight reads the M4 TEST selection from the pinned Docker runtime profile. It verifies the selected TEST seal with the production store stopped, then checks the Compose recipe, stock and patched distributions, fixture inputs, policy and live route topology. After preflight passes, Part B2g claims fresh private evidence and a journaled disposable workspace for the native Docker trial. The reviewed comparison witness is added for foreground selection after dossier emission because it names the final seal digest.
 
 `vm_catalog` reports `capability.static_compose.available: false` with `network_fence_unverified` or a more specific qualification or custody refusal. The Compose recipe is absent from the catalog. The static admission fence covers `vm_template_build` for the web and selected Compose recipes, `static_vm_create`, and `vm_start`, `vm_stop`, `vm_run_script` and `vm_extend` for static rows, subject to each tool's earlier validation and policy checks. It also covers `publish_site` after the default-off policy check. Existing Ubuntu web static VMs remain subject to the fence.
 
@@ -31,21 +31,11 @@ reservation once and requires attribution to the held child before allowing
 guest execution. The deterministic journey continues through HTTPS and the
 held foreground reader. See [ADR 0075](adr/0075-authenticate-docker-receiver-capture.md).
 
-The owner CLI still needs the native QEMU adapter for phase media staging,
-checked process creation, QMP and serial attribution, listener transfer and
-disposable release. It refuses during preflight before claiming evidence.
-The native static effects under `SelectedStatic` also remain gated. They need
-qualified template build, independent full copy, checked start and stop, and
-durable recovery that retains committed VM media. The production boot owner
-must pass the verified origin and attributed pipe to the existing settlement
-adapter.
+Part B2g wires the [Windows owner qualifier](docker-qualification.md) to the native QEMU phase host. It stages the fixture, runs the restricted installer and detached health boot, and verifies the public-egress endpoint on a separate copy. It checks the suspended child, attributes QMP, serial and the loopback listener, and requires checked shutdown and disposable release before sealing. One watch covers the pre-execution fixture checks. A signed drift result and settled fixture permit a fresh watch only after the enrolled route is restored. That watch covers the remaining phases through dossier publication. [ADR 0076](adr/0076-native-docker-qualification-phases.md)
 
-Part B2g begins after that native lifecycle can settle a verified boot. Its
-private route install must work with public publishing off. Its opt-in
-Cloudflare publication then uses the same boot and checks route retirement
-through cleanup. Native VM boot, Docker, public-only networking, Windows
-custody, persistence and live Cloudflare publishing remain
-**unverified on real hardware**.
+The next static runtime slice under `SelectedStatic` must build qualified Ubuntu web and Compose templates, create independent full copies, and start and stop them through checked native effects. Start must pass the verified origin identity, attributed serial handle and route retirement signal to the existing atomic settlement adapter. Restart recovery must preserve committed VM media and backups. Static admission stays closed until those effects can settle and the route and publication work below is wired.
+
+The remaining publication slice installs the enrolled private routes while publishing is off, then supports explicit opt-in Cloudflare activation and cleanup on the same verified boot. It lifts `network_fence_unverified` only behind live route monitoring and the other admission checks. Native VM boot, Docker, public-only networking, Windows custody, persistence and live Cloudflare publishing remain **unverified on real hardware**.
 
 ## Enroll a dedicated acceptance VM
 

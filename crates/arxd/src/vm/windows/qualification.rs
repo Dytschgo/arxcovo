@@ -810,12 +810,36 @@ pub fn preflight_paused(enrollment: &str, evidence: &str) -> Result<Baseline, Na
     preflight_with(&capacity::MountManager, enrollment, evidence, true, false)
 }
 
-/// Separate, fail-closed entry point for explicit Docker qualification.
-pub fn preflight_docker(
+/// Run the explicit owner-local Docker qualifier. Only a complete sealed
+/// run returns true. Keep the synchronous collector outside any caller's
+/// Tokio runtime, including its serial and HTTPS block_on calls.
+pub fn qualify_docker(
     enrollment: &str,
     evidence: &str,
-) -> Result<std::convert::Infallible, NativeRefusal> {
-    docker_trial::preflight(enrollment, evidence)
+) -> Result<bool, crate::vm::qualification_record::RunError> {
+    require_unimpersonated().map_err(|_| NativeRefusal::IdentityUnverified)?;
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("arx-docker-qualifier".into())
+            .spawn_scoped(scope, || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .map_err(|_| NativeRefusal::JobUnverified)?;
+                let cancel = Shutdown::default();
+                let signal = cancel.clone();
+                runtime.spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    signal.cancel();
+                });
+                docker_trial::qualify(enrollment, evidence, &runtime, &cancel)
+                    .map(|outcome| outcome == docker_trial::Outcome::Complete)
+            })
+            .map_err(|_| NativeRefusal::JobUnverified)?
+            .join()
+            .map_err(|_| NativeRefusal::JobUnverified)?
+    })
 }
 
 pub fn preflight_full_test(enrollment: &str, evidence: &str) -> Result<Baseline, NativeRefusal> {

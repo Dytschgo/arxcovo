@@ -814,6 +814,9 @@ pub enum Observation {
         ipv6_icmp_denied: bool,
         route_drift_denied: bool,
     },
+    DockerTestBaseline {
+        test_seal: Hash,
+    },
     DockerInstalledEndpoint {
         recipe: RecipeIdentity,
         compose_protocol: u32,
@@ -838,10 +841,33 @@ pub enum Observation {
     },
 }
 
+impl Stage {
+    pub(crate) fn docker_inherits_test(self) -> bool {
+        matches!(
+            self,
+            Self::CustodyJobCapacityBaseline
+                | Self::ActivityReservesBaseline
+                | Self::WhpxCapability
+                | Self::DisposableStore
+                | Self::SuspendedChild
+                | Self::QemuPrelaunchPause
+                | Self::HeldBundleInventory
+                | Self::FirstGuestExecution
+                | Self::SupervisorLossRelease
+                | Self::CapacityTrials
+                | Self::ReserveActivityTrials
+                | Self::QmpChannel
+        )
+    }
+}
+
 impl Observation {
     pub fn validates(&self, stage: Stage, origin: Origin) -> bool {
         use Observation as O;
         match (stage, self) {
+            (stage, O::DockerTestBaseline { test_seal }) => {
+                origin == Origin::Native && stage.docker_inherits_test() && *test_seal != [0; 32]
+            }
             (
                 Stage::Distribution,
                 O::DockerDistribution {
@@ -1861,7 +1887,7 @@ fn bundle_rows(
         when = record.finished_ms;
         previous = digest(&canonical(&record)?);
         if origin == Origin::Native {
-            docker.observe(class, &record.result)?;
+            docker.observe(class, record.stage, &record.result)?;
         }
         match (record.stage, record.result) {
             (

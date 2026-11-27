@@ -7,7 +7,7 @@
 
 pub(super) mod enrollment;
 pub(super) mod reviewed_network;
-mod route_watch;
+pub(super) mod route_watch;
 
 use super::*;
 use crate::vm::{
@@ -259,13 +259,13 @@ impl StaticDossier {
 }
 
 pub(super) struct ComposeInstallerInputs {
-    medium: PathPin,
-    installer: PathPin,
-    kernel: PathPin,
-    initrd: PathPin,
+    pub(super) medium: PathPin,
+    pub(super) installer: PathPin,
+    pub(super) kernel: PathPin,
+    pub(super) initrd: PathPin,
     qemu_receipt: PathPin,
     guest: PathPin,
-    firmware: [PathPin; 2],
+    pub(super) firmware: [PathPin; 2],
     review: HeldReview,
     recipe: DockerRecipe,
     pub(super) bootstrap_packages: Hash,
@@ -615,7 +615,7 @@ impl<'a> StockBootInputs<'a> {
         })
     }
 
-    fn roles(&self) -> [(ArtifactRole, &PathPin); 3] {
+    pub(super) fn roles(&self) -> [(ArtifactRole, &PathPin); 3] {
         [
             (ArtifactRole::Qemu, &self.image),
             (ArtifactRole::Data, &self.data),
@@ -715,15 +715,15 @@ pub(super) struct HeldDockerInputs<'a> {
     release: [PathPin; 2],
     scope: &'a test::Scope,
     token: &'a VmToken,
-    recipe: &'a ComposeInstallerInputs,
+    pub(super) recipe: &'a ComposeInstallerInputs,
     profile: PathPin,
     m4_seal: Hash,
-    policy: PathPin,
-    parsed_policy: PublicEgressPolicy,
+    pub(super) policy: PathPin,
+    pub(super) parsed_policy: PublicEgressPolicy,
     pub(super) patched: inventory::PatchedBundle,
     pub(super) stock: inventory::Bundle,
     stock_inventory: Hash,
-    fixture: [PathPin; 3],
+    pub(super) fixture: [PathPin; 3],
     receiver_inventory: PathPin,
     topology: PathPin,
     origin_profile: PathPin,
@@ -829,6 +829,10 @@ impl<'a> HeldDockerInputs<'a> {
 
     /// Binds these inputs to the separately selected M4 seal before any live
     /// measurement, then returns the enrolled public targets.
+    pub(super) fn m4_seal(&self) -> Hash {
+        self.m4_seal
+    }
+
     pub(super) fn bound_targets(
         &self,
         selected_m4: Hash,
@@ -912,6 +916,7 @@ impl<'a> HeldDockerInputs<'a> {
         let [daemon, qualifier] = &self.release;
         let [code, vars] = &self.recipe.firmware;
         Ok(DockerDependencies {
+            test_seal: self.m4_seal,
             supervisor_image: measured(daemon)?,
             qualifier_image: measured(qualifier)?,
             host: HostDependency {

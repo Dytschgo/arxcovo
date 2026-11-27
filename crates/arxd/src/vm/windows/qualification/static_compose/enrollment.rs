@@ -15,6 +15,7 @@ pub(in crate::vm::windows::qualification) struct Enrollment {
     pub(super) fixture_network_profile: Input,
     pub(super) receiver_inventory: Input,
     pub(in crate::vm::windows::qualification) receiver_mailbox: Option<String>,
+    pub(in crate::vm::windows::qualification) trial_workspace: Option<TrialWorkspace>,
     pub(super) probe_image: Input,
     pub(super) topology: Input,
     pub(super) origin_profile: Input,
@@ -22,6 +23,14 @@ pub(in crate::vm::windows::qualification) struct Enrollment {
     // Collection can precede it. Foreground selection always requires it.
     pub(super) network_witness: Option<Input>,
     pub(in crate::vm::windows::qualification) recipe: Recipe,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::vm::windows::qualification) struct TrialWorkspace {
+    #[serde(deserialize_with = "local_path")]
+    pub(in crate::vm::windows::qualification) path: LocalPath,
+    pub(in crate::vm::windows::qualification) identity: VolumePin,
 }
 
 #[derive(Deserialize)]

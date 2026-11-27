@@ -871,9 +871,13 @@ pub(crate) fn run(enrollment: &str, evidence: &str, mode: Mode) -> Result<Outcom
         Mode::Paused => qualification::preflight_paused,
         Mode::Test => qualification::preflight_full_test,
         Mode::Docker => {
-            return qualification::preflight_docker(enrollment, evidence)
-                .map_err(RunError::Native)
-                .map(|closed| match closed {});
+            return qualification::qualify_docker(enrollment, evidence).map(|complete| {
+                if complete {
+                    Outcome::Complete
+                } else {
+                    Outcome::Incomplete
+                }
+            });
         }
     };
     let runtime = (mode != Mode::Baseline)

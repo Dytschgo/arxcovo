@@ -18,6 +18,7 @@ fn docker_fixture(
         medium: [10; 32],
     };
     let dependencies = DockerDependencies {
+        test_seal: [42; 32],
         supervisor_image: [1; 32],
         qualifier_image: [16; 32],
         host: HostDependency {
@@ -64,6 +65,9 @@ fn docker_fixture(
             .enumerate()
             .map(|(i, stage)| {
                 let result = match stage {
+                    stage if stage.docker_inherits_test() => Observation::DockerTestBaseline {
+                        test_seal: dependencies.test_seal,
+                    },
                     Stage::Distribution => Observation::DockerDistribution {
                         manifest: build.manifest.sha256,
                         executable: build.qemu.sha256,
