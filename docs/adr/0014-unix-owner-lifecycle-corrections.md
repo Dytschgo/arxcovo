@@ -630,10 +630,12 @@ capture on the owner's Mac mini remains **unverified on real hardware**.
 0, empty stderr and exactly one block whose header is
 `system/com.arxcovo.arxd = {`. Nested blocks must balance by tab depth and only
 top-level lines are read, so a nested `state =` or `path =` line never counts.
-Every top-level line must be `key = value` or `key = {`. `path`, `state` and
-`program` must each appear exactly once as scalars, and `arguments` exactly
-once as a block; uniqueness and shape are checked across scalar and block
-entries before dispatch. The only blank lines allowed are completely empty
+Every top-level line must be `key = value` or `key = {`. Each top-level key
+is at most 64 bytes of printable ASCII words separated by single spaces (for
+example `active count`), without tabs, control bytes, `{`, `}` or `=`, and
+appears at most once, whether scalar or block. `path`, `state` and `program`
+must each appear exactly once as scalars, and `arguments` exactly once as a
+block; syntax, uniqueness and shape are checked before dispatch. The only blank lines allowed are completely empty
 lines between top-level entries. A whitespace-only line, a blank line inside a
 nested block or the argument vector, and anything after the closing `}` except
 one final newline are `Unknown`.

@@ -266,10 +266,12 @@ The following lifecycle plans describe Linux/macOS; Windows SCM details follow.
   that old binary to run `service uninstall`. Then use the new binary to run
   `service install`, then `service configure` again if you use admin rights on
   Linux, then `service start`. Your config and activity history are kept.
-- On macOS, `owner_query::launchd` accepts absence only as exit 113, empty
-  stdout and the exact `Could not find service "com.arxcovo.arxd" in domain for
-  system` stderr, pinned from hosted macOS CI evidence and rechecked by a
-  native test on every hosted macOS run. A well-formed loaded job with a
+- On macOS, `owner_query::launchd` accepts absence only as the complete tuple
+  in ADR 0014's launchd profile addendum: exit 113, empty stdout, and stderr
+  of exactly two lines, `Bad request.` then `Could not find service
+  "com.arxcovo.arxd" in domain for system`, each ending in a newline. It is
+  pinned from hosted macOS CI evidence and rechecked by a native test on
+  every hosted macOS run. A well-formed loaded job with a
   recognized state but a different plist path, program or arguments is
   `service-foreign-registration`; malformed, ambiguous or unrecognized output
   is `service-manager`. The loaded grammar and a root capture on a real Mac

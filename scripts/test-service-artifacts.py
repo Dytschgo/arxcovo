@@ -63,18 +63,75 @@ def rust_str_consts(text):
     return dict(pairs)
 
 
+def split_top_level(text, separator):
+    """Split on `separator` outside (), [], {} and string literals."""
+    parts, depth, i, last = [], 0, 0, 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i += 1
+            while text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth < 0:
+                raise AssertionError("unbalanced Layout::unix source")
+        elif depth == 0 and text.startswith(separator, i):
+            parts.append(text[last:i])
+            last = i + len(separator)
+            i = last
+            continue
+        i += 1
+    if depth != 0:
+        raise AssertionError("unbalanced Layout::unix source")
+    parts.append(text[last:])
+    return parts
+
+
 def unix_layout_binaries(text):
-    """Binary (first tuple element) and artifact constant of each arm in the
-    active `Layout::unix` match, read from comment-free source."""
+    """Binary (first tuple element) and artifact constant of every arm in the
+    active `Layout::unix` match, read from comment-free source. The match must
+    have exactly the arms `Platform::Linux` and `_`, in that order."""
     code = strip_rust_comments(text)
     body = re.search(r"fn unix\(platform: Platform\) -> Self \{(.*?)\n    \}\n", code, re.S)
     if body is None:
         raise AssertionError("Layout::unix not found")
-    arms = re.findall(r'(Platform::Linux|_) => \(\s*"([^"]+)",(?:\s*"[^"]*",){3}\s*super::owner_query::([A-Z_]+),',
-                      body.group(1))
-    if [arm for arm, _, _ in arms] != ["Platform::Linux", "_"]:
+    head = re.search(r"= match platform \{", body.group(1))
+    if head is None or body.group(1).count("match ") != 1:
+        raise AssertionError("Layout::unix must contain exactly one match")
+    rest = body.group(1)[head.end():]
+    # The match body ends at the first unbalanced closing brace.
+    depth, i = 0, 0
+    while True:
+        c = rest[i]
+        if c == '"':
+            i += 1
+            while rest[i] != '"':
+                i += 2 if rest[i] == "\\" else 1
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        i += 1
+    arms = [arm.strip() for arm in split_top_level(rest[:i], ",") if arm.strip()]
+    parsed = []
+    for arm in arms:
+        pattern_expr = split_top_level(arm, "=>")
+        if len(pattern_expr) != 2:
+            raise AssertionError("malformed Layout::unix arm")
+        pattern, expr = (part.strip() for part in pattern_expr)
+        found = re.fullmatch(r'\(\s*"([^"]+)",(?:\s*"[^"]*",){3}\s*super::owner_query::([A-Z_]+),.*\)',
+                             expr, re.S)
+        if found is None:
+            raise AssertionError("unexpected Layout::unix arm value")
+        parsed.append((pattern, found.group(1), found.group(2)))
+    if [pattern for pattern, _, _ in parsed] != ["Platform::Linux", "_"]:
         raise AssertionError("unexpected Layout::unix arms")
-    return {arm: (binary, artifact) for arm, binary, artifact in arms}
+    return {pattern: (binary, artifact) for pattern, binary, artifact in parsed}
 
 
 def require(condition):
@@ -128,6 +185,18 @@ class Artifacts(unittest.TestCase):
         mac_bin = '"/Library/Application Support/Arxcovo/libexec/arxd",\n                "/Library/Application Support/Arxcovo/config'
         self.assertEqual(layout.count(linux_bin), 1)
         self.assertEqual(layout.count(mac_bin), 1)
+        self.assertEqual(layout.count("            _ => ("), 1)
+        mac_arm = "".join(line + "\n" for line in [
+            "Platform::Macos => (",
+            '                "/opt/arxd",',
+            '                "/opt/arxd.json",',
+            '                "/opt/state",',
+            '                "/opt/arxd.sock",',
+            "                super::owner_query::PLIST_PATH,",
+            "                vec![],",
+            "            ),",
+        ])
+        linux_arm = mac_arm.replace("Platform::Macos", "Platform::Linux")
         mutations = [
             # Active binary changed while the old literal survives in a comment.
             (owner_query, layout.replace(linux_bin, '// "/usr/local/libexec/arxcovo/arxd",\n                "/opt/arxd",'), plist, unit),
@@ -135,6 +204,10 @@ class Artifacts(unittest.TestCase):
             # A conflicting or even identical Program key in the plist.
             (owner_query, layout, {**plist, "Program": "/opt/arxd"}, unit),
             (owner_query, layout, {**plist, "Program": plist["ProgramArguments"][0]}, unit),
+            # A new arm before `_` would change the effective macOS layout.
+            (owner_query, layout.replace("            _ => (", mac_arm + "            _ => (", 1), plist, unit),
+            # A duplicate Linux arm or a guard also changes the arm set.
+            (owner_query, layout.replace("            _ => (", linux_arm + "            _ => (", 1), plist, unit),
             # owner_query constant shadowed only by a comment.
             (owner_query.replace('pub const LAUNCHD_LABEL: &str = "com.arxcovo.arxd";',
                                  '// pub const LAUNCHD_LABEL: &str = "com.arxcovo.arxd";\npub const LAUNCHD_LABEL: &str = "com.other";'),

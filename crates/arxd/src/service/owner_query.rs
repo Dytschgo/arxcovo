@@ -301,7 +301,8 @@ fn absent_stderr(label: &str) -> String {
 /// top-level entries. A whitespace-only line, a blank line inside any nested
 /// block (including the argument vector) and anything after the closing `}`
 /// other than one final newline are Unknown. `path`, `state` and `program`
-/// must be scalars and `arguments` a block, each exactly once.
+/// must be scalars and `arguments` a block. Every top-level key is
+/// syntactically valid (see [`top_level_key`]) and appears at most once.
 fn loaded(text: &str, profile: &LaunchdProfile<'_>) -> Query {
     if text.contains(['\r', '\0']) {
         return Query::Unknown;
@@ -312,7 +313,7 @@ fn loaded(text: &str, profile: &LaunchdProfile<'_>) -> Query {
     }
     let (mut path, mut state, mut program) = (None, None, None);
     let mut arguments: Option<Vec<&str>> = None;
-    let mut seen = [false; 4];
+    let mut keys = std::collections::HashSet::new();
     let mut collecting = false;
     let mut depth = 1usize;
     for line in lines {
@@ -364,13 +365,14 @@ fn loaded(text: &str, profile: &LaunchdProfile<'_>) -> Query {
             return Query::Unknown;
         };
         let block = value == "{";
-        // Uniqueness and shape of required keys are settled before dispatch,
-        // across both scalar and block entries.
-        let required = ["path", "state", "program", "arguments"]
-            .iter()
-            .position(|k| *k == key);
-        if let Some(index) = required
-            && (std::mem::replace(&mut seen[index], true) || block != (key == "arguments"))
+        // Every top-level key is well formed and unique, across scalar and
+        // block entries, before any dispatch.
+        if !top_level_key(key) || !keys.insert(key) {
+            return Query::Unknown;
+        }
+        // Required keys also have a fixed shape.
+        if matches!(key, "path" | "state" | "program" | "arguments")
+            && block != (key == "arguments")
         {
             return Query::Unknown;
         }
@@ -406,6 +408,19 @@ fn loaded(text: &str, profile: &LaunchdProfile<'_>) -> Query {
         return Query::Foreign;
     }
     Query::Ours(state)
+}
+/// A launchd field name: printable ASCII words (`active count`, `path`)
+/// separated by single spaces. No tab, control byte, brace, `=`, or leading,
+/// trailing or repeated space.
+fn top_level_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key.split(' ').all(|word| {
+            !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|b| matches!(b, 0x21..=0x7e) && !matches!(b, b'{' | b'}' | b'='))
+        })
 }
 
 #[cfg(test)]
@@ -914,6 +929,46 @@ mod launchd_profile_tests {
                 "{variant:?}"
             );
         }
+    }
+    #[test]
+    fn review2_top_level_keys_are_strict_and_unique() {
+        let exit0 = LaunchdTermination::Exited(0);
+        // Realistic multi-word launchd keys and values still parse.
+        let realistic = "\tworking directory = /\n\tspawn type = daemon (3)\n\tjetsam memory limit (active) = 0\n\tproperties = keepalive | runatload | inferred program\n\tendpoints = {\n\t}\n";
+        assert_eq!(
+            observe(exit0, &ours("running", realistic), b""),
+            Query::Ours(State::Running)
+        );
+        for extra in [
+            // Second state key hidden by an embedded tab, or a tab inside a key.
+            "\tstate\t = running\n",
+            "\tsta\tte = running\n",
+            // Conflicting duplicates of non-required keys, scalar or block.
+            "\ttype = LaunchAgent\n",
+            "\tactive count = 2\n",
+            "\tdomain = {\n\t}\n",
+            "\tdefault environment = {\n\t}\n",
+            // Braces, '=' and control bytes used as keys.
+            "\t{ = x\n",
+            "\t} = x\n",
+            "\t{ = {\n\t}\n",
+            "\ta=b = x\n",
+            "\t\u{1} = x\n",
+            "\tst\u{7f}ate = x\n",
+            "\tst\u{1b}ate = running\n",
+            // Spacing that launchd does not print.
+            "\tfoo  = x\n",
+            "\tfoo  bar = x\n",
+            "\tnon\u{a0}ascii = x\n",
+        ] {
+            assert_eq!(
+                observe(exit0, &ours("running", extra), b""),
+                Query::Unknown,
+                "{extra:?}"
+            );
+        }
+        let long = format!("\t{} = x\n", "k".repeat(65));
+        assert_eq!(observe(exit0, &ours("running", &long), b""), Query::Unknown);
     }
     #[test]
     fn unknown_state_is_never_reported_as_foreign() {

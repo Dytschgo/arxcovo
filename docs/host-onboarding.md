@@ -204,9 +204,17 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`, ADR 0015):
    boot), or `bootout` may already have stopped the job while the plist stays
    in place. Rerunning the same command is safe once the cause is fixed.
    Report the macOS version; the fix is a reviewed fixture, not a manual
-   workaround. `arxd: service-foreign-registration` means launchd reports a
-   job with this label whose plist path, program or arguments differ from
-   Arxcovo's; nothing is changed, and you inspect that job yourself.
+   workaround.
+
+   `arxd: service-foreign-registration` has two sources (`owner_unix.rs`
+   `observe`): a file at `/Library/LaunchDaemons/com.arxcovo.arxd.plist` whose
+   bytes differ from Arxcovo's plist, or a launchd job with this label whose
+   plist path, program or arguments differ from Arxcovo's. `status` and
+   `install` change nothing when they report it. `stop` and `uninstall` check
+   again before `bootout` and after it (`owner_plan.rs`), so a foreign result
+   there can come after `disable` has already run, or after `bootout` has
+   already stopped the job; the plist is never removed in that case. Inspect
+   the conflicting file or job yourself before rerunning.
 6. Cluster join: not available on macOS in this version. The cluster runtime is
    Linux-only (`cluster/consensus/bound_start.rs`), `--cluster-config` exits
    with the config error on macOS, and the service refuses a `cluster`
