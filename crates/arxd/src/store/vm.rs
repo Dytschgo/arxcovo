@@ -3412,8 +3412,66 @@ mod tests {
         );
 
         let targets = [target.clone(), target];
-        compose::enroll_with_backup_targets(&store, &releases, &targets)?;
-        compose::enroll_with_backup_targets(&store, &releases, &targets)?;
+        let selected = crate::vm::qualification_record::DockerRecipe::identity([1; 32]);
+        let enrollment = |recipe, verify: &dyn Fn() -> Result<()>| {
+            compose::enroll_selected(&store, &releases, &targets, recipe, verify)
+        };
+        // A legacy static row with the same digest alone is insufficient.
+        assert!(enrollment(selected, &|| Ok(())).is_err());
+        store.transact(|db| {
+            let template: Id = db.query_row(
+                "SELECT template FROM vm_static_instances WHERE id=?1",
+                [targets[0].vm],
+                |row| row.get(0),
+            )?;
+            db.execute(
+                "INSERT INTO vm_templates VALUES(?1,1,?2,zeroblob(32),zeroblob(32),64)",
+                params![template, selected.recipe_sha256],
+            )?;
+            db.execute(
+                "INSERT INTO vm_build_intents
+                  (id,recipe_id,recipe_digest,staging_bytes,template_id,health_verified,state)
+                 VALUES(?1,?2,?3,0,?4,1,'sealed')",
+                params![
+                    [9u8; 16],
+                    hex::encode(selected.recipe_id),
+                    selected.recipe_sha256,
+                    template
+                ],
+            )?;
+            Ok(())
+        })?;
+        let wrong = crate::vm::qualification_record::DockerRecipe::identity([2; 32]);
+        assert!(enrollment(wrong, &|| Ok(())).is_err());
+        let checks = std::cell::Cell::new(0);
+        assert!(
+            enrollment(selected, &|| {
+                checks.set(checks.get() + 1);
+                ensure!(checks.get() == 1, "selection retired");
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(checks.get(), 2);
+        store.transact(|db| {
+            for table in [
+                "vm_compose_projects",
+                "vm_compose_releases",
+                "vm_compose_backup_targets",
+            ] {
+                assert_eq!(
+                    count(
+                        db,
+                        &format!("SELECT count(*) FROM {table} WHERE project=?1"),
+                        [project]
+                    )?,
+                    0
+                );
+            }
+            Ok(())
+        })?;
+        enrollment(selected, &|| Ok(()))?;
+        enrollment(selected, &|| Ok(()))?;
         assert_eq!(
             store.transact(|db| count(
                 db,

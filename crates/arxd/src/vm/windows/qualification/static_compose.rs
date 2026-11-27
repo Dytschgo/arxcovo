@@ -5,7 +5,7 @@
     reason = "consumed by the Part B disposable collector and foreground adapter"
 )]
 
-mod enrollment;
+pub(super) mod enrollment;
 mod reviewed_network;
 mod route_watch;
 
@@ -101,12 +101,12 @@ impl PreparedStaticDossier {
             .reopen_without_writer()
             .map_err(|_| REFUSAL)?;
         let bytes = read_bounded(&enrollment_file, MAX_ENROLLMENT_BYTES).map_err(|_| REFUSAL)?;
-        let enrollment: enrollment::Enrollment =
-            serde_json::from_slice(&bytes).map_err(|_| REFUSAL)?;
-        if enrollment.class != crate::vm::qualification_record::Class::Docker {
-            return Err(REFUSAL);
-        }
-        let witness = enrollment.network_witness.file();
+        let enrollment = enrollment::Enrollment::parse(&bytes)?;
+        let witness = enrollment
+            .network_witness
+            .as_ref()
+            .ok_or(NativeRefusal::NetworkFenceUnverified)?
+            .file();
         let reviewed = hold_file(witness.path, witness.pin, reviewed_network::MAX_BYTES)
             .map_err(|_| NativeRefusal::NetworkFenceUnverified)?;
         if !sink::held_private(&reviewed.leaf, m4.owner())

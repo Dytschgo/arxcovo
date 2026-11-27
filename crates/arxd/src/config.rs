@@ -1051,6 +1051,44 @@ impl VmCustody {
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn open_static_backup(
+        &self,
+    ) -> Result<Option<crate::vm::compose_backup::ManagedBackupDir>> {
+        let Some(root) = self
+            .static_inputs
+            .as_ref()
+            .and_then(|inputs| inputs.backup.as_ref())
+        else {
+            return Ok(None);
+        };
+        self.verify()?;
+        let directory = crate::vm::compose_backup::ManagedBackupDir::new(
+            &root.configured,
+            &self.configured_state,
+            self.secret
+                .as_ref()
+                .map(|secret| secret.configured.as_path()),
+        )
+        .map_err(|_| StaticComposeCustodyRefusal)?;
+        self.verify()?;
+        Ok(Some(directory))
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn static_backup_capacity(&self) -> Result<crate::vm::Capacity> {
+        self.verify()?;
+        let root = self
+            .static_inputs
+            .as_ref()
+            .and_then(|inputs| inputs.backup.as_ref())
+            .ok_or(StaticComposeCustodyRefusal)?;
+        let capacity = crate::vm::qualification::backup_capacity(&self.state.leaf, &root.pin.leaf)
+            .map_err(|_| anyhow::anyhow!("Compose backup capacity unavailable"))?;
+        self.verify()?;
+        Ok(capacity)
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn open_ciphertext(&self, reference: crate::vm::Id) -> Result<std::fs::File> {
         let secret = self.secret.as_ref().ok_or(ComposeCustodyRefusal)?;
         let volume = full_directory_identity(&secret.pin.leaf)?.volume;
@@ -1859,6 +1897,17 @@ impl TestVms {
 
     pub(crate) fn has_static_compose(&self) -> bool {
         self.static_compose.is_some()
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn take_static_backup_targets(
+        &mut self,
+    ) -> Vec<crate::vm::compose_backup::TargetEnrollment> {
+        self.static_compose
+            .as_mut()
+            .and_then(|profile| profile.backup.as_mut())
+            .map(|backup| std::mem::take(&mut backup.targets))
+            .unwrap_or_default()
     }
 
     pub(crate) fn recipe(&self) -> Result<Option<([u8; 16], [u8; 32])>> {

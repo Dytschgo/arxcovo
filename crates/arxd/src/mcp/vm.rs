@@ -440,11 +440,9 @@ impl Supervisor {
                 crate::vm::compose_secrets::Dpapi::new(custody.clone()),
             ));
         }
-        // Static release/backup enrollment waits for the selected live
-        // runtime. The legacy profile retains its existing enrollment path.
+        // The static enrollment transaction is bound to the selected recipe.
         if !static_enabled && !profile.compose_releases.is_empty() {
-            let enrollments = profile
-                .compose_releases
+            let enrollments = std::mem::take(&mut profile.compose_releases)
                 .into_iter()
                 .map(compose::ReleaseInput::enroll)
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -468,6 +466,15 @@ impl Supervisor {
             let selected = Err(NativeRefusal::UnsupportedPlatform);
             custody.verify()?;
             state.install_static_selection(selected)?;
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if let Some(Ok(selection)) = &state.selected_static {
+                selection.enroll_runtime(
+                    state.controller.compose_store(),
+                    &mut state.compose_backup,
+                    &mut profile,
+                    &custody,
+                )?;
+            }
         }
         state.custody = Some(custody);
         let gate = state
@@ -2875,7 +2882,6 @@ impl VmInventory {
         let store = self.supervisor.controller.compose_store();
         let _ = self.supervisor.compose_backup.reconcile_partials(store);
         let session = self.supervisor.compose_backup.session(target.vm);
-        let capacity = self.supervisor.compose_backup.capacity();
         let custody_present = self.supervisor.compose_backup.custody().is_some();
 
         let admission = store.transact(|tx| {
@@ -2911,7 +2917,7 @@ impl VmInventory {
                 |tx, staging_bytes| {
                     self.supervisor.controller.validate_compose_backup_disk(
                         tx,
-                        capacity,
+                        self.supervisor.compose_backup.capacity(),
                         staging_bytes,
                     )
                 },
@@ -16982,6 +16988,106 @@ pub(crate) mod tests {
             byte = peer.read_u8() => panic!("unexpected guest traffic or channel closure: {byte:?}"),
             () = std::future::ready(()) => (),
         }
+    }
+
+    #[tokio::test]
+    async fn compose_backup_rechecks_held_capacity_before_guest_io_and_host_staging() {
+        use compose_backup::{BackupHost, BackupOpStatus};
+        let h = Harness::start_with_web(false, false, true).await;
+        let client = h.client(0).await;
+        let (_, vm, generation, target, root, managed) =
+            setup_compose_backup_project(&h, &client, 5900, 64 * 1024).await;
+        let boot = 5901;
+        let mut peer = backup_test_peer(&h, vm, generation, boot).await;
+        let supervisor = h.supervisor();
+        let controller = &supervisor.controller;
+        let session = supervisor.compose_backup.session(vm).unwrap();
+
+        let mut backup = BackupHost::default();
+        let samples = Arc::new(AtomicU64::new(0));
+        let counter = samples.clone();
+        backup
+            .install_native(controller.compose_store(), managed, move || {
+                matches!(counter.fetch_add(1, Ordering::SeqCst), 1 | 2).then_some(Capacity {
+                    free_bytes: 150 << 30,
+                    managed_bytes: 0,
+                })
+            })
+            .unwrap();
+
+        let cancel = Shutdown::default();
+        let rejected = admit_test_backup(&h, &target, 5910);
+        backup
+            .drive(
+                controller,
+                "alpha",
+                RequestId::parse(&key(5910)).unwrap().key,
+                &target,
+                session.clone(),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_no_queued_frame(&mut peer).await;
+        assert_eq!(replay_test_backup(&h, 5910).status, BackupOpStatus::Failed);
+
+        let releases = Arc::new(AtomicU64::new(0));
+        let payload = vec![0u8; 512];
+        let digest = hex::encode(Sha256::digest(&payload));
+        let guest = tokio::spawn(serve_backup_payloads(
+            peer,
+            boot,
+            [(payload, digest)].into(),
+            releases.clone(),
+        ));
+        let lost = admit_test_backup(&h, &target, 5911);
+        backup
+            .drive(
+                controller,
+                "alpha",
+                RequestId::parse(&key(5911)).unwrap().key,
+                &target,
+                session,
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(samples.load(Ordering::SeqCst), 4);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        for (nonce, intent) in [(5910, rejected), (5911, lost)] {
+            let settled = replay_test_backup(&h, nonce);
+            assert_eq!(settled.status, BackupOpStatus::Failed);
+            controller
+                .compose_store()
+                .transact(|tx| {
+                    let row: (String, u64, Option<String>) = tx.query_row(
+                        "SELECT b.state,b.host_staging_charge,o.failure
+                     FROM vm_compose_backups b JOIN vm_compose_backup_ops o ON o.backup_id=b.id
+                     WHERE b.id=?1",
+                        [intent.backup_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?;
+                    assert_eq!(
+                        row,
+                        (
+                            "cleaned".into(),
+                            0,
+                            Some("backup_capacity_unavailable".into())
+                        )
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+        for leaf in ["staging", "settled"] {
+            assert!(
+                std::fs::read_dir(root.path().join(leaf))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
+        guest.abort();
     }
 
     #[tokio::test]
