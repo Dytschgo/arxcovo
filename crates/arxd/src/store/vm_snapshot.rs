@@ -270,16 +270,38 @@ pub(crate) fn list(
     Ok(Ok(rows.collect::<rusqlite::Result<_>>()?))
 }
 
+/// A snapshot precheck refusal. `Retiring` is the transient post-restore
+/// case and keeps the `cleanup_unconfirmed` wire reason and audit code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refused {
+    Plain(Refusal),
+    /// The only unsettled work is an accounted post-restore retire the
+    /// reaper is authorized to dispose on its next sweep.
+    Retiring,
+}
+
+impl Refused {
+    pub(crate) fn reason(self) -> Refusal {
+        match self {
+            Self::Plain(reason) => reason,
+            Self::Retiring => Refusal::CleanupUnconfirmed,
+        }
+    }
+}
+
+/// Admission maps [`Refused::reason`]; the foreground keeps the
+/// retiring/held distinction of unsettled work.
 pub(crate) fn precheck(
     db: &Connection,
     principal: &str,
     vm: Id,
     request: &crate::vm::snapshot::Request,
     now: i64,
-) -> Result<Result<bool, Refusal>> {
+) -> Result<Result<bool, Refused>> {
     use crate::vm::snapshot::Request;
+    let refused = |reason| Ok(Err(Refused::Plain(reason)));
     let Some(owner) = owner(db, principal, vm)? else {
-        return Ok(Err(Refusal::NotFound));
+        return refused(Refusal::NotFound);
     };
     let is_static = matches!(owner, Owner::Static(_));
     if let Request::Restore(id) | Request::Delete(id) = request {
@@ -289,30 +311,34 @@ pub(crate) fn precheck(
             params![id, vm], |row| row.get(0),
         ).optional()?;
         if is_static && matches!(request, Request::Delete(_)) && state.is_some() {
-            return Ok(Err(Refusal::StaticBackupDeleteForbidden));
+            return refused(Refusal::StaticBackupDeleteForbidden);
         }
         if state.as_deref() != Some("ready") {
-            return Ok(Err(Refusal::NotFound));
+            return refused(Refusal::NotFound);
         }
     }
     if is_static && !route_quiescent(db, vm)? {
-        return Ok(Err(Refusal::SnapshotPublishNotQuiesced));
+        return refused(Refusal::SnapshotPublishNotQuiesced);
     }
     match owner {
         Owner::Test { state, expires } if state == 4 || expires <= now => {
-            return Ok(Err(Refusal::Expired));
+            return refused(Refusal::Expired);
         }
         Owner::Static(StaticState::Recovering) | Owner::Test { state: 3, .. } => {
-            return Ok(Err(Refusal::CleanupUnconfirmed));
+            return refused(Refusal::CleanupUnconfirmed);
         }
         Owner::Static(StaticState::Stopped) | Owner::Test { state: 1, .. } => {}
-        _ => return Ok(Err(Refusal::SnapshotOfflineRequired)),
+        _ => return refused(Refusal::SnapshotOfflineRequired),
     }
     if has_pending_vm_activity(db, vm)? {
-        return Ok(Err(Refusal::Busy));
+        return refused(Refusal::Busy);
     }
     if unsettled(db, vm)? {
-        return Ok(Err(Refusal::CleanupUnconfirmed));
+        return Ok(Err(if retiring(db, vm)? {
+            Refused::Retiring
+        } else {
+            Refused::Plain(Refusal::CleanupUnconfirmed)
+        }));
     }
     let create = matches!(request, Request::Create(_));
     if create || (is_static && matches!(request, Request::Restore(_))) {
@@ -323,7 +349,7 @@ pub(crate) fn precheck(
             POINTS_PER_VM
         };
         if per_vm >= limit || host >= POINTS_PER_HOST {
-            return Ok(Err(Refusal::SnapshotLimit));
+            return refused(Refusal::SnapshotLimit);
         }
     }
     if let Request::Create(Some(name)) = request
@@ -333,7 +359,7 @@ pub(crate) fn precheck(
             params![vm, name.as_str()],
         )? != 0
     {
-        return Ok(Err(Refusal::NameUnavailable));
+        return refused(Refusal::NameUnavailable);
     }
     Ok(Ok(is_static))
 }
@@ -356,6 +382,30 @@ pub(crate) fn unsettled(db: &Connection, vm: Id) -> Result<bool> {
         "SELECT count(*) FROM vm_snapshot_work WHERE vm=?1 OR static_vm=?1",
         [vm],
     )? != 0)
+}
+
+/// True only when the VM's single unsettled row is an unquarantined
+/// post-restore retire whose two leaves are accounted and which the reaper is
+/// authorized to dispose. Recovery, copies, abandoned or quarantined work and
+/// unaccounted leaves stay held: a sweep alone does not clear them.
+fn retiring(db: &Connection, vm: Id) -> Result<bool> {
+    let generation: Option<Id> = db
+        .query_row(
+            "SELECT expected FROM vm_snapshot_work
+             WHERE vm=?1 AND phase='retire' AND quarantine_audited=0",
+            [vm],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(generation) = generation else {
+        return Ok(false);
+    };
+    let kind = CleanupKind::Snapshot { vm, generation };
+    Ok(cleanup_work(db, kind, vm, generation)?.is_some_and(|work| {
+        work.accounted
+            && work.artifacts.len() == 2
+            && work.snapshot_phase.as_deref() == Some("retire")
+    }))
 }
 
 pub(crate) fn invalidate_release(db: &Connection, vm: Id, epoch: Id) -> Result<()> {

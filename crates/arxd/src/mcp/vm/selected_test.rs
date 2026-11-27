@@ -178,15 +178,15 @@ impl SelectedTest {
             return caller.refuse(
                 action,
                 request.vm(),
-                Fault(native_reason(NativeRefusal::QualificationMissing)),
+                Fault::new(native_reason(NativeRefusal::QualificationMissing)),
             );
         }
         let subject = request.vm();
         let refuse = |reason: Fault| caller.refuse::<Value>(action, subject, reason);
-        let native = |reason: NativeRefusal| refuse(Fault(native_reason(reason)));
+        let native = |reason: NativeRefusal| refuse(Fault::new(native_reason(reason)));
         let live_host = || {
             self.live_host()
-                .or_else(|reason| caller.refuse(action, subject, Fault(native_reason(reason))))
+                .or_else(|reason| caller.refuse(action, subject, Fault::new(native_reason(reason))))
         };
         let supervisor = &caller.supervisor;
         let ctl = &supervisor.controller;

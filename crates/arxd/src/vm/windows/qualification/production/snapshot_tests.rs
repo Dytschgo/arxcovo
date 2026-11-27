@@ -1993,7 +1993,9 @@ fn test_delete_disposes_one_point_and_static_backup_delete_is_refused() {
         fx.ctl()
             .foreground_snapshot_precheck("alice", static_vm, &Request::Delete(backup))
             .unwrap(),
-        Err(crate::vm::Refusal::StaticBackupDeleteForbidden)
+        Err(crate::store::vm::snapshot::Refused::Plain(
+            crate::vm::Refusal::StaticBackupDeleteForbidden
+        ))
     );
     let guards = GenerationGuards::default();
     let ledger = LedgerDisposal { store: fx.store() };
