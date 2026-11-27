@@ -1764,3 +1764,96 @@ fn per_step_contention_windows_stop_at_cancellation_or_revocation() {
     }
     assert_admission_closed();
 }
+
+#[test]
+fn trailing_guard_refuses_revocation_between_attempts() {
+    use std::{cell::Cell, sync::mpsc};
+
+    let fixture = Fixture::new();
+    let issuer = fixture.issuer();
+    let (worker, target) = fixture.script();
+    let intent = issuer.intent(&worker, target, &fixture.cancel).unwrap();
+    let captured = issuer.refresh().unwrap();
+    let store = fixture.ctl.store_for_test();
+    let (holding, held) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let (unlocked, wait_unlocked) = mpsc::channel();
+    let attempts = Cell::new(0);
+    let contended = Cell::new(false);
+
+    let result = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            store
+                .read_only(|_| {
+                    holding.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(2)).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            unlocked.send(()).unwrap();
+        });
+        held.recv_timeout(Duration::from_secs(2)).unwrap();
+        retry_contended(
+            &|| fixture.cancel.is_cancelled(),
+            &|| {
+                let revoked = issuer.epoch().effects_revoked();
+                if contended.replace(false) {
+                    // The failed attempt observed an open epoch. Revoke it
+                    // before re-entry and make the next store read possible.
+                    assert!(!revoked);
+                    fixture.fault(Some(Confirmed(REFUSED)));
+                    assert_eq!(issuer.refresh(), Err(REFUSED));
+                    fixture.fault(None);
+                    release.send(()).unwrap();
+                    wait_unlocked.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                revoked
+            },
+            || REFUSED,
+            || {
+                attempts.set(attempts.get() + 1);
+                let result = intent.guard(&[], None);
+                if attempts.get() == 1 {
+                    assert_eq!(result, Err(REFUSED));
+                    contended.set(true);
+                }
+                result
+            },
+        )
+    });
+
+    assert!(issuer.epoch().effects_revoked());
+    assert_eq!(intent.guard(&[], None), Ok(()));
+    assert_eq!(fresh_observation(captured, Instant::now(), REFUSED), Ok(()));
+    assert_eq!(result, Err(NativeRefusal::QualificationMissing));
+    assert_eq!(attempts.get(), 1);
+}
+
+#[test]
+fn trailing_guard_refuses_cancellation_racing_a_successful_read() {
+    let fixture = Fixture::new();
+    let issuer = fixture.issuer();
+    let (worker, target) = fixture.script();
+    let intent = issuer.intent(&worker, target, &fixture.cancel).unwrap();
+    let captured = issuer.refresh().unwrap();
+
+    let result = retry_contended(
+        &|| fixture.cancel.is_cancelled(),
+        &|| issuer.epoch().effects_revoked(),
+        || REFUSED,
+        || {
+            let guard = intent.guard(&[], None);
+            assert_eq!(guard, Ok(()));
+            // Cancel on a peer after the store read, before the retry can
+            // accept its success.
+            std::thread::scope(|scope| {
+                scope.spawn(|| fixture.cancel.cancel()).join().unwrap();
+            });
+            guard
+        },
+    );
+
+    assert!(!issuer.epoch().effects_revoked());
+    assert_eq!(fresh_observation(captured, Instant::now(), REFUSED), Ok(()));
+    assert_eq!(result, Err(NativeRefusal::QualificationMissing));
+}

@@ -1626,8 +1626,8 @@ pub(crate) fn operation_status(
     operation: Id,
     now: i64,
 ) -> Result<Option<OperationStatus>> {
-    // A poll never writes: no journal or flush holds the store lock that
-    // nonblocking TEST workers and monitors try.
+    // Keep the receipt read separate from any clock advance on expiry so
+    // active polling does not hold the store lock through a commit.
     let now = retry_time_readonly(db, now)?;
     Ok(db
         .query_row(
@@ -1693,6 +1693,25 @@ pub(crate) fn operation_status(
             },
         )
         .optional()?)
+}
+
+/// A retained receipt was hidden by this poll's wall time and would still
+/// be visible at the persisted retry-clock high water.
+pub(crate) fn operation_expiry_needs_clock_advance(
+    db: &Connection,
+    principal: &str,
+    operation: Id,
+    now: i64,
+) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM vm_operations o CROSS JOIN vm_retry_clock c
+            WHERE o.principal=?1 AND o.operation_id=?2 AND o.status<>0
+              AND o.valid_through_ms>=c.high_water_ms AND o.valid_through_ms<?3
+        )",
+        params![principal, operation, now],
+        |row| row.get(0),
+    )?)
 }
 
 #[allow(dead_code, reason = "foreground MCP projection is wired in 4d")]

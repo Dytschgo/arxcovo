@@ -53,16 +53,24 @@ const CONTENTION_RETRY: Duration = Duration::from_millis(5);
 
 /// Retries `attempt` through transient refusal until it succeeds, the
 /// worker is cancelled, the selection epoch is revoked or
-/// [`CONTENTION_BUDGET`] passes, and returns the last result.
+/// [`CONTENTION_BUDGET`] passes. Cancellation and revocation return the
+/// explicit refusal even when an attempt succeeded.
 pub(crate) fn retry_contended<T, E>(
     cancelled: &dyn Fn() -> bool,
     revoked: &dyn Fn() -> bool,
+    refusal: impl FnOnce() -> E,
     mut attempt: impl FnMut() -> Result<T, E>,
 ) -> Result<T, E> {
     let deadline = Instant::now() + CONTENTION_BUDGET;
     loop {
+        if cancelled() || revoked() {
+            return Err(refusal());
+        }
         let result = attempt();
-        if result.is_ok() || cancelled() || revoked() || Instant::now() >= deadline {
+        if cancelled() || revoked() {
+            return Err(refusal());
+        }
+        if result.is_ok() || Instant::now() >= deadline {
             return result;
         }
         std::thread::sleep(CONTENTION_RETRY);
@@ -73,12 +81,19 @@ pub(crate) fn retry_contended<T, E>(
 pub(crate) async fn retry_contended_async<T, E>(
     cancelled: &dyn Fn() -> bool,
     revoked: &dyn Fn() -> bool,
+    refusal: impl FnOnce() -> E,
     mut attempt: impl FnMut() -> Result<T, E>,
 ) -> Result<T, E> {
     let deadline = Instant::now() + CONTENTION_BUDGET;
     loop {
+        if cancelled() || revoked() {
+            return Err(refusal());
+        }
         let result = attempt();
-        if result.is_ok() || cancelled() || revoked() || Instant::now() >= deadline {
+        if cancelled() || revoked() {
+            return Err(refusal());
+        }
+        if result.is_ok() || Instant::now() >= deadline {
             return result;
         }
         tokio::time::sleep(CONTENTION_RETRY).await;
@@ -473,9 +488,22 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         // trailing guard passes, so the retries never extend its freshness.
         let cancelled = || self.cancel.is_cancelled();
         let revoked = || self.issuer.epoch.effects_revoked();
-        retry_contended(&cancelled, &revoked, || self.guard(slots, inspection))?;
-        let captured = retry_contended(&cancelled, &revoked, || self.issuer.refresh())?;
-        retry_contended(&cancelled, &revoked, || self.guard(slots, inspection))?;
+        retry_contended(
+            &cancelled,
+            &revoked,
+            || REFUSED,
+            || self.guard(slots, inspection),
+        )?;
+        let captured = retry_contended(&cancelled, &revoked, || REFUSED, || self.issuer.refresh())?;
+        retry_contended(
+            &cancelled,
+            &revoked,
+            || REFUSED,
+            || self.guard(slots, inspection),
+        )?;
+        if cancelled() || revoked() {
+            return Err(REFUSED);
+        }
         fresh_observation(captured, Instant::now(), REFUSED)
     }
 

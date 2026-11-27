@@ -91,9 +91,12 @@ pub(super) fn refresh_pre_seal<S: SelectedSource, C: Clock>(
     issuer: &TestIssuer<'_, S, C>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Instant, Q> {
-    crate::vm::test_issuer::retry_contended(cancelled, &|| issuer.epoch().effects_revoked(), || {
-        issuer.refresh()
-    })
+    crate::vm::test_issuer::retry_contended(
+        cancelled,
+        &|| issuer.epoch().effects_revoked(),
+        || Q::QualificationMissing,
+        || issuer.refresh(),
+    )
 }
 
 impl<S: SelectedSource, C: Clock> Effects for Checked<'_, S, C> {

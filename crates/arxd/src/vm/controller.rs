@@ -552,12 +552,24 @@ impl<C: Clock> VmController<C> {
         if validate_principal(principal).is_err() {
             return Ok(Err(Refusal::NotFound));
         }
-        self.store.read_only(|db| {
-            Ok(
-                store::operation_status(db, principal, id, utc(self.clock.now())?)?
-                    .ok_or(Refusal::NotFound),
-            )
-        })
+        let (status, advance_to) = self.store.read_only(|db| {
+            let now = utc(self.clock.now())?;
+            let status = store::operation_status(db, principal, id, now)?;
+            let advance_to = if status.is_none()
+                && store::operation_expiry_needs_clock_advance(db, principal, id, now)?
+            {
+                Some(now)
+            } else {
+                None
+            };
+            Ok((status, advance_to))
+        })?;
+        if let Some(now) = advance_to {
+            // Persist the time observed by the poll even if UTC moved back
+            // while acquiring the writer. retry_time also preserves newer writes.
+            self.store.transact(|db| store::retry_time(db, now))?;
+        }
+        Ok(status.ok_or(Refusal::NotFound))
     }
 
     #[allow(dead_code, reason = "foreground MCP projection is wired in 4d")]
@@ -2156,6 +2168,9 @@ impl<C: Clock> VmController<C> {
                     return Ok(refused(match owned_vm(db, principal, vm)? {
                         None if store::expired_status(db, principal, vm)?.is_some() => {
                             Err(Refusal::Expired)
+                        }
+                        None if store::static_vm::owned_state(db, principal, vm)?.is_some() => {
+                            Ok(())
                         }
                         None => Err(Refusal::NotFound),
                         Some(lease) => lease.check(now),
@@ -3873,5 +3888,81 @@ impl<C: Clock> VmController<C> {
         );
         self.store
             .transact(|db| store::snapshot::fail_copy(db, work, leaves, utc(self.clock.now())?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PollClock(Mutex<ClockReading>);
+
+    impl Clock for PollClock {
+        fn now(&self) -> ClockReading {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn operation_status_cannot_resurrect_an_expired_receipt_after_utc_rollback() {
+        const NOW: i64 = 1_800_000_000_000;
+        let root = crate::service::application::tests::private_temp();
+        let ctl = VmController::open(
+            root.path(),
+            VmPolicy::default(),
+            PollClock(Mutex::new(ClockReading {
+                utc_ms: NOW,
+                monotonic: Instant::now(),
+            })),
+        )
+        .unwrap();
+        let binding = store::Binding {
+            principal: "alice",
+            key: RequestId {
+                key: [1; 16],
+                issued_at_ms: NOW,
+            },
+            subject: Subject::Vm([2; 16]),
+            action: Action::Start as i64,
+        };
+        let operation = ctl
+            .store
+            .transact(|db| {
+                store::retry_time(db, NOW)?;
+                binding.record(db, NOW, Some([2; 16]), None)
+            })
+            .unwrap();
+        let set_utc = |utc_ms| ctl.clock.0.lock().unwrap().utc_ms = utc_ms;
+        let poll = || ctl.operation_status("alice", operation.id).unwrap();
+        let high_water = || {
+            ctl.store
+                .read_only(|db| store::count(db, "SELECT high_water_ms FROM vm_retry_clock", []))
+                .unwrap()
+        };
+        let last_valid = NOW + RETRY_WINDOW_MS;
+        set_utc(last_valid + 1);
+        assert_eq!(poll().unwrap().state, Status::Pending);
+        assert_eq!(high_water(), NOW);
+
+        ctl.store
+            .transact(|db| {
+                store::finish(
+                    db,
+                    operation.receipt.activity_id,
+                    Status::Succeeded,
+                    NOW,
+                    Some(true),
+                )
+            })
+            .unwrap();
+        set_utc(last_valid);
+        assert_eq!(poll().unwrap().state, Status::Succeeded);
+        assert_eq!(high_water(), NOW);
+
+        set_utc(last_valid + 1);
+        assert_eq!(poll(), Err(Refusal::NotFound));
+        set_utc(last_valid);
+        assert_eq!(poll(), Err(Refusal::NotFound));
+        assert_eq!(high_water(), last_valid + 1);
     }
 }

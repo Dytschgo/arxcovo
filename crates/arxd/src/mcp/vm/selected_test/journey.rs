@@ -77,6 +77,7 @@ impl GuestPeer<'_> {
         crate::vm::test_issuer::retry_contended_async(
             &|| cancel.is_cancelled(),
             &|| self.issuer.epoch().effects_revoked(),
+            || NativeRefusal::QualificationMissing,
             refresh,
         )
         .await
@@ -156,7 +157,10 @@ struct Session {
 
 impl Session {
     fn new(supervisor: &Arc<Supervisor>, now: Arc<AtomicI64>) -> Self {
-        let connection = supervisor.connection("alice".into());
+        Self::with_connection(supervisor.connection("alice".into()), now)
+    }
+
+    fn with_connection(connection: Connection, now: Arc<AtomicI64>) -> Self {
         Self {
             inventory: connection.inventory(),
             _connection: connection,
@@ -862,8 +866,8 @@ async fn closed_admission_withdraws_witness_and_settles_exact_owner_stop() {
     advance.abort();
 }
 
-/// P2-2: a caller-owned Static VM reaching the selected TEST dispatch is
-/// refused, audited, as unqualified rather than unknown.
+/// Foreground admission audits owned Static requests as unqualified and
+/// withholds the VM identity from a different authenticated principal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_dispatch_refuses_a_static_vm_as_unqualified() {
     let dir = fixture_root();
@@ -871,7 +875,7 @@ async fn selected_dispatch_refuses_a_static_vm_as_unqualified() {
     let now = Arc::new(AtomicI64::new(UTC));
     let (supervisor, _) = fixture_foreground(root, &now);
     let _close = CloseOnDrop(supervisor.clone());
-    let session = Session::new(&supervisor, now.clone());
+    let mut session = Session::new(&supervisor, now.clone());
     set_busy(&supervisor, false);
     supervisor
         .controller
@@ -891,23 +895,79 @@ async fn selected_dispatch_refuses_a_static_vm_as_unqualified() {
             Ok(())
         })
         .unwrap();
-    let audited = "SELECT count(*) FROM activity WHERE status=4
-        AND vm=unhex('02020202020202020202020202020202')";
-    assert_eq!(session.count(audited), 0);
-    let selected = supervisor.selected_test.clone().unwrap();
-    let refused = {
-        let mut gate = supervisor.lock().unwrap();
-        selected.dispatch(
-            &session.inventory,
-            &mut gate,
-            Action::Start as i64,
-            Mutation {
-                key: RequestId::parse(&crate::mcp::vm::tests::key(7)).unwrap(),
-                id: [2; 16],
-                work: Work::Start,
-            },
-        )
-    };
-    assert_eq!(refused.unwrap_err().0, "qualification_missing");
-    assert_eq!(session.count(audited), 1);
+    let vm = [2; 16];
+    let vm_id = hex::encode(vm);
+    assert_eq!(
+        supervisor
+            .controller
+            .foreground_snapshot_precheck("alice", vm, &SnapshotRequest::Create(None))
+            .unwrap(),
+        Ok(true)
+    );
+    assert!(supervisor.publisher.snapshot_route(vm).is_some());
+
+    let effects = [
+        "SELECT count(*) FROM vm_operations",
+        "SELECT count(*) FROM vm_disk_claims",
+        "SELECT count(*) FROM vm_artifacts",
+        "SELECT count(*) FROM vm_snapshot_work",
+        "SELECT count(*) FROM activity WHERE status<>4",
+    ];
+    for sql in effects {
+        assert_eq!(session.count(sql), 0, "{sql}");
+    }
+    let mutations = [
+        ("vm_start", Action::Start, json!({"vm_id":vm_id})),
+        (
+            "vm_extend",
+            Action::Extend,
+            json!({"vm_id":vm_id,"ttl_s":600}),
+        ),
+        (
+            "vm_snapshot_create",
+            Action::Snapshot,
+            json!({"vm_id":vm_id}),
+        ),
+    ];
+    for (tool, action, args) in &mutations {
+        assert_eq!(
+            session.mutate(tool, args.clone()).unwrap_err().0,
+            "qualification_missing",
+            "{tool}"
+        );
+        assert_eq!(
+            session.count(&format!(
+                "SELECT count(*) FROM activity WHERE status=4 AND principal='alice'
+                 AND vm=unhex('{vm_id}') AND action={} AND reason={}",
+                *action as i64,
+                Refusal::QualificationMissing as i64,
+            )),
+            1,
+            "{tool}"
+        );
+    }
+
+    let mut foreign = Session::with_connection(supervisor.connection("bob".into()), now);
+    for (tool, action, args) in mutations {
+        assert_eq!(
+            foreign.mutate(tool, args).unwrap_err().0,
+            "not_found",
+            "{tool}"
+        );
+        assert_eq!(
+            session.count(&format!(
+                "SELECT count(*) FROM activity WHERE status=4 AND principal='bob'
+                 AND vm IS NULL AND action={} AND reason={}",
+                action as i64,
+                Refusal::NotFound as i64,
+            )),
+            1,
+            "{tool}"
+        );
+    }
+    for sql in effects {
+        assert_eq!(session.count(sql), 0, "{sql}");
+    }
+    assert_eq!(session.count("SELECT count(*) FROM vm_generations"), 1);
+    assert_eq!(session.count("SELECT state FROM vm_static_instances"), 1);
 }

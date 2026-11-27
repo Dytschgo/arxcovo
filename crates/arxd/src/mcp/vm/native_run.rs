@@ -849,9 +849,12 @@ impl Run {
         };
         let stopped = || self.cancel.is_cancelled() || supervisor.cancel.is_cancelled();
         let revoked = || issuer.epoch().effects_revoked();
-        let Ok(scope) = retry_contended_async(&stopped, &revoked, || {
-            controller.native_workspace_scope(self.target.generation)
-        })
+        let Ok(scope) = retry_contended_async(
+            &stopped,
+            &revoked,
+            || anyhow::anyhow!("TEST qualification missing"),
+            || controller.native_workspace_scope(self.target.generation),
+        )
         .await
         else {
             // No workspace was touched. Hand the committed epoch to recovery
@@ -879,9 +882,12 @@ impl Run {
                     .map_err(fail)?;
                 let (slots, evidence) = start.active.golden.ok_or_else(|| fail(PATH))?;
                 let golden = binding(
-                    retry_contended_async(&stopped, &revoked, || {
-                        controller.native_workspace_scope(slots.disk.generation)
-                    })
+                    retry_contended_async(
+                        &stopped,
+                        &revoked,
+                        || anyhow::anyhow!("TEST qualification missing"),
+                        || controller.native_workspace_scope(slots.disk.generation),
+                    )
                     .await
                     .map_err(|_| fail(PATH))?,
                 );

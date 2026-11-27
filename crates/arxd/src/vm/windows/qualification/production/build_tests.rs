@@ -1300,9 +1300,12 @@ impl super::super::FixtureQualification {
             let recipe = intent
                 .build_recipe()
                 .ok_or_else(|| anyhow::anyhow!("admitted build recipe"))?;
-            let origin = retry_contended(&cancelled, &revoked, || {
-                StorePins::open(&self.production)?.origin(store, boot::marker()?)
-            })
+            let origin = retry_contended(
+                &cancelled,
+                &revoked,
+                || NativeRefusal::QualificationMissing,
+                || StorePins::open(&self.production)?.origin(store, boot::marker()?),
+            )
             .map_err(|_| anyhow::anyhow!("fixture build origin"))?;
             let primary = reserve(slots.pair.disk.generation)?;
             Ok::<_, anyhow::Error>((intent, recipe, origin, primary))

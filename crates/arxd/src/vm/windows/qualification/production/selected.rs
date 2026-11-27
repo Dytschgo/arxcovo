@@ -70,11 +70,13 @@ impl ForegroundQualification {
                     .ok_or(NativeRefusal::PathCustodyUnverified)
             },
             |golden| {
-                let scope =
-                    retry_contended(&cancelled, &|| issuer.epoch().effects_revoked(), || {
-                        controller.native_workspace_scope(golden.slots().disk.generation)
-                    })
-                    .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
+                let scope = retry_contended(
+                    &cancelled,
+                    &|| issuer.epoch().effects_revoked(),
+                    || anyhow::anyhow!("TEST qualification missing"),
+                    || controller.native_workspace_scope(golden.slots().disk.generation),
+                )
+                .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
                 self.hold_golden(
                     &ledger,
                     binding_from_scope(scope),

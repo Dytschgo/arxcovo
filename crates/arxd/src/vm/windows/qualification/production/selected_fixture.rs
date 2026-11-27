@@ -103,9 +103,12 @@ impl FixtureQualification {
         cancelled: &dyn Fn() -> bool,
         revoked: &dyn Fn() -> bool,
     ) -> Result<HeldGolden, NativeRefusal> {
-        let binding = retry_contended(cancelled, revoked, || {
-            controller.native_workspace_scope(golden.slots().disk.generation)
-        })
+        let binding = retry_contended(
+            cancelled,
+            revoked,
+            || anyhow::anyhow!("TEST qualification missing"),
+            || controller.native_workspace_scope(golden.slots().disk.generation),
+        )
         .map_err(|_| PATH)?;
         HeldGolden::hold(
             &self.production,
@@ -351,9 +354,12 @@ impl FixtureQualification {
         cancelled: &dyn Fn() -> bool,
         revoked: &dyn Fn() -> bool,
     ) -> anyhow::Result<ProductionWorkspace> {
-        let binding = binding_from_scope(retry_contended(cancelled, revoked, || {
-            controller.native_workspace_scope(generation)
-        })?);
+        let binding = binding_from_scope(retry_contended(
+            cancelled,
+            revoked,
+            || anyhow::anyhow!("TEST qualification missing"),
+            || controller.native_workspace_scope(generation),
+        )?);
         let workspace = hold_workspace_under(&self.production, self.owner(), binding)
             .map_err(|_| anyhow::anyhow!("fixture run hold"))?;
         workspace
@@ -409,20 +415,25 @@ impl FixtureQualification {
         cancelled: &dyn Fn() -> bool,
         revoked: &dyn Fn() -> bool,
     ) -> Result<(), NativeRefusal> {
-        retry_contended(cancelled, revoked, || {
-            let origin =
-                recovery::StorePins::open(&self.production)?.origin(store, boot::marker()?)?;
-            store
-                .try_native_transaction(|db| {
-                    crate::store::vm::native::recovery::record_job(
-                        db,
-                        custody::scope(binding),
-                        epoch,
-                        origin,
-                    )
-                })
-                .map_err(|_| PATH)
-        })
+        retry_contended(
+            cancelled,
+            revoked,
+            || NativeRefusal::QualificationMissing,
+            || {
+                let origin =
+                    recovery::StorePins::open(&self.production)?.origin(store, boot::marker()?)?;
+                store
+                    .try_native_transaction(|db| {
+                        crate::store::vm::native::recovery::record_job(
+                            db,
+                            custody::scope(binding),
+                            epoch,
+                            origin,
+                        )
+                    })
+                    .map_err(|_| PATH)
+            },
+        )
     }
 }
 
