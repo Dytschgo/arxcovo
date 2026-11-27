@@ -108,13 +108,24 @@ paths, identities, credentials, and raw MCP transcripts are excluded.
   the seal `sha256` and the Ubuntu and Windows recipe pins. A missing or
   unverified dossier stays closed with `qualification_missing`, or with the
   selected refusal.
-- On Windows x64, `vault_test_version` opens when that selected catalog
-  verifies. `LaunchAuthority` is minted there for a consumed TEST launch
-  permit, and it stays uninhabited on other platforms.
-  `CandidateRuntime::capability` still does not return `Qualified`. An enabled
-  Windows x64 profile still yields `qualification_missing` from that method.
-  An absent or unverified dossier still makes `vault_test_version` return
-  `vm_admission_closed`. The qualified path stays **unverified on real
+- On Windows x64, `vault_test_available`
+  (`crates/arxd/src/mcp/vm/vault_test.rs:81`) checks
+  `selected.catalog().is_ok()` (`vault_test.rs:88`). That check is the
+  selected-catalog admission gate for a fresh vault test.
+  `crates/arxd/src/mcp/vm.rs:1578` supplies `vm_admission_closed` when that
+  check fails. That refusal applies to a fresh submission. The replay match
+  at `crates/arxd/src/vault/store.rs:224` returns the prior receipt at line
+  228 before `Write::Test` reaches the fresh admission gate (`store.rs:378`).
+  An absent or unverified dossier still fails a fresh `vault_test_version`
+  with `vm_admission_closed`. `CandidateRuntime::capability` still does not
+  return `Qualified`. An enabled Windows x64 profile still yields
+  `qualification_missing` from that method.
+- Launch authority is a separate step from that admission gate.
+  `Permit::consume` (`crates/arxd/src/vm/test_issuer.rs:774`, in the
+  `LaunchPermit` impl at line 773) reverifies the launch plan and then calls
+  `LaunchAuthority::new` (`test_issuer.rs:787`). The constructor is defined
+  at `crates/arxd/src/vm/runtime.rs:48`. Off Windows x64, `LaunchAuthority`
+  stays uninhabited. The qualified path stays **unverified on real
   hardware**.
 - Both journeys require the vault `oneOf` `list_activity` schema. The
   pre-vault activity object, and any other shape, is `schema_changed`.
