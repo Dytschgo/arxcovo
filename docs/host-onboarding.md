@@ -207,18 +207,21 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`, ADR 0015):
    workaround.
 
    `arxd: service-foreign-registration` has two sources (`owner_unix.rs`
-   `observe`): a file at `/Library/LaunchDaemons/com.arxcovo.arxd.plist` whose
-   bytes differ from Arxcovo's plist, or an opened plist that fails the
-   file-protection check even when those bytes are identical, or a launchd
-   job with this label whose plist path, program or arguments differ from
-   Arxcovo's. The opened file must be a regular file with one hard link,
-   owner and group `root:wheel`, mode `0644` and no ACL entries. A wrong
-   mode such as `0600`, a wrong owner or group, or a non-regular file
-   reports `service-foreign-registration`. A symlink fails the no-follow
-   open and reports `service-permissions`. The job mismatch applies when
-   `launchctl print` output has recognized structure and a recognized state
-   (`owner_query.rs:396`). Output with unrecognized structure or state
-   reports `service-manager`. Only `status` is
+   `observe`). The first is an opened file at
+   `/Library/LaunchDaemons/com.arxcovo.arxd.plist` whose bytes differ from
+   Arxcovo's plist, or that fails the file-protection check even when its
+   bytes match. The opened descriptor must be a regular file on a local
+   filesystem with one hard link, owner and group `root:wheel`, mode `0644`,
+   no ACL entries, and readable within the size limit. An opened file with
+   a wrong mode such as `0600`, the wrong owner or group, or an opened
+   non-regular descriptor reports `service-foreign-registration`. A path that
+   fails `open` itself, other than a missing file (`ENOENT`), reports
+   `service-permissions`, including a symlink (`O_NOFOLLOW`) and a
+   Unix-domain socket. The second source is a launchd job with this label
+   whose recognized `launchctl print` output (recognized structure and
+   state, `owner_query.rs:396`) has a plist path, program, or arguments
+   that differ from Arxcovo's. Unrecognized structure or state reports
+   `service-manager` once the query is reached. Only `status` is
    strictly read-only. The other verbs check first and change nothing when
    that first check reports it, but they check again later (`owner_plan.rs`),
    and nothing is rolled back: `install` can report it at its final check,
