@@ -54,17 +54,15 @@ impl Fixture {
         std::fs::set_permissions(self.path(name), std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// Publication's view: the worker daemon and the operator, whose current
+    /// groups in this fixture are the fixture group.
     fn access(&self) -> Access {
-        Access {
-            daemon: Identity {
-                uid: self.uid,
-                groups: vec![self.gid],
-            },
-            owner: Identity {
-                uid: self.ids().owner_uid,
-                groups: vec![self.gid],
-            },
-        }
+        let mut access = Access::worker(self.uid, self.gid);
+        access.owner = Some(Identity {
+            uid: self.ids().owner_uid,
+            groups: vec![self.gid],
+        });
+        access
     }
 
     fn qualify(&self, path: &Path, mode: u32) {
@@ -569,11 +567,11 @@ fn runtime_identities_must_search_every_directory_they_traverse() {
         uid: stranger_uid,
         groups: vec![fixture.gid],
     };
-    assert!(chain_searchable(&pass, &out, false, &member));
-    assert!(!chain_searchable(&pass, &out, false, &stranger));
+    assert!(chain_reachable(&pass, &out, false, &member));
+    assert!(!chain_reachable(&pass, &out, false, &stranger));
     fixture.chmod("config", 0o700);
     let (settings, _, pass) = check();
-    assert!(!chain_searchable(&pass, &out, false, &member));
+    assert!(!chain_reachable(&pass, &out, false, &member));
     // SAFETY: geteuid takes no pointers.
     if unsafe { libc::geteuid() } == 0 {
         // A root-owned 0700 output directory: the daemon cannot open the file.
@@ -589,11 +587,194 @@ fn runtime_identities_must_search_every_directory_they_traverse() {
     assert!(!blocked.permits(&pass, &settings, &out));
     let blocked = Access {
         daemon: fixture.access().daemon,
-        owner: stranger,
+        owner: Some(stranger),
     };
     fixture.chmod("config", 0o711);
     let (settings, _, pass) = check();
     assert!(!blocked.permits(&pass, &settings, &out));
+}
+
+/// An extended POSIX ACL xattr matching `mode`, plus a named-user entry that
+/// grants `named` nothing. Setting it keeps the mode bits unchanged.
+fn extended_acl(mode: u32, named: u32) -> Vec<u8> {
+    let (owner, group, other) = ((mode >> 6) & 7, (mode >> 3) & 7, mode & 7);
+    let mut value = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in [
+        (0x01u16, owner, u32::MAX),
+        (0x02, 0, named),
+        (0x04, group, u32::MAX),
+        (0x10, group, u32::MAX),
+        (0x20, other, u32::MAX),
+    ] {
+        value.extend(tag.to_le_bytes());
+        value.extend((perm as u16).to_le_bytes());
+        value.extend(id.to_le_bytes());
+    }
+    value
+}
+
+/// Sets or removes an xattr; `Ok(false)` when the filesystem has no ACLs.
+fn set_acl(path: &Path, attribute: &std::ffi::CStr, value: Option<&[u8]>) -> Result<bool, i32> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: path and attribute are NUL terminated; value is live.
+    let rc = unsafe {
+        match value {
+            Some(value) => libc::setxattr(
+                path.as_ptr(),
+                attribute.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            ),
+            None => libc::removexattr(path.as_ptr(), attribute.as_ptr()),
+        }
+    };
+    match rc {
+        0 => Ok(true),
+        _ => match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EOPNOTSUPP) => Ok(false),
+            other => Err(other.unwrap_or(-1)),
+        },
+    }
+}
+
+#[test]
+fn extended_acls_on_config_and_private_ancestors_are_refused() {
+    let fixture = Fixture::new();
+    let r = fixture.request(Role::Founder);
+    let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
+    let out = fixture.path("config/cluster.json");
+    write_private(&out, &bytes, (fixture.uid, fixture.gid), fixture.vet()).unwrap();
+    let other = fixture.path("config/other.json");
+    let check = || Settings::vetted_layout(&out, None, fixture.uid, &[], None).unwrap();
+    let worker = Access::worker(fixture.uid, fixture.gid);
+    let (settings, _, pass) = check();
+    assert!(worker.permits(&pass, &settings, &out));
+    let named = if fixture.uid == u32::MAX - 1 {
+        u32::MAX - 2
+    } else {
+        u32::MAX - 1
+    };
+    // The output directory (config ancestor), the custody parent and the
+    // control directory (private and owner-socket chains).
+    for (name, mode) in [("config", 0o711), ("pki", 0o700), ("control", 0o2710)] {
+        let path = fixture.path(name);
+        let acl = extended_acl(mode, named);
+        match set_acl(&path, c"system.posix_acl_access", Some(&acl)) {
+            Ok(true) => {}
+            // The test filesystem has no POSIX ACL support; nothing to observe.
+            Ok(false) => return,
+            Err(errno) => panic!("setxattr {name}: {errno}"),
+        }
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().mode() & 0o7777,
+            mode,
+            "{name}"
+        );
+        // `Child::qualify`'s worker check refuses the layout.
+        let (settings, _, pass) = check();
+        assert!(!worker.permits(&pass, &settings, &out), "{name}");
+        assert!(!fixture.access().permits(&pass, &settings, &out), "{name}");
+        // Publication refuses and names nothing.
+        assert_eq!(
+            write_private(&other, &bytes, (fixture.uid, fixture.gid), fixture.vet()),
+            Err(InstallError::Layout),
+            "{name}"
+        );
+        assert_eq!(fixture.entries("config"), ["cluster.json"]);
+        assert_eq!(set_acl(&path, c"system.posix_acl_access", None), Ok(true));
+        let (settings, _, pass) = check();
+        assert!(worker.permits(&pass, &settings, &out), "{name}");
+    }
+    // An extended ACL on the configuration file itself fails the worker check.
+    assert_eq!(
+        set_acl(
+            &out,
+            c"system.posix_acl_access",
+            Some(&extended_acl(0o600, named))
+        ),
+        Ok(true)
+    );
+    let (settings, _, pass) = check();
+    assert!(!worker.permits(&pass, &settings, &out));
+    assert_eq!(set_acl(&out, c"system.posix_acl_access", None), Ok(true));
+    // A default ACL on a private directory is refused too.
+    let state = fixture.path("state");
+    assert_eq!(
+        set_acl(
+            &state,
+            c"system.posix_acl_default",
+            Some(&extended_acl(0o700, named))
+        ),
+        Ok(true)
+    );
+    let (settings, _, pass) = check();
+    assert!(!worker.permits(&pass, &settings, &out));
+}
+
+#[test]
+fn daemon_traversal_ignores_supplementary_groups() {
+    let fixture = Fixture::new();
+    let r = fixture.request(Role::Founder);
+    let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
+    let out = fixture.path("config/cluster.json");
+    // Publication and `Child::qualify` check the daemon as the native worker
+    // runs: its UID and primary GID only.
+    let worker = Access::worker(fixture.uid, fixture.gid);
+    assert_eq!(worker.daemon, Identity::worker(fixture.uid, fixture.gid));
+    assert_eq!(worker.daemon.groups, [fixture.gid]);
+    assert!(worker.owner.is_none());
+    assert_eq!(fixture.access().daemon, worker.daemon);
+    write_private(&out, &bytes, (fixture.uid, fixture.gid), fixture.vet()).unwrap();
+    let (settings, _, pass) = Settings::vetted_layout(&out, None, fixture.uid, &[], None).unwrap();
+    // The fixture root (0710) is searchable only through its group. An
+    // identity holding that group only as a supplementary group reaches the
+    // file and the control directory; the same identity as a worker does not.
+    let uid = if fixture.uid == u32::MAX - 1 {
+        u32::MAX - 2
+    } else {
+        u32::MAX - 1
+    };
+    let primary = if fixture.gid == u32::MAX - 1 {
+        u32::MAX - 2
+    } else {
+        u32::MAX - 1
+    };
+    let supplementary = Identity {
+        uid,
+        groups: vec![primary, fixture.gid],
+    };
+    let worker_view = Identity::worker(uid, primary);
+    let control = settings.owner_socket.parent().unwrap();
+    assert!(chain_reachable(&pass, &out, false, &supplementary));
+    assert!(chain_reachable(&pass, control, true, &supplementary));
+    assert!(!chain_reachable(&pass, &out, false, &worker_view));
+    assert!(!chain_reachable(&pass, control, true, &worker_view));
+    // SAFETY: geteuid takes no pointers.
+    if unsafe { libc::geteuid() } == 0 {
+        // Full flow as root: the root directory belongs to another account and
+        // a group the daemon holds only as a supplementary group.
+        let group = primary;
+        std::os::unix::fs::chown(fixture.root.path(), Some(0), Some(group)).unwrap();
+        let mut supplementary = Access::worker(fixture.uid, fixture.gid);
+        supplementary.daemon.groups.push(group);
+        let (settings, _, pass) =
+            Settings::vetted_layout(&out, None, fixture.uid, &[], None).unwrap();
+        assert!(supplementary.permits(&pass, &settings, &out));
+        assert!(!worker.permits(&pass, &settings, &out));
+        assert_eq!(
+            write_private(
+                &fixture.path("config/other.json"),
+                &bytes,
+                (fixture.uid, fixture.gid),
+                fixture.vet()
+            ),
+            Err(InstallError::Layout)
+        );
+        assert_eq!(fixture.entries("config"), ["cluster.json"]);
+        std::os::unix::fs::chown(fixture.root.path(), Some(fixture.uid), Some(fixture.gid))
+            .unwrap();
+    }
 }
 
 /// A minimal POSIX ACL xattr: version 2 with user, group and other entries.

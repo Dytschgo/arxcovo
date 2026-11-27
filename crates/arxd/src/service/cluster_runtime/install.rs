@@ -46,17 +46,13 @@ pub(in crate::service) fn publish(request: &Request, layout: &Layout) -> Result<
         return Err(InstallError::Address);
     }
     socket_route(&settings)?;
-    let groups = |uid| cluster_owner::account_groups(uid).ok_or(InstallError::Account);
-    let access = Access {
-        daemon: Identity {
-            uid: ids.daemon_uid,
-            groups: groups(ids.daemon_uid)?,
-        },
-        owner: Identity {
-            uid: ids.owner_uid,
-            groups: groups(ids.owner_uid)?,
-        },
-    };
+    // The daemon as the native worker runs (primary GID only); the operator
+    // with its current groups, as it runs `cluster-control` interactively.
+    let mut access = Access::worker(ids.daemon_uid, ids.daemon_gid);
+    access.owner = Some(Identity {
+        uid: ids.owner_uid,
+        groups: cluster_owner::account_groups(ids.owner_uid).ok_or(InstallError::Account)?,
+    });
     // The same ordinary roots `Child::spawn` uses, except the service
     // workspace, which `service configure` checks once it names this file.
     let mut ordinary = layout
@@ -221,17 +217,27 @@ struct Vetted {
     parent: Object,
 }
 
-/// A runtime identity: a UID with its current primary and supplementary GIDs.
+/// A runtime identity: a UID with the GIDs it holds when it traverses.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Identity {
+pub(super) struct Identity {
     uid: u32,
     groups: Vec<u32>,
 }
 
 impl Identity {
+    /// ADR 0047's native worker clears its supplementary groups, so the daemon
+    /// traverses with its UID and primary GID only.
+    pub(super) fn worker(uid: u32, gid: u32) -> Self {
+        Self {
+            uid,
+            groups: vec![gid],
+        }
+    }
+
     /// Effective POSIX search permission on a directory from its owner, group
     /// and other bits. Root publication bypasses these bits, so they are
     /// checked for the identity that must traverse the path at run time.
+    /// They decide alone only where `no_extended_acl` holds.
     fn searches(&self, metadata: &std::fs::Metadata) -> bool {
         let bit = if self.uid == 0 {
             return metadata.is_dir();
@@ -246,38 +252,79 @@ impl Identity {
     }
 }
 
+/// The pinned object carries no access or default POSIX ACL, so its owner,
+/// group and other bits are authoritative: no named entry can deny what the
+/// bits grant. The attributes are read through the descriptor's
+/// `/proc/self/fd` link, which names exactly the pinned object and also works
+/// for `O_PATH` and `O_TMPFILE` handles. ENODATA means no ACL; EOPNOTSUPP means
+/// the filesystem cannot carry one. Any other result refuses.
+fn no_extended_acl(file: &File) -> bool {
+    let Ok(path) = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())) else {
+        return false;
+    };
+    [c"system.posix_acl_access", c"system.posix_acl_default"]
+        .iter()
+        .all(|attribute| {
+            // SAFETY: both strings are NUL terminated; a null, zero-length
+            // buffer only queries the attribute size.
+            let size = unsafe {
+                libc::getxattr(path.as_ptr(), attribute.as_ptr(), std::ptr::null_mut(), 0)
+            };
+            size < 0
+                && matches!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENODATA | libc::EOPNOTSUPP)
+                )
+        })
+}
+
 /// Every pinned component from `/` down to `path`'s parent, and `path`
-/// itself when `inclusive`, is searchable by `who`.
-fn chain_searchable(
-    pass: &super::LayoutPass,
-    path: &Path,
-    inclusive: bool,
-    who: &Identity,
-) -> bool {
+/// itself when `inclusive`, carries no extended ACL and is searchable by
+/// `who`.
+fn chain_reachable(pass: &super::LayoutPass, path: &Path, inclusive: bool, who: &Identity) -> bool {
     let start = if inclusive { Some(path) } else { path.parent() };
     start.is_some_and(|dir| {
         dir.ancestors().all(|component| {
             pass.0
                 .get(component)
-                .is_some_and(|(_, metadata)| who.searches(metadata))
+                .is_some_and(|(file, metadata)| who.searches(metadata) && no_extended_acl(file))
         })
     })
 }
 
 /// The runtime identities whose access the layout must grant.
-struct Access {
+pub(super) struct Access {
     daemon: Identity,
-    owner: Identity,
+    owner: Option<Identity>,
 }
 
 impl Access {
+    /// The native worker's view, used by `Child::qualify`: the daemon with its
+    /// primary GID only. The operator is checked at publication.
+    pub(super) fn worker(uid: u32, gid: u32) -> Self {
+        Self {
+            daemon: Identity::worker(uid, gid),
+            owner: None,
+        }
+    }
+
     /// The daemon reaches the configuration file, every private directory and
-    /// the control directory; the operator reaches the control directory.
-    fn permits(&self, pass: &super::LayoutPass, settings: &Settings, config: &Path) -> bool {
+    /// the control directory; the operator, when given, reaches the control
+    /// directory. Every component on those chains, and the file itself,
+    /// carries no extended ACL.
+    pub(super) fn permits(
+        &self,
+        pass: &super::LayoutPass,
+        settings: &Settings,
+        config: &Path,
+    ) -> bool {
         let Some(control) = settings.owner_socket.parent() else {
             return false;
         };
-        chain_searchable(pass, config, false, &self.daemon)
+        pass.0
+            .get(config)
+            .is_some_and(|(file, _)| no_extended_acl(file))
+            && chain_reachable(pass, config, false, &self.daemon)
             && [
                 &settings.workspace,
                 &settings.state,
@@ -287,9 +334,12 @@ impl Access {
                 &settings.history,
             ]
             .iter()
-            .all(|dir| chain_searchable(pass, dir, true, &self.daemon))
-            && chain_searchable(pass, control, true, &self.daemon)
-            && chain_searchable(pass, control, true, &self.owner)
+            .all(|dir| chain_reachable(pass, dir, true, &self.daemon))
+            && chain_reachable(pass, control, true, &self.daemon)
+            && self
+                .owner
+                .as_ref()
+                .is_none_or(|owner| chain_reachable(pass, control, true, owner))
     }
 }
 

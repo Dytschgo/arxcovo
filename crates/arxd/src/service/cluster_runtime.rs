@@ -1712,10 +1712,18 @@ impl Child {
         ordinary.push(layout.binary().parent().ok_or(ExitCode::Layout)?);
         ordinary.push(layout.endpoint().parent().ok_or(ExitCode::Layout)?);
         ordinary.push(Path::new(service.workspace()));
-        let (settings, stamp) =
-            Settings::vetted(&launch.config, launch.daemon_uid, &ordinary, None)
+        let (settings, stamp, pass) =
+            Settings::vetted_layout(&launch.config, None, launch.daemon_uid, &ordinary, None)
                 .map_err(|_| ExitCode::Config)?;
-        if !launch_matches(&settings, launch) {
+        // The root parent opens what the worker may not: require the worker's
+        // own search access (primary GID only, no extended ACLs).
+        if !launch_matches(&settings, launch)
+            || !install::Access::worker(launch.daemon_uid, launch.daemon_gid).permits(
+                &pass,
+                &settings,
+                &launch.config,
+            )
+        {
             return Err(ExitCode::Config);
         }
         Ok(stamp)

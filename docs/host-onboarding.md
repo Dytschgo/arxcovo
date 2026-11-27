@@ -205,7 +205,13 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`):
         can search every directory leading to the control directory. Root
         could open a layout that these accounts cannot reach, so the
         command checks their owner, group and other search bits itself.
-        Step b grants this through the `0755` parents and the `2710` control
+        It refuses any access or default POSIX ACL on those directories and
+        on the file, so the bits alone decide. `arxd-cluster` is checked
+        with its primary group only, because the service worker clears
+        supplementary groups (ADR 0047). The operator is checked with its
+        current groups, including `arxd-control`. `service configure`
+        repeats the daemon check before it records a cluster setting. Step
+        b grants this through the `0755` parents and the `2710` control
         directory.
 
       It then writes the content as an unnamed file in the output directory
