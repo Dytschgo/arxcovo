@@ -311,8 +311,58 @@ pub(crate) fn enroll_with_backup_targets(
     releases: &[Enrollment],
     targets: &[compose_backup::TargetEnrollment],
 ) -> Result<()> {
+    enroll_batch(store, releases, targets, |_| Ok(()), || Ok(()))
+}
+
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
+pub(crate) fn enroll_selected(
+    store: &VmStore,
+    releases: &[Enrollment],
+    targets: &[compose_backup::TargetEnrollment],
+    recipe: crate::vm::qualification_record::RecipeIdentity,
+    verify: impl Fn() -> Result<()>,
+) -> Result<()> {
+    enroll_batch(
+        store,
+        releases,
+        targets,
+        |db| {
+            for vm in releases
+                .iter()
+                .map(|release| release.target.vm)
+                .chain(targets.iter().map(|target| target.vm))
+            {
+                ensure!(
+                    count(
+                        db,
+                        "SELECT count(*) FROM vm_static_instances s
+                     JOIN vm_templates t ON t.id=s.template AND t.guest=1
+                     JOIN vm_build_intents b ON b.template_id=t.id
+                     WHERE s.id=?1 AND s.state IN (1,2,3) AND s.recipe_digest=?2
+                       AND t.recipe_digest=?2 AND b.recipe_id=?3
+                       AND b.state='sealed' AND b.health_verified=1",
+                        params![vm, recipe.recipe_sha256, hex::encode(recipe.recipe_id)],
+                    )? == 1,
+                    "Compose enrollment requires the selected sealed recipe"
+                );
+            }
+            Ok(())
+        },
+        verify,
+    )
+}
+
+fn enroll_batch(
+    store: &VmStore,
+    releases: &[Enrollment],
+    targets: &[compose_backup::TargetEnrollment],
+    validate: impl FnOnce(&Connection) -> Result<()>,
+    verify: impl Fn() -> Result<()>,
+) -> Result<()> {
     compose_backup::validate_targets(targets)?;
+    verify()?;
     store.transact(|db| {
+        validate(db)?;
         for release in releases {
             let target = &release.target;
             let project = &target.project;
@@ -374,7 +424,8 @@ pub(crate) fn enroll_with_backup_targets(
                 target.max_bytes,
             )?;
         }
-        require_headroom(db)
+        require_headroom(db)?;
+        verify()
     })
 }
 

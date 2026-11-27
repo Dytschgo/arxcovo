@@ -4,7 +4,7 @@ use crate::vm::template::{ubuntu_compose::PackagePin, ubuntu_web::PoolPackage};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Enrollment {
+pub(in crate::vm::windows::qualification) struct Enrollment {
     pub(super) class: crate::vm::qualification_record::Class,
     pub(super) release: ReleaseEnrollment,
     pub(super) runtime_profile: Input,
@@ -17,7 +17,9 @@ pub(super) struct Enrollment {
     pub(super) probe_image: Input,
     pub(super) topology: Input,
     pub(super) origin_profile: Input,
-    pub(super) network_witness: Input,
+    // The independently reviewed comparison refers to the emitted seal.
+    // Collection can precede it. Foreground selection always requires it.
+    pub(super) network_witness: Option<Input>,
     pub(super) recipe: Recipe,
 }
 
@@ -29,6 +31,18 @@ pub(super) struct Input {
     size: u64,
     #[serde(deserialize_with = "sha256")]
     sha256: Hash,
+}
+
+impl Enrollment {
+    pub(in crate::vm::windows::qualification) fn parse(
+        bytes: &[u8],
+    ) -> Result<Self, NativeRefusal> {
+        let enrollment: Self = serde_json::from_slice(bytes).map_err(|_| REFUSAL)?;
+        if enrollment.class != crate::vm::qualification_record::Class::Docker {
+            return Err(REFUSAL);
+        }
+        Ok(enrollment)
+    }
 }
 
 impl Input {

@@ -125,15 +125,137 @@ async fn static_compose_negotiation_and_shared_exact_boot_retirement() {
         ));
         received.send(()).unwrap();
         ready.await.unwrap();
-        sessions.channel.retire().await;
+        origin.retired.retire();
     };
     let (pending, queued, ()) = tokio::join!(pending, queued, retire);
+    sessions.channel.retire().await;
     assert!(pending.is_err() && queued.is_err());
     assert!(!sessions.lifecycle.is_open());
     assert_eq!(
         peer.read_u8().await.unwrap_err().kind(),
         std::io::ErrorKind::UnexpectedEof
     );
+}
+
+#[tokio::test]
+async fn static_compose_start_commits_boot_and_sessions_together() -> Result<()> {
+    use crate::store::vm::static_vm;
+    use crate::vm::{
+        Admission, Capacity, ClockReading, Completion, DiskClaim, HostObservation, Operation,
+        Request, Resources, Status, VmController, VmPolicy,
+    };
+
+    const NOW: i64 = 1_800_000_000_000;
+    struct FixedClock;
+    impl Clock for FixedClock {
+        fn now(&self) -> ClockReading {
+            ClockReading {
+                utc_ms: NOW,
+                monotonic: std::time::Instant::now(),
+            }
+        }
+    }
+    let (dir, db, target, generation) = backup_owner_fixture()?;
+    db.transact(|tx| {
+        tx.execute(
+            "UPDATE vm_static_instances SET state=1 WHERE id=?1",
+            [target.vm],
+        )?;
+        Ok(())
+    })?;
+    drop(db);
+    let controller = VmController::open(dir.path(), VmPolicy::default(), FixedClock)?;
+    let db = controller.compose_store();
+    let request = |nonce, operation| Request {
+        principal: "alice",
+        vm: target.vm,
+        request_id: crate::vm::RequestId {
+            key: [nonce; 16],
+            issued_at_ms: NOW,
+        },
+        disk: DiskClaim::default(),
+        operation,
+    };
+    let host_observation = HostObservation {
+        owner_idle: Some(true),
+        logical_cpus: Some(8),
+        available_ram: Some(64 << 30),
+        capacity: Some(Capacity {
+            free_bytes: 250 << 30,
+            managed_bytes: 0,
+        }),
+    };
+    let resources = Resources {
+        vcpus: 2,
+        guest_ram: 4 << 30,
+        overhead_ram: 3 << 30,
+    };
+    let Admission::Admitted(worker) =
+        controller.admit(request(1, Operation::Start), host_observation, resources)?
+    else {
+        panic!("static start could not be admitted");
+    };
+    let origin_generation: Id = db.transact(|tx| static_vm::origin_generation(tx, target.vm))?;
+    let origin = Origin {
+        origin_generation,
+        ..origin(generation)
+    };
+    let host = Host::default();
+    let backup_host = crate::vm::compose_backup::BackupHost::default();
+
+    for (wire, proof) in [
+        (
+            2,
+            Origin {
+                origin_generation: [7; 16],
+                ..origin.clone()
+            },
+        ),
+        (3, origin.clone()),
+        (4, origin.clone()),
+    ] {
+        let (transport, mut peer) = duplex(8192);
+        let (_, sessions) = tokio::join!(
+            hello(&mut peer, true),
+            PreparedStaticSessions::negotiate(transport, &proof, wire)
+        );
+        let checks = std::cell::Cell::new(0);
+        let committed =
+            sessions?.activate(&controller, &worker, &host, &backup_host, target.vm, || {
+                checks.set(checks.get() + 1);
+                wire != 3 || checks.get() == 1
+            });
+        if wire == 4 {
+            assert!(committed.is_ok());
+            assert_eq!(host.session(target.vm).unwrap().wire_boot, wire);
+            assert_eq!(backup_host.session(target.vm).unwrap().wire_boot, wire);
+            assert!(db.transact(|tx| store::live_boot(tx, target.vm, generation, wire))?);
+        } else {
+            assert!(committed.is_err());
+            assert!(host.session(target.vm).is_none() && backup_host.session(target.vm).is_none());
+            db.transact(|tx| {
+                assert_eq!(
+                    static_vm::owned_state(tx, "alice", target.vm)?,
+                    Some(crate::vm::static_web::StaticState::Stopped)
+                );
+                assert!(!store::live_boot(tx, target.vm, generation, wire)?);
+                Ok(())
+            })?;
+        }
+    }
+    origin.retired.retire();
+    assert!(!host.session(target.vm).unwrap().is_open());
+    let Admission::Admitted(stop) =
+        controller.admit(request(2, Operation::Stop), host_observation, resources)?
+    else {
+        panic!("static stop could not be admitted");
+    };
+    assert_eq!(
+        controller.finish(&stop, Completion::Succeeded)?,
+        Status::Succeeded
+    );
+    assert!(!db.transact(|tx| store::live_boot(tx, target.vm, generation, 4))?);
+    Ok(())
 }
 
 #[tokio::test]

@@ -902,13 +902,6 @@ pub(crate) mod publication {
     }
 
     impl Retirement {
-        #[cfg_attr(
-            not(test),
-            allow(
-                dead_code,
-                reason = "the closed native origin seam retires through this"
-            )
-        )]
         pub(crate) fn retire(&self) {
             let _fence = self.fence();
             self.token.cancel();

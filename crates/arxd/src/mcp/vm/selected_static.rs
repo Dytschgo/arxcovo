@@ -9,7 +9,7 @@ pub(super) struct SelectedStatic(Source);
 
 enum Source {
     #[cfg(all(windows, target_arch = "x86_64"))]
-    Native(Box<crate::vm::qualification::StaticDossier>),
+    Native(Arc<crate::vm::qualification::StaticDossier>),
     #[cfg(test)]
     Fixture(Box<FixtureStaticQualification>),
 }
@@ -21,25 +21,79 @@ impl SelectedStatic {
         m4: &SelectedTest,
     ) -> Result<Self, NativeRefusal> {
         let dossier = custody.select_static_dossier(Some(m4.native_source()))?;
-        Ok(Self(Source::Native(Box::new(dossier))))
+        Ok(Self(Source::Native(Arc::new(dossier))))
     }
 
     pub(super) fn refusal(&self) -> Option<NativeRefusal> {
         match self.0 {
             #[cfg(all(windows, target_arch = "x86_64"))]
-            Source::Native(ref dossier) => {
-                // Verified read-side selection has no checked static launcher.
-                Some(
-                    dossier
-                        .require_current()
-                        .err()
-                        .unwrap_or(NativeRefusal::NetworkFenceUnverified),
-                )
-            }
+            Source::Native(ref dossier) => Some(
+                dossier
+                    .require_current()
+                    .err()
+                    .unwrap_or(NativeRefusal::NetworkFenceUnverified),
+            ),
             #[cfg(test)]
             Source::Fixture(ref fixture) => (!fixture.network_live.load(Ordering::Acquire))
                 .then_some(NativeRefusal::NetworkFenceUnverified),
         }
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) fn enroll_runtime(
+        &self,
+        store: &crate::store::vm::VmStore,
+        backup_host: &mut compose_backup::BackupHost,
+        profile: &mut TestVms,
+        custody: &Arc<crate::config::VmCustody>,
+    ) -> anyhow::Result<()> {
+        #[cfg(not(test))]
+        let Source::Native(dossier) = &self.0;
+        #[cfg(test)]
+        let Source::Native(dossier) = &self.0 else {
+            unreachable!("native foreground selection required")
+        };
+        let current = || {
+            dossier
+                .require_current()
+                .map_err(|reason| anyhow::anyhow!(native_reason(reason)))?;
+            custody.verify()
+        };
+        // A retired selection still reports its refusal through the catalog.
+        if dossier.require_current().is_err() {
+            return Ok(());
+        }
+        let releases = std::mem::take(&mut profile.compose_releases)
+            .into_iter()
+            .map(compose::ReleaseInput::enroll)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let targets = profile.take_static_backup_targets();
+        anyhow::ensure!(
+            releases.iter().all(|release| release.secrets.is_empty()) || custody.has_compose_root(),
+            "Compose secret custody required"
+        );
+        let backup = custody.open_static_backup()?;
+        if backup.is_some() {
+            custody.static_backup_capacity()?;
+        }
+        if !releases.is_empty() || !targets.is_empty() {
+            crate::store::vm::compose::enroll_selected(
+                store,
+                &releases,
+                &targets,
+                self.recipe(),
+                current,
+            )?;
+        }
+        if let Some(backup) = backup {
+            let custody = custody.clone();
+            let dossier = dossier.clone();
+            backup_host.install_native(store, Arc::new(backup), move || {
+                dossier.require_current().ok()?;
+                custody.static_backup_capacity().ok()
+            })?;
+        }
+        Ok(())
     }
 
     fn evidence(&self) -> (&VerifiedDockerEvidence, Hash) {

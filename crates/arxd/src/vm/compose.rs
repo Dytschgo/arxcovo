@@ -300,6 +300,7 @@ pub(crate) struct Session {
 
 #[allow(dead_code, reason = "consumed by the Part B static boot transaction")]
 pub(crate) struct PreparedStaticSessions {
+    origin: super::runtime::publication::Origin,
     pub lifecycle: Session,
     pub backup: super::compose_backup::BackupSession,
     pub channel: ComposeChannel,
@@ -315,15 +316,49 @@ impl PreparedStaticSessions {
         wire_boot: u64,
     ) -> Result<Self> {
         let retired = origin.retired.token();
-        let channel = ComposeChannel::negotiate(transport, wire_boot, retired)
-            .await
-            .map_err(|_| anyhow::anyhow!("static Compose negotiation refused"))?;
+        let channel =
+            ComposeChannel::negotiate_bound(transport, wire_boot, retired, origin.retired.clone())
+                .await
+                .map_err(|_| anyhow::anyhow!("static Compose negotiation refused"))?;
         ensure!(!retired.is_cancelled(), "static Compose boot retired");
         Ok(Self {
+            origin: origin.clone(),
             lifecycle: Session::for_origin(origin, channel.shared()),
             backup: super::compose_backup::BackupSession::new(origin.generation, channel.shared()),
             channel,
         })
+    }
+
+    /// Publish both views of the same pipe after the ledger settles. Registry
+    /// readers cannot observe either session before its boot is committed.
+    #[allow(dead_code, reason = "native static boot owner is pending")]
+    pub(crate) fn activate<C: Clock>(
+        self,
+        controller: &super::VmController<C>,
+        worker: &super::PendingOperation,
+        host: &Host,
+        backup_host: &super::compose_backup::BackupHost,
+        vm: Id,
+        current: impl Fn() -> bool,
+    ) -> Result<ComposeChannel> {
+        let mut lifecycle = host
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Compose sessions unavailable"))?;
+        let mut backups = backup_host
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Compose backup sessions unavailable"))?;
+        controller.finish_compose_start(
+            worker,
+            vm,
+            &self.origin,
+            self.channel.generation(),
+            || current() && self.channel.is_open(),
+        )?;
+        lifecycle.insert(vm, Arc::new(self.lifecycle));
+        backups.insert(vm, Arc::new(self.backup));
+        Ok(self.channel)
     }
 }
 
