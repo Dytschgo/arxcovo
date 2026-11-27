@@ -2164,12 +2164,17 @@ impl<C: Clock> VmController<C> {
                         Err(Refusal::NotFound)
                     }));
                 }
-                ForegroundSubject::Extend(vm) => {
+                ForegroundSubject::Extend {
+                    vm,
+                    selected_test_installed,
+                } => {
                     return Ok(refused(match owned_vm(db, principal, vm)? {
                         None if store::expired_status(db, principal, vm)?.is_some() => {
                             Err(Refusal::Expired)
                         }
-                        None if store::static_vm::owned_state(db, principal, vm)?.is_some() => {
+                        None if selected_test_installed
+                            && store::static_vm::owned_state(db, principal, vm)?.is_some() =>
+                        {
                             Ok(())
                         }
                         None => Err(Refusal::NotFound),
@@ -2274,7 +2279,10 @@ pub(crate) enum ForegroundSubject {
     Start(Id),
     Stop(Id),
     Script(Id),
-    Extend(Id),
+    Extend {
+        vm: Id,
+        selected_test_installed: bool,
+    },
 }
 
 impl ForegroundSubject {
@@ -2284,7 +2292,7 @@ impl ForegroundSubject {
             | Self::Start(id)
             | Self::Stop(id)
             | Self::Script(id)
-            | Self::Extend(id) => id,
+            | Self::Extend { vm: id, .. } => id,
         }
     }
 }

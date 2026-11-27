@@ -1640,7 +1640,16 @@ impl VmInventory {
             Work::Start => Some(ForegroundSubject::Start(request.id)),
             Work::Stop => Some(ForegroundSubject::Stop(request.id)),
             Work::Script(..) => Some(ForegroundSubject::Script(request.id)),
-            Work::Extend(_) => Some(ForegroundSubject::Extend(request.id)),
+            Work::Extend(_) => {
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                let selected_test_installed = self.supervisor.selected_test.is_some();
+                #[cfg(not(all(windows, target_arch = "x86_64")))]
+                let selected_test_installed = false;
+                Some(ForegroundSubject::Extend {
+                    vm: request.id,
+                    selected_test_installed,
+                })
+            }
             Work::Publish | Work::Unpublish => return self.publication(gate, action, request),
             Work::Snapshot(snapshot) => {
                 let result = controller.foreground_snapshot_precheck(
@@ -13289,6 +13298,74 @@ pub(crate) mod tests {
         assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
         drop(a);
         h.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn static_vm_extend_without_selected_test_is_not_found() {
+        let temp = crate::service::application::tests::private_temp();
+        let supervisor = Supervisor::new(
+            temp.path(),
+            VmPolicy::default(),
+            ForegroundClock {
+                utc: Some(Arc::new(AtomicI64::new(UTC))),
+            },
+            None,
+            NativeRefusal::Disabled,
+            None,
+        )
+        .unwrap();
+        assert!(supervisor.lock().unwrap().fixture.is_none());
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        assert!(supervisor.selected_test.is_none());
+
+        let vm: Id = [2; 16];
+        let generation: Id = [3; 16];
+        let store = supervisor.controller.store_for_test();
+        store
+            .transact(|db| {
+                db.execute(
+                    "INSERT INTO vm_static_instances(id,name,principal,host,template,
+                        source_generation,recipe_digest,disk_digest,vars_digest,state,
+                        persistent,staging,origin_generation)
+                     VALUES(?1,'web-site','alice',?2,zeroblob(16),?3,
+                        zeroblob(32),zeroblob(32),zeroblob(32),1,4096,0,?3)",
+                    rusqlite::params![vm, supervisor.host_id, generation],
+                )?;
+                db.execute(
+                    "INSERT INTO vm_generations(id,static_id,generation,active) VALUES(?1,?2,1,1)",
+                    rusqlite::params![generation, vm],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let connection = supervisor.connection("alice".into());
+        let refused = connection.inventory().dispatch(
+            request(
+                "vm_extend",
+                json!({"vm_id":hex::encode(vm),"ttl_s":600,"request_id":key(1)}),
+            ),
+            || false,
+        );
+        assert_eq!(refused.unwrap_err().0, "not_found");
+        store
+            .read_only(|db| {
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM activity WHERE principal='alice' AND vm=?1
+                            AND action=?2 AND status=4 AND reason=?3",
+                        rusqlite::params![vm, Action::Extend as i64, Refusal::NotFound as i64],
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    crate::store::vm::count(db, "SELECT count(*) FROM vm_operations", [])?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[tokio::test]
