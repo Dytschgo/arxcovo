@@ -191,7 +191,7 @@ pub const ORIGIN_PORT_LAST: u16 = 49215;
 
 /// A daemon-selected reservation with no caller-supplied address or port.
 pub struct OriginPortLease {
-    listener: std::net::TcpListener,
+    listener: std::sync::Mutex<Option<std::net::TcpListener>>,
     port: u16,
 }
 
@@ -205,9 +205,14 @@ impl OriginPortLease {
         let size = ORIGIN_PORT_LAST - ORIGIN_PORT_FIRST + 1;
         for attempt in 0..size {
             let port = ORIGIN_PORT_FIRST + (u16::from(nonce[0]) + attempt) % size;
-            match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
-                Ok(listener) => return Ok(Self { listener, port }),
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            match bind_origin(port) {
+                Ok(listener) => {
+                    return Ok(Self {
+                        listener: std::sync::Mutex::new(Some(listener)),
+                        port,
+                    });
+                }
+                Err(error) if origin_port_busy(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -220,18 +225,130 @@ impl OriginPortLease {
 
     #[cfg(test)]
     pub(crate) fn fixture_listener(&self) -> std::io::Result<std::net::TcpListener> {
-        let listener = self.listener.try_clone()?;
+        let held = self
+            .listener
+            .lock()
+            .map_err(|_| std::io::Error::other("origin reservation unavailable"))?;
+        let listener = held
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("origin reservation consumed"))?
+            .try_clone()?;
         listener.set_nonblocking(true)?;
         Ok(listener)
     }
 
     /// For the qualified launcher to check a still-held provisional claim.
     pub fn verify(&self) -> bool {
-        self.listener.local_addr().is_ok_and(|address| {
+        self.listener.lock().is_ok_and(|listener| {
+            listener
+                .as_ref()
+                .is_some_and(|listener| self.matches(listener))
+        })
+    }
+
+    fn matches(&self, listener: &std::net::TcpListener) -> bool {
+        listener.local_addr().is_ok_and(|address| {
             address == (std::net::Ipv4Addr::LOCALHOST, self.port).into()
                 && (ORIGIN_PORT_FIRST..=ORIGIN_PORT_LAST).contains(&self.port)
         })
     }
+
+    /// Consume the provisional claim once. The checked launcher keeps the
+    /// socket in this token until the verified suspended child's resume edge.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(super) fn take_for_handoff(&self) -> Option<std::net::TcpListener> {
+        let mut held = self.listener.lock().ok()?;
+        if self.matches(held.as_ref()?) {
+            held.take()
+        } else {
+            None
+        }
+    }
+}
+
+fn origin_port_busy(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Winsock can report access denied for a conflicting exclusive bind.
+        error.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEACCES)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn bind_origin(port: u16) -> std::io::Result<std::net::TcpListener> {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+}
+
+#[cfg(windows)]
+fn bind_origin(port: u16) -> std::io::Result<std::net::TcpListener> {
+    use std::io;
+    use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket};
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Networking::WinSock::*;
+
+    // Keep the Winsock startup reference for the process lifetime. Listeners
+    // can outlive this call and must stay valid when they enter Tokio.
+    static STARTUP: OnceLock<i32> = OnceLock::new();
+    let status = *STARTUP.get_or_init(|| unsafe { WSAStartup(0x0202, &mut WSADATA::default()) });
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    let error = || io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+    let socket = unsafe {
+        WSASocketW(
+            AF_INET.into(),
+            SOCK_STREAM,
+            IPPROTO_TCP,
+            std::ptr::null(),
+            0,
+            WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if socket == INVALID_SOCKET {
+        return Err(error());
+    }
+    // Take ownership before any fallible operation so every failure closes it.
+    let owned = unsafe { OwnedSocket::from_raw_socket(socket as _) };
+    let socket = owned.as_raw_socket() as SOCKET;
+    let exclusive = 1i32;
+    let address = SOCKADDR_IN {
+        sin_family: AF_INET,
+        sin_port: port.to_be(),
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 {
+                S_addr: u32::from_ne_bytes(std::net::Ipv4Addr::LOCALHOST.octets()),
+            },
+        },
+        sin_zero: [0; 8],
+    };
+    if unsafe {
+        setsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&raw const exclusive).cast(),
+            size_of::<i32>() as i32,
+        )
+    } != 0
+        || unsafe {
+            bind(
+                socket,
+                (&raw const address).cast(),
+                size_of::<SOCKADDR_IN>() as i32,
+            )
+        } != 0
+        || unsafe { listen(socket, 8) } != 0
+    {
+        return Err(error());
+    }
+    Ok(std::net::TcpListener::from(owned))
 }
 
 /// Stable provisioned identity. The TLS name is derived from the first active

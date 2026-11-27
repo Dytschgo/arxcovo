@@ -50,9 +50,12 @@ Leave existing VMs, their hypervisor settings and the old Lab Manager untouched.
   receiver inventory file alongside the fixture image, network profile and
   probe image. Enumerate every reviewed case, transport and receiver identity,
   including multiple receivers for the same case and transport. The inventory
-  is a bounded JSON array of objects with `case`, `transport` and an
-  `identity` of 32 bytes. Use the case and transport names in the reviewed
-  [witness schema](../crates/arxd/src/vm/windows/qualification/docker_trial/witness.rs).
+  is a bounded JSON object with integer `version: 1`, the observer's
+  Ed25519 public key as a 32-byte `signer` array, and a `targets` array. Each
+  target has `case`, `transport` and an `identity` array of 32 bytes. Use the
+  names in the [witness schema](../crates/arxd/src/vm/windows/qualification/docker_trial/witness.rs).
+  Keep the private signing key outside the qualifier host, its enrollment,
+  and the guest. The earlier targets-only inventory must be re-enrolled.
   Include dormant
   site adapters, VPNs, host services, routers, public-numbered LAN and WAN
   hairpin. Use an isolated representative uplink if the ordinary site
@@ -166,8 +169,38 @@ manifest and byte pins against the reviewed E1a receipt, then enroll the
 **new copy's exact path and held identity** in the independently reviewed
 private Docker enrollment. Keep that enrollment separate from the stock TEST
 enrollment and the output root. Use the enrollment field contract of the
-reviewed native release. The gated CLI currently parses only the Docker class
-at this boundary.
+reviewed native release. Preflight also checks the optional
+`receiver_mailbox` directory for private ownership, emptiness, and separation
+from the production, trial, recipe and evidence areas.
+
+## Exchange receiver evidence
+
+The mailbox protocol is covered by deterministic tests. The owner CLI still
+requires a checked native QEMU host before it can run the exchange.
+
+1. Give the independent observer the bytes of `request.json` from a fresh
+   private mailbox. The request binds the run, boot, generation, nonce,
+   route, policy, topology and complete receiver inventory. Keep the request
+   and all measurement content private.
+2. After arming the enrolled receivers, have the observer sign the sequence
+   `arx-docker-capture-v1`, a NUL byte, `armed`, a NUL byte, the SHA-256 of
+   the exact request bytes, and the SHA-256 of an empty byte string. Use the
+   raw 32-byte hashes. Deliver the raw 64-byte signature as `armed.sig`
+   through a private temporary file and an atomic, non-replacing rename.
+   The acknowledgement has a 120-second wait inside the trial deadline.
+3. Wait for `started.json`. It gives the request SHA-256, the origin in
+   Windows boot-uptime milliseconds, and the start and exclusive cutoff
+   relative to that origin. Use that clock to correlate the independently
+   observed captures. Keep the before and after controls, each attempt,
+   and the drift events inside the recorded window.
+4. Serialize the [receiver report](../crates/arxd/src/vm/windows/qualification/docker_trial/witness.rs)
+   as at most 64 KiB of JSON. Use the same signing input layout with
+   `completed` in place of `armed` and the SHA-256 of the exact report bytes
+   in place of the empty digest. Deliver the 64-byte signature immediately
+   followed by the report as `capture.bin` through an atomic, non-replacing
+   rename. The capture has a 15-minute wait inside the trial deadline.
+   Keep all raw mailbox artifacts private. The dossier records the
+   validated report's digest.
 
 ## Run and review
 
@@ -215,8 +248,8 @@ at this boundary.
    that transition. Restore the original enrolled topology before the
    installed boot and resample. The
    installed boot must bind the exclusive IPv4 loopback listener to the
-   held child, verify exact port, TLS profile and boot with a bounded pinned
-   CA/SNI health exchange, complete the exact Compose v3 hello, and release
+   held child, verify exact port and boot with a bounded HTTPS exchange pinned
+   to the certificate and SNI supplied for that boot, complete the exact Compose v3 hello, and release
    cleanly. Require independent settlement of the owned workspace and
    helpers.
 5. If a run is incomplete, cancelled, times out, or cannot settle, retain

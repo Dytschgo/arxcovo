@@ -321,8 +321,7 @@ impl MeasureEnv {
         )
         .into_bytes();
         let topology_bytes = b"reviewed-topology".to_vec();
-        let manifest_bytes =
-            serde_json::to_vec(&super::super::docker_trial::witness::fixture_targets()).unwrap();
+        let manifest_bytes = super::super::docker_trial::witness::fixture_manifest();
         Self {
             dir,
             stock_fixture,

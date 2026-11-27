@@ -14,6 +14,7 @@ pub(in crate::vm::windows::qualification) struct Enrollment {
     pub(super) fixture_image: Input,
     pub(super) fixture_network_profile: Input,
     pub(super) receiver_inventory: Input,
+    pub(in crate::vm::windows::qualification) receiver_mailbox: Option<String>,
     pub(super) probe_image: Input,
     pub(super) topology: Input,
     pub(super) origin_profile: Input,
