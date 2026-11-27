@@ -65,17 +65,24 @@ DIAGNOSTIC = re.compile(
 )
 PIN = "C13 starts=6 closes=6 Found=1 Mint=3 AnchorQuery=3 Redeem=3 admissions=2 AddNodes=2 joint=1 flatten=1 transfer=2 enrollment_proposals=7"
 PUBLICATION = re.compile(r"C13 publication node=4 term=\d+ leader=\d+ index=\d+")
-# Both pins are the panic lines from the runs that reddened main, and both
-# assertions are still those lines on 270df38e. Mint is the owner-mint
-# success check. Promotion-transfer is the readiness assert, which other
-# phases also call, so the phase stays part of the pin. A wider line pin
-# would hide a different assertion with the same message.
+# The pins are the panic lines from the runs that reddened main. Mint is
+# the owner-mint success check. Promotion-transfer is the readiness assert,
+# which other phases also call, so the phase stays part of the pin. A wider
+# line pin would hide a different assertion with the same message.
 # Run 45570315686 attempt 1: join mint-refused, owner node a action mint
 # exit 8, result 101. Run 45457780671 attempt 1: promotion-transfer
 # process-exited, result 101, no owner line. Both reaped every helper with
 # helper_unknown=0 and removed the fixture with no retained or unknown
 # roles. Neither closed every worker gracefully (clean=2, spawned=3), so
 # graceful close stays required for success only.
+# Runs 45845285816 attempt 1 and 45906354582 attempt 1: join-refused at
+# m3_activation_linux.rs:1368, owner action join exit 8, and one stderr
+# diagnostic for that same node at stage=admission-exchange
+# category=identity. The node letter is part of the pair (b, then c) and is
+# not pinned to one letter. Other stderr diagnostics may accompany that
+# line. Result 101, helpers reaped, fixture removed, no retained or unknown
+# roles. A different phase, first-line category, location, message, stage,
+# diagnostic category, or owner action stays red.
 MINT_QUARANTINE = (
     "C13 first phase=join category=assertion "
     "at=m3_activation_linux.rs:1366 message=mint-refused"
@@ -84,8 +91,18 @@ PROMOTION_QUARANTINE = (
     "C13 first phase=promotion-transfer category=assertion "
     "at=m3_activation_linux.rs:766 message=process-exited"
 )
+JOIN_QUARANTINE = (
+    "C13 first phase=join category=assertion "
+    "at=m3_activation_linux.rs:1368 message=join-refused"
+)
 MINT_OWNER_QUARANTINE = "C13 owner node=a action=mint exit=8"
-QUARANTINE_NAMES = frozenset(("mint-refused", "promotion-transfer-process-exited"))
+JOIN_OWNER = re.compile(r"C13 owner node=([abcd]) action=join exit=8")
+JOIN_DIAGNOSTIC = re.compile(
+    r"C13 diagnostic node=([abcd]) stage=admission-exchange category=identity"
+)
+QUARANTINE_NAMES = frozenset((
+    "mint-refused", "promotion-transfer-process-exited", "join-refused",
+))
 QUARANTINE_MARKER = "c13-quarantine"
 
 
@@ -288,7 +305,8 @@ def bounded_run(args, *, env, timeout, stderr=subprocess.DEVNULL):
 
 
 def run_campaign(args, *, env, timeout):
-    # Optional diagnostics never enter Capture or influence cleanup evidence.
+    # Optional diagnostics never enter Capture or the cleanup disposition.
+    # Only the join-refused quarantine reads them, and only after teardown.
     try:
         reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
@@ -347,7 +365,37 @@ def quarantine_bytes_eligible(data):
         byte == 0x0A or 0x20 <= byte <= 0x7E for byte in data)
 
 
-def quarantine_signature(first, evidence, *, code, truncated, fixture, retained, unknown):
+def join_refused_evidence(owners, diagnostic):
+    """One join exit 8 owner and its admission-exchange identity diagnostic.
+
+    The node letter has to match across those two lines. Any other stderr
+    record must still be one accepted diagnostic line. A missing, duplicated,
+    or different identity line is a different failure.
+    """
+    if len(owners) != 1:
+        return False
+    owner = JOIN_OWNER.fullmatch(owners[0])
+    if owner is None:
+        return False
+    raw = evidence_bytes(diagnostic)
+    if any(token in raw for token in QUARANTINE_VETOES) or not quarantine_bytes_eligible(raw):
+        return False
+    found = 0
+    node = owner.group(1)
+    for line in (part.decode("ascii") for part in raw[:-1].split(b"\n")):
+        if DIAGNOSTIC.fullmatch(line) is None:
+            return False
+        identity = JOIN_DIAGNOSTIC.fullmatch(line)
+        if identity is None:
+            continue
+        if identity.group(1) != node:
+            return False
+        found += 1
+    return found == 1
+
+
+def quarantine_signature(first, evidence, *, code, truncated, fixture, retained, unknown,
+                         diagnostic=b""):
     # Result 101 is the harness panic status from both incidents. A timeout,
     # a different status, or truncated campaign output is a separate anomaly.
     # Artifact mismatches raise before this decision and keep a non-zero exit.
@@ -382,6 +430,8 @@ def quarantine_signature(first, evidence, *, code, truncated, fixture, retained,
             return None
     # Cleanup and the pinned first failure are each one strict line. Mint's
     # owner pin is one exact line. Promotion's pin is no owner line.
+    # Join-refused pairs one join exit 8 owner with its admission-exchange
+    # identity diagnostic. The node letter has to be the same on both.
     if len(cleanup) != 1 or len(failures) != 1 or failures[0] != first:
         return None
     reaped_all, _clean_close = cleanup_disposition(cleanup)
@@ -391,6 +441,8 @@ def quarantine_signature(first, evidence, *, code, truncated, fixture, retained,
         return "mint-refused"
     if first == PROMOTION_QUARANTINE and not owners:
         return "promotion-transfer-process-exited"
+    if first == JOIN_QUARANTINE and join_refused_evidence(owners, diagnostic):
+        return "join-refused"
     return None
 
 
@@ -643,6 +695,7 @@ def privileged(stage, deadline):
         first, bytes(capture.bulk) if capture is not None else b"", code=code,
         truncated=bool(capture is not None and capture.truncated),
         fixture=fixture, retained=retained, unknown=unknown,
+        diagnostic=diagnostic,
     )
     if signature is not None:
         write_quarantine_marker(stage_directory, signature)
