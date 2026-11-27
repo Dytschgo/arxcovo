@@ -13410,6 +13410,131 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn static_compose_network_fence_unverified_closes_foreground_admission() {
+        use rusqlite::params;
+
+        let temp = crate::service::application::tests::private_temp();
+        let mut supervisor = Supervisor::new(
+            temp.path(),
+            VmPolicy::default(),
+            ForegroundClock {
+                utc: Some(Arc::new(AtomicI64::new(UTC))),
+            },
+            Some(RECIPE),
+            NativeRefusal::QualificationMissing,
+            None,
+        )
+        .unwrap();
+        let state = Arc::get_mut(&mut supervisor).unwrap();
+        state.recipes[1] = Some((WEB_RECIPE_ID, Some(WEB_DIGEST)));
+        state
+            .install_static_selection(Err(NativeRefusal::NetworkFenceUnverified))
+            .unwrap();
+
+        let vm = [2_u8; 16];
+        let template = [3_u8; 16];
+        supervisor.controller.store_for_test().transact(|db| {
+            db.execute(
+                "INSERT INTO vm_templates VALUES(?1,1,?2,zeroblob(32),zeroblob(32),4096)",
+                params![template, WEB_DIGEST],
+            )?;
+            db.execute(
+                "INSERT INTO vm_static_instances(id,name,principal,host,template,
+                    source_generation,recipe_digest,disk_digest,vars_digest,state,persistent,staging)
+                 VALUES(?1,'web-site','alice',?2,?3,zeroblob(16),?4,zeroblob(32),zeroblob(32),1,4096,0)",
+                params![vm, supervisor.host_id, template, WEB_DIGEST],
+            )?;
+            Ok(())
+        }).unwrap();
+        {
+            let mut gate = supervisor.lock().unwrap();
+            gate.allow_agent_public_sites = true;
+            gate.publish_profile =
+                Some(Arc::new(Profile::synthetic(supervisor.host_id, "web-site")));
+        }
+
+        let dispatch = |supervisor: &Arc<Supervisor>, tool, args| {
+            supervisor
+                .connection("alice".into())
+                .inventory()
+                .dispatch(request(tool, args), || false)
+        };
+        let refused = |supervisor: &Arc<Supervisor>, tool, args| {
+            assert_eq!(
+                dispatch(supervisor, tool, args).unwrap_err().0,
+                "network_fence_unverified",
+                "{tool}",
+            );
+        };
+        let compose = selected_static::FixtureStaticQualification::select().recipe();
+        let catalog = dispatch(&supervisor, "vm_catalog", json!({})).unwrap();
+        assert_eq!(
+            catalog["capability"]["static_compose"],
+            json!({"available":false,"reason":"network_fence_unverified"}),
+        );
+        assert!(
+            catalog["capability"]
+                .get("selected_static_qualification")
+                .is_none()
+        );
+        let compose_id = hex::encode(compose.recipe_id);
+        let entries = catalog["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry["recipe_id"] != compose_id));
+        let build = |n| json!({"recipe_id":compose_id,"request_id":key(n)});
+        assert_eq!(
+            dispatch(&supervisor, "vm_template_build", build(1))
+                .unwrap_err()
+                .0,
+            "not_found",
+        );
+
+        let args = |n| json!({"vm_id":hex::encode(vm),"request_id":key(n)});
+        refused(
+            &supervisor,
+            "static_vm_create",
+            json!({
+                "template_id":hex::encode(template),"name":"another-site","request_id":key(2),
+            }),
+        );
+        refused(&supervisor, "vm_start", args(3));
+        // Stop, script, and publish require a running row to reach their gate.
+        supervisor
+            .controller
+            .store_for_test()
+            .transact(|db| {
+                db.execute("UPDATE vm_static_instances SET state=2 WHERE id=?1", [vm])?;
+                Ok(())
+            })
+            .unwrap();
+        refused(&supervisor, "vm_stop", args(4));
+        let mut script = args(5);
+        script["script"] = json!("exit 0");
+        refused(&supervisor, "vm_run_script", script);
+        refused(&supervisor, "publish_site", args(6));
+
+        // B1 never registers a native Compose recipe. Supply one only here
+        // to exercise the build guard after the known-recipe precheck.
+        Arc::get_mut(&mut supervisor).unwrap().recipes[3] =
+            Some((compose.recipe_id, Some(compose.recipe_sha256)));
+        refused(&supervisor, "vm_template_build", build(7));
+        supervisor
+            .controller
+            .store_for_test()
+            .read_only(|db| {
+                for table in ["vm_operations", "vm_publication", "vm_publication_hosts"] {
+                    assert_eq!(
+                        crate::store::vm::count(db, &format!("SELECT count(*) FROM {table}"), [])?,
+                        0,
+                        "{table}",
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn static_vm_extend_without_selected_test_is_not_found() {
         let temp = crate::service::application::tests::private_temp();
         let supervisor = Supervisor::new(
