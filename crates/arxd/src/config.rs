@@ -1031,6 +1031,7 @@ impl VmCustody {
     #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn select_static_dossier(
         &self,
+        m4: Option<&crate::vm::qualification::ForegroundQualification>,
     ) -> Result<crate::vm::qualification::StaticDossier, crate::vm::runtime::NativeRefusal> {
         use crate::vm::runtime::NativeRefusal;
         self.verify()
@@ -1039,11 +1040,9 @@ impl VmCustody {
             .static_inputs
             .as_ref()
             .ok_or(NativeRefusal::QualificationMissing)?;
-        // B2 supplies an independent measure from held Docker inputs and
-        // the native route/topology observer. The seal is never its own input.
         inputs
             .qualification
-            .select(Err(NativeRefusal::NetworkFenceUnverified))
+            .select(m4.ok_or(NativeRefusal::QualificationMissing)?)
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]

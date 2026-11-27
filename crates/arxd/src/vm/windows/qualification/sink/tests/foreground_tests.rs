@@ -164,23 +164,17 @@ fn docker_dossier_reads_only_its_own_class_and_exact_rows() {
     let pin = PathPin::open(&path, true, false).unwrap();
     let expected = crate::config::fixture_directory_pin(&pin.leaf);
     let pending = PreparedStaticDossier::hold(&path, &expected, &enrollment, selection).unwrap();
-    assert_eq!(
-        pending
-            .select(Err(NativeRefusal::NetworkFenceUnverified))
-            .err(),
-        Some(NativeRefusal::NetworkFenceUnverified),
-    );
     assert!(
         pending
-            .select(Ok(DockerFresh {
+            .read_measured(&DockerFresh {
                 boot_marker: [99; 32],
                 ..fresh
-            }))
+            })
             .is_err()
     );
-    let dossier = pending.select(Ok(DockerFresh { ..fresh })).unwrap();
-    assert_eq!(dossier.evidence.recipe(), recipe);
-    assert_eq!(dossier.seal_sha256, selection.seal_sha256);
+    let (evidence, _rows) = pending.read_measured(&fresh).unwrap();
+    assert_eq!(evidence.recipe(), recipe);
+    assert_eq!(evidence.seal().binding, binding);
     assert!(
         std::fs::OpenOptions::new()
             .write(true)

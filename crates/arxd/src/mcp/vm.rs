@@ -416,12 +416,7 @@ impl Supervisor {
         let policy = profile.policy();
         let recipe = profile.recipe()?;
         custody.verify()?;
-        let selected_static = profile
-            .has_static_compose()
-            .then(|| selected_static::SelectedStatic::open(&custody));
-        if selected_static.is_some() {
-            custody.verify()?;
-        }
+        let static_enabled = profile.has_static_compose();
         let mut supervisor = Self::new(
             root,
             policy,
@@ -447,7 +442,7 @@ impl Supervisor {
         }
         // Static release/backup enrollment waits for the selected live
         // runtime. The legacy profile retains its existing enrollment path.
-        if selected_static.is_none() && !profile.compose_releases.is_empty() {
+        if !static_enabled && !profile.compose_releases.is_empty() {
             let enrollments = profile
                 .compose_releases
                 .into_iter()
@@ -460,6 +455,20 @@ impl Supervisor {
         if profile.enabled {
             state.install_test();
         }
+        state.recipes[1] = Some((WEB_RECIPE_ID, None));
+        state.recipes[2].get_or_insert((Controller::windows_recipe_id(), None));
+        if static_enabled {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            let selected = state
+                .selected_test
+                .as_ref()
+                .ok_or(state.native_refusal)
+                .and_then(|m4| selected_static::SelectedStatic::open(&custody, m4));
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            let selected = Err(NativeRefusal::UnsupportedPlatform);
+            custody.verify()?;
+            state.install_static_selection(selected)?;
+        }
         state.custody = Some(custody);
         let gate = state
             .gate
@@ -467,11 +476,6 @@ impl Supervisor {
             .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
         gate.allow_agent_public_sites = profile.allow_agent_public_sites;
         gate.publish_profile = profile.publication.map(Arc::from);
-        state.recipes[1] = Some((WEB_RECIPE_ID, None));
-        state.recipes[2].get_or_insert((Controller::windows_recipe_id(), None));
-        if let Some(selected) = selected_static {
-            state.install_static_selection(selected)?;
-        }
         Ok(supervisor)
     }
 
@@ -927,8 +931,7 @@ impl Supervisor {
 
     fn static_refusal(&self) -> Option<NativeRefusal> {
         match self.selected_static.as_ref()? {
-            Ok(selected) if selected.buildable() => None,
-            Ok(_) => Some(NativeRefusal::NetworkFenceUnverified),
+            Ok(selected) => selected.refusal(),
             Err(reason) => Some(*reason),
         }
     }

@@ -485,8 +485,8 @@ fn static_compose_custody_verifies_four_disjoint_pins_before_opening_state() {
     raw.as_object_mut().unwrap().remove("backup");
     let vm = roots.load(&raw).unwrap();
     assert_eq!(
-        vm.custody.select_static_dossier().err(),
-        Some(NativeRefusal::NetworkFenceUnverified),
+        vm.custody.select_static_dossier(None).err(),
+        Some(NativeRefusal::QualificationMissing),
     );
     vm.custody.verify().unwrap();
     assert!(!roots.state.join("activity.sqlite3").exists());
