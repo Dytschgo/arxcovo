@@ -102,13 +102,20 @@ paths, identities, credentials, and raw MCP transcripts are excluded.
 - An authenticated catalog with closed admission returns `admission_closed`
   with a reason such as `qualification_missing`. An open catalog without the
   selected-record receipt returns `daemon_qualification_evidence_unavailable`.
-- The product catalog does not yet emit `selected_test_qualification`. That is
-  the M4 7c receipt this journey waits on.
-- `CandidateRuntime::capability` does not return `Qualified`. `LaunchAuthority`
-  is uninhabited, so `vault_test_version` on the real foreground returns
-  `vm_admission_closed` until a qualified runtime opens that gate. The client
-  records the refusal and fails. This journey does not change that product
-  behavior.
+- `vm_catalog` emits `selected_test_qualification` when a valid M4 TEST dossier
+  is selected and its epoch observation verifies. On Windows x64,
+  `Supervisor::capability` returns that catalog from `selected_test.catalog()`:
+  the seal `sha256` and the Ubuntu and Windows recipe pins. A missing or
+  unverified dossier stays closed with `qualification_missing`, or with the
+  selected refusal.
+- On Windows x64, `vault_test_version` opens when that selected catalog
+  verifies. `LaunchAuthority` is minted there for a consumed TEST launch
+  permit, and it stays uninhabited on other platforms.
+  `CandidateRuntime::capability` still does not return `Qualified`. An enabled
+  Windows x64 profile still yields `qualification_missing` from that method.
+  An absent or unverified dossier still makes `vault_test_version` return
+  `vm_admission_closed`. The qualified path stays **unverified on real
+  hardware**.
 - Both journeys require the vault `oneOf` `list_activity` schema. The
   pre-vault activity object, and any other shape, is `schema_changed`.
 - A broken version that activates, exits 0, skips cleanup, or replaces the
