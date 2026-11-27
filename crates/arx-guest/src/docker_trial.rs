@@ -11,7 +11,10 @@ use crate::protocol::{Message, ProtocolError, private, read_frame, write_frame};
 
 pub const FW_CFG: &str = "opt/arxcovo/compose-trial";
 pub const DETACHED: &str = "detached-v1";
-pub const ENDPOINT: &str = "endpoint-v1";
+pub const ENDPOINT: &str = "endpoint-v2";
+pub const MAX_ORIGIN_CERT: usize = 4096;
+pub const ORIGIN_HEALTH_PATH: &str = "/arx-health";
+pub const ORIGIN_PROFILE: &[u8] = b"arx-docker-trial-origin-v2\n";
 pub const PACKAGES: [&str; 4] = [
     "containerd.io",
     "docker-ce",
@@ -62,6 +65,14 @@ impl Challenge {
         Ok(())
     }
 
+    pub fn origin_name(self) -> String {
+        format!("arx-{}.invalid", self.compose_nonce())
+    }
+
+    pub fn origin_health(self) -> String {
+        format!("{}-{}\n", self.generation, self.compose_nonce())
+    }
+
     pub fn compose_nonce(self) -> String {
         self.nonce
             .iter()
@@ -77,7 +88,7 @@ pub enum TrialRequest {
     DockerTrialProvision { challenge: Challenge },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum TrialResponse {
     DockerTrialHealthy {
@@ -86,6 +97,7 @@ pub enum TrialResponse {
     },
     DockerTrialProvisioned {
         challenge: Challenge,
+        certificate_der: Vec<u8>,
     },
 }
 
@@ -107,7 +119,11 @@ impl Message for TrialResponse {
                 challenge,
                 packages,
             } if *packages != [0; 32] => challenge.validate(),
-            Self::DockerTrialProvisioned { challenge } => challenge.validate(),
+            Self::DockerTrialProvisioned {
+                challenge,
+                certificate_der,
+            } if (1..=MAX_ORIGIN_CERT).contains(&certificate_der.len()) => challenge.validate(),
+            Self::DockerTrialProvisioned { .. } => Err(ProtocolError::InvalidComposeField),
             Self::DockerTrialHealthy { .. } => Err(ProtocolError::InvalidComposeField),
         }
     }
@@ -167,7 +183,7 @@ pub fn secret_mount_matches(mountinfo: &str) -> bool {
 /// Local fixed actions. The wire cannot supply a command, image, path or secret.
 pub trait Bootstrap {
     fn health(&mut self) -> Option<[u8; 32]>;
-    fn provision(&mut self) -> bool;
+    fn provision(&mut self, challenge: Challenge) -> Option<Vec<u8>>;
 }
 
 /// The detached boot accepts health only. On the separate endpoint copy,
@@ -193,19 +209,29 @@ pub fn serve(
     if mode == BootMode::Detached {
         return Ok(());
     }
-    if read_frame(&mut reader)? != Some(TrialRequest::DockerTrialProvision { challenge })
-        || !guest.provision()
-    {
+    if read_frame(&mut reader)? != Some(TrialRequest::DockerTrialProvision { challenge }) {
         return Err(ProtocolError::UnexpectedRequest);
     }
+    let certificate_der = guest
+        .provision(challenge)
+        .ok_or(ProtocolError::UnexpectedRequest)?;
     write_frame(
         &mut writer,
-        &TrialResponse::DockerTrialProvisioned { challenge },
+        &TrialResponse::DockerTrialProvisioned {
+            challenge,
+            certificate_der,
+        },
     )?;
     if read_frame(&mut reader)? != Some(compose_hello(challenge)) {
         return Err(ProtocolError::ExpectedComposeHello);
     }
-    write_frame(&mut writer, &compose_ack(challenge))
+    write_frame(&mut writer, &compose_ack(challenge))?;
+    // Keep the guest service and its nginx child alive for HTTPS. The host
+    // holds the verified pipe until shutdown and sends no more trial frames.
+    if read_frame::<TrialRequest>(&mut reader)?.is_some() {
+        return Err(ProtocolError::UnexpectedRequest);
+    }
+    Ok(())
 }
 
 pub fn compose_hello(challenge: Challenge) -> ComposeRequest {
@@ -251,6 +277,8 @@ mod tests {
         challenge: CHALLENGE,
     };
 
+    const CERTIFICATE: &[u8] = b"fixture certificate";
+
     struct Guest {
         healthy: bool,
         provisions: u8,
@@ -261,9 +289,10 @@ mod tests {
             self.healthy.then_some([11; 32])
         }
 
-        fn provision(&mut self) -> bool {
+        fn provision(&mut self, challenge: Challenge) -> Option<Vec<u8>> {
+            assert_eq!(challenge, CHALLENGE);
             self.provisions += 1;
-            true
+            Some(CERTIFICATE.into())
         }
     }
 
@@ -314,6 +343,7 @@ mod tests {
             read_frame(&mut reply).unwrap(),
             Some(TrialResponse::DockerTrialProvisioned {
                 challenge: CHALLENGE,
+                certificate_der: CERTIFICATE.into(),
             })
         );
         let ack = read_frame(&mut reply).unwrap().unwrap();
@@ -346,6 +376,35 @@ mod tests {
             ambiguous_operations: 0,
         };
         assert!(!matches_compose_ack(CHALLENGE, &reordered));
+    }
+
+    #[test]
+    fn trial_origin_reply_carries_a_single_bounded_public_certificate() {
+        for certificate_der in [Vec::new(), vec![0; MAX_ORIGIN_CERT + 1]] {
+            let response = TrialResponse::DockerTrialProvisioned {
+                challenge: CHALLENGE,
+                certificate_der,
+            };
+            assert!(write_frame(&mut Vec::new(), &response).is_err());
+        }
+    }
+
+    #[test]
+    fn endpoint_trial_refuses_additional_requests_after_compose_hello() {
+        let mut input = Vec::new();
+        write_frame(&mut input, &HEALTH).unwrap();
+        write_frame(&mut input, &PROVISION).unwrap();
+        write_frame(&mut input, &compose_hello(CHALLENGE)).unwrap();
+        write_frame(&mut input, &PROVISION).unwrap();
+        let mut guest = Guest {
+            healthy: true,
+            provisions: 0,
+        };
+        assert!(matches!(
+            serve(BootMode::Endpoint, input.as_slice(), Vec::new(), &mut guest),
+            Err(ProtocolError::UnexpectedRequest)
+        ));
+        assert_eq!(guest.provisions, 1);
     }
 
     #[test]

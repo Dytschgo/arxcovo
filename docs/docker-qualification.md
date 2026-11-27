@@ -56,9 +56,11 @@ Leave existing VMs, their hypervisor settings and the old Lab Manager untouched.
   Include dormant
   site adapters, VPNs, host services, routers, public-numbered LAN and WAN
   hairpin. Use an isolated representative uplink if the ordinary site
-  cannot sustain the enrolled invariant. Supply the private generation-bound
-  CA/SNI profile and keep keys under owner/guest-root custody. No
-  Cloudflare credentials are needed.
+  cannot sustain the enrolled invariant. Supply the private profile file
+  containing the exact ASCII line `arx-docker-trial-origin-v2` followed by
+  a single LF. Pin that file in `origin_profile`. The endpoint guest
+  generates its own TLS key in a root-only runtime directory and returns
+  only its certificate over serial. No Cloudflare credentials are needed.
 
 ## Prepare a separately protected E1a copy
 
