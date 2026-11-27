@@ -83,6 +83,10 @@ impl Supervisor {
         if gate.fixture.is_some() {
             return true;
         }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(selected) = &self.selected_test {
+            return selected.catalog().is_ok();
+        }
         let _ = gate;
         matches!(
             self.candidate().capability(),
@@ -107,6 +111,16 @@ impl Supervisor {
                 vm,
                 &reaper,
                 &*reaper.custody,
+                turn,
+                &self.fenced,
+            );
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(cleanup) = self.test_cleanup() {
+            return self.controller.sweep_vault_test_with(
+                vm,
+                &cleanup,
+                &cleanup.custody,
                 turn,
                 &self.fenced,
             );
@@ -232,6 +246,20 @@ impl Run {
                 .is_some_and(|fixture| status.vm.is_some_and(|vm| fixture.worker_active(vm)));
             #[cfg(not(test))]
             let working = false;
+            // A native clone or snapshot worker settles its operation before
+            // it drops its staging registration. A busy gate is unconfirmed.
+            // A live run owner is not waited for: it stays registered while
+            // the VM runs, and the cleanup turn ends it.
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            let working = working
+                || status.vm.is_some_and(|vm| {
+                    !matches!(
+                        supervisor.observe_test_worker(&supervisor.test_staging, vm, |owner| {
+                            owner.is_none()
+                        }),
+                        Ok(true)
+                    )
+                });
             if status.state != Status::Pending && !working {
                 return Some(status);
             }

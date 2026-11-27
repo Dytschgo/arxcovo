@@ -274,10 +274,22 @@ fn same_work(work: &Work) -> Work {
 /// held disk's first cluster and reports what the pinned helper would.
 type InspectionCheck<'a> = dyn Fn(&InspectTarget<'_>, &SnapshotInfo<'_>, &CopyBudget<'_>) + 'a;
 
-struct FixtureInspector<'a> {
+pub(in crate::vm::windows::qualification::production) struct FixtureInspector<'a> {
     calls: u32,
     fail: bool,
     check: &'a InspectionCheck<'a>,
+}
+
+impl<'a> FixtureInspector<'a> {
+    pub(in crate::vm::windows::qualification::production) fn checking(
+        check: &'a InspectionCheck<'a>,
+    ) -> Self {
+        Self {
+            calls: 0,
+            fail: false,
+            check,
+        }
+    }
 }
 
 impl SnapshotInspector for FixtureInspector<'_> {
@@ -420,6 +432,7 @@ struct Case<'c> {
     custody: Option<&'c dyn CustodyCheckpoints>,
     inspect_fails: bool,
     checked_inspection: bool,
+    inspection_driver: Option<&'c tokio::runtime::Handle>,
     cancelled: &'c dyn Fn() -> bool,
     lose_commit: bool,
     lose_failure: bool,
@@ -435,6 +448,7 @@ impl Default for Case<'_> {
             custody: None,
             inspect_fails: false,
             checked_inspection: false,
+            inspection_driver: None,
             cancelled: &|| false,
             lose_commit: false,
             lose_failure: false,
@@ -515,6 +529,11 @@ fn run(
     let holds = Cell::new(0);
     let check_inspection =
         |target: &InspectTarget<'_>, info: &SnapshotInfo<'_>, budget: &CopyBudget<'_>| {
+            if let Some(driver) = case.inspection_driver {
+                // Matches the production inspector's synchronous bridge to
+                // the active foreground runtime that owns the helper I/O.
+                driver.block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            }
             if !case.checked_inspection {
                 return;
             }
@@ -686,8 +705,15 @@ fn assert_exact_inventory(fx: &SweepFixture, expected: &[PairSlots]) {
 /// T61/T62/I19: a capture holds the exact released pair and golden, writes
 /// only after its permits and identity checkpoints, and publishes one point
 /// with its exact charge while every hold is live. A replay mints nothing.
-#[test]
-fn native_capture_publishes_one_point_with_exact_lineage_charge_and_replay() {
+#[tokio::test]
+async fn native_capture_publishes_one_point_with_exact_lineage_charge_and_replay() {
+    let driver = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || assert_native_capture(&driver))
+        .await
+        .unwrap();
+}
+
+fn assert_native_capture(driver: &tokio::runtime::Handle) {
     assert_admission_closed();
     let fx = SweepFixture::new();
     let source = FakeSource::new(Instant::now());
@@ -698,7 +724,15 @@ fn native_capture_publishes_one_point_with_exact_lineage_charge_and_replay() {
     let golden_bytes = std::fs::read(fx.slot_file(golden.slots.disk)).unwrap();
 
     let admitted = admit(&fx, vm, 1, &Request::Create(None));
-    let (result, seen) = run(&fx, &source, &admitted, Case::default());
+    let (result, seen) = run(
+        &fx,
+        &source,
+        &admitted,
+        Case {
+            inspection_driver: Some(driver),
+            ..Case::default()
+        },
+    );
     result.unwrap();
     assert_eq!(seen.holds, 1);
     assert!(seen.checkpoints >= 2, "{seen:?}");

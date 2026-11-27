@@ -735,7 +735,6 @@ impl VmStore {
         Ok(result)
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn read_only<T>(
         &self,
         read: impl FnOnce(&Transaction<'_>) -> Result<T>,
@@ -1394,7 +1393,8 @@ pub(crate) fn retry_time(db: &Connection, now: i64) -> Result<i64> {
     )?)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+/// The retry clock's high water as [`retry_time`] would return it, without
+/// advancing it, for reads such as an operation poll.
 fn retry_time_readonly(db: &Connection, now: i64) -> Result<i64> {
     Ok(db.query_row(
         "SELECT max(high_water_ms,?1) FROM vm_retry_clock",
@@ -1626,7 +1626,9 @@ pub(crate) fn operation_status(
     operation: Id,
     now: i64,
 ) -> Result<Option<OperationStatus>> {
-    let now = retry_time(db, now)?;
+    // Keep the receipt read separate from any clock advance on expiry so
+    // active polling does not hold the store lock through a commit.
+    let now = retry_time_readonly(db, now)?;
     Ok(db
         .query_row(
             // Only immutable ledger evidence names a template. A legacy clone
@@ -1691,6 +1693,25 @@ pub(crate) fn operation_status(
             },
         )
         .optional()?)
+}
+
+/// A retained receipt was hidden by this poll's wall time and would still
+/// be visible at the persisted retry-clock high water.
+pub(crate) fn operation_expiry_needs_clock_advance(
+    db: &Connection,
+    principal: &str,
+    operation: Id,
+    now: i64,
+) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM vm_operations o CROSS JOIN vm_retry_clock c
+            WHERE o.principal=?1 AND o.operation_id=?2 AND o.status<>0
+              AND o.valid_through_ms>=c.high_water_ms AND o.valid_through_ms<?3
+        )",
+        params![principal, operation, now],
+        |row| row.get(0),
+    )?)
 }
 
 #[allow(dead_code, reason = "foreground MCP projection is wired in 4d")]
@@ -2339,6 +2360,16 @@ pub(crate) fn sealed_golden(
     }) else {
         return Ok(None);
     };
+    Ok(native_golden_pair(db, generation)?.map(|(slots, pair)| (slots, pair, retained)))
+}
+
+/// Read the two native checkpoints of a sealed pair. The caller binds the
+/// generation to a selected TEST recipe and an active template.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn native_golden_pair(
+    db: &Connection,
+    generation: Id,
+) -> Result<Option<(PairSlots, [ArtifactEvidence; 2])>> {
     let mut found = Vec::with_capacity(2);
     for role in ["disk", "vars"] {
         let row = db
@@ -2397,7 +2428,6 @@ pub(crate) fn sealed_golden(
             vars: *vars,
         },
         [*disk_evidence, *vars_evidence],
-        retained,
     )))
 }
 

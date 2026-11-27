@@ -325,7 +325,7 @@ pub(crate) trait SnapshotInspector {
 
 /// Checks and runs the read-only helper on the blocking copy worker.
 pub(crate) struct CheckedSnapshotInspector<'a, M, R> {
-    pub qualification: &'a ForegroundQualification<'a>,
+    pub qualification: &'a ForegroundQualification,
     pub image: &'a Artifact,
     pub cwd: &'a LocalPath,
     pub cancel: &'a Shutdown,
@@ -334,7 +334,7 @@ pub(crate) struct CheckedSnapshotInspector<'a, M, R> {
     pub refresh: R,
 }
 
-fn inspection_launch_target<'a, 'plan>(
+pub(super) fn inspection_launch_target<'a, 'plan>(
     plan: &'a CommandPlan<'plan>,
     workspace: &ProductionWorkspace,
     cwd: &'a LocalPath,
@@ -931,4 +931,4 @@ pub(crate) fn copy_offline_snapshot(
 
 #[cfg(test)]
 #[path = "snapshot_tests.rs"]
-mod tests;
+pub(super) mod tests;

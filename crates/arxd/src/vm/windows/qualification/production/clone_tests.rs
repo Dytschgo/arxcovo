@@ -345,7 +345,7 @@ struct FixtureOverlay<'f, 'i> {
     before_consume: &'f dyn Fn(),
 }
 
-fn held_release<'a>(
+pub(in crate::vm::windows::qualification::production) fn held_release<'a>(
     workspace: &'a ProductionWorkspace,
     slot: ArtifactSlot,
     identity: FileIdentity,

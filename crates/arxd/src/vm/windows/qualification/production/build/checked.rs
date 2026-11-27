@@ -5,7 +5,7 @@
 use super::health::{AdmittedProbe, HealthRun, HealthSession, run_health};
 use super::*;
 use crate::vm::runtime::InstallerFailureReason;
-use crate::vm::test_issuer::{Intent, NativeTarget, TestIssuer};
+use crate::vm::test_issuer::{Intent, NativeTarget, SelectedSource, TestIssuer};
 use crate::vm::windows::qualification::recipe::BootReservation;
 
 /// A held installed boot driven by the shared health runner.
@@ -73,19 +73,35 @@ fn installer_refusal(reason: InstallerFailureReason) -> Q {
     }
 }
 
-struct Checked<'a, C> {
-    qualification: &'a ForegroundQualification<'a>,
-    issuer: &'a TestIssuer<'a, ForegroundQualification<'a>, C>,
-    intent: &'a Intent<'a, ForegroundQualification<'a>, C>,
+struct Checked<'a, S, C> {
+    qualification: &'a ForegroundQualification,
+    issuer: &'a TestIssuer<'a, S, C>,
+    intent: &'a Intent<'a, S, C>,
     cwd: LocalPath,
     cancel: &'a Shutdown,
     cancelled: &'a dyn Fn() -> bool,
     limits: BuildRequest<'a>,
 }
 
-impl<C: Clock> Effects for Checked<'_, C> {
+/// Refreshes the selection epoch for post-release and pre-seal checks, riding
+/// out transient store-mutex contention without blocking past cancellation or
+/// confirmed epoch revocation. Live-child monitors keep single nonblocking
+/// samples by calling `issuer.refresh()` directly.
+pub(super) fn refresh_pre_seal<S: SelectedSource, C: Clock>(
+    issuer: &TestIssuer<'_, S, C>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Instant, Q> {
+    crate::vm::test_issuer::retry_contended(
+        cancelled,
+        &|| issuer.epoch().effects_revoked(),
+        || Q::QualificationMissing,
+        || issuer.refresh(),
+    )
+}
+
+impl<S: SelectedSource, C: Clock> Effects for Checked<'_, S, C> {
     fn fresh(&self) -> Result<Instant, Q> {
-        self.issuer.refresh()
+        refresh_pre_seal(self.issuer, self.cancelled)
     }
 
     fn stage<'w>(
@@ -140,7 +156,7 @@ impl<C: Clock> Effects for Checked<'_, C> {
                         permit,
                         self.cancel,
                         self.cancelled,
-                        || self.fresh(),
+                        || self.issuer.refresh(),
                     )
                     .await
             }
@@ -197,7 +213,7 @@ impl<C: Clock> Effects for Checked<'_, C> {
         let check = |by| launch::check_preparation(by, &cancelled);
         let fresh = |by: Instant| -> Result<Instant, Q> {
             check(by)?;
-            let captured = self.fresh()?;
+            let captured = self.issuer.refresh()?;
             check(by)?;
             Ok(captured)
         };
@@ -295,7 +311,9 @@ impl<C: Clock> Effects for Checked<'_, C> {
                 (release, None)
             }
         };
-        fresh(cutoff)?;
+        check(cutoff)?;
+        self.fresh()?;
+        check(cutoff)?;
         Ok(BootRelease {
             release: release.for_build(workspace, pair)?,
             phase: installer.map(InstallerStage::phase),
@@ -304,14 +322,14 @@ impl<C: Clock> Effects for Checked<'_, C> {
     }
 }
 
-impl<'q> ForegroundQualification<'q> {
+impl ForegroundQualification {
     /// Runs an already-admitted build. Installation of the issuer and the
     /// entry point that admits native production requests land in chunk 16.
     #[allow(clippy::too_many_arguments, reason = "one admitted build's inputs")]
-    pub(crate) async fn build_test_golden<C: Clock>(
+    pub(crate) async fn build_test_golden<'q, S: SelectedSource, C: Clock>(
         &'q self,
         controller: &VmController<C>,
-        issuer: &'q TestIssuer<'q, Self, C>,
+        issuer: &'q TestIssuer<'q, S, C>,
         worker: &PendingOperation,
         slots: BuildSlots,
         request: BuildRequest<'_>,

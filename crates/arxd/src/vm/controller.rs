@@ -160,7 +160,7 @@ pub(crate) enum AdmittedEffect {
 /// Foreground VM-profile metadata. A successful admission commits intent;
 /// there is no runtime, transport, or process launcher in this controller.
 pub struct VmController<C> {
-    store: VmStore,
+    store: Arc<VmStore>,
     policy: VmPolicy,
     clock: C,
     gate: Mutex<AdmissionGate>,
@@ -331,7 +331,7 @@ impl<C: Clock> VmController<C> {
     pub fn open(vm_state_root: &Path, policy: VmPolicy, clock: C) -> Result<Self> {
         let store = VmStore::open(vm_state_root, utc(clock.now())?)?;
         Ok(Self {
-            store,
+            store: Arc::new(store),
             policy,
             clock,
             gate: Mutex::default(),
@@ -552,12 +552,24 @@ impl<C: Clock> VmController<C> {
         if validate_principal(principal).is_err() {
             return Ok(Err(Refusal::NotFound));
         }
-        self.store.transact(|db| {
-            Ok(
-                store::operation_status(db, principal, id, utc(self.clock.now())?)?
-                    .ok_or(Refusal::NotFound),
-            )
-        })
+        let (status, advance_to) = self.store.read_only(|db| {
+            let now = utc(self.clock.now())?;
+            let status = store::operation_status(db, principal, id, now)?;
+            let advance_to = if status.is_none()
+                && store::operation_expiry_needs_clock_advance(db, principal, id, now)?
+            {
+                Some(now)
+            } else {
+                None
+            };
+            Ok((status, advance_to))
+        })?;
+        if let Some(now) = advance_to {
+            // Persist the time observed by the poll even if UTC moved back
+            // while acquiring the writer. retry_time also preserves newer writes.
+            self.store.transact(|db| store::retry_time(db, now))?;
+        }
+        Ok(status.ok_or(Refusal::NotFound))
     }
 
     #[allow(dead_code, reason = "foreground MCP projection is wired in 4d")]
@@ -2152,10 +2164,18 @@ impl<C: Clock> VmController<C> {
                         Err(Refusal::NotFound)
                     }));
                 }
-                ForegroundSubject::Extend(vm) => {
+                ForegroundSubject::Extend {
+                    vm,
+                    selected_test_installed,
+                } => {
                     return Ok(refused(match owned_vm(db, principal, vm)? {
                         None if store::expired_status(db, principal, vm)?.is_some() => {
                             Err(Refusal::Expired)
+                        }
+                        None if selected_test_installed
+                            && store::static_vm::owned_state(db, principal, vm)?.is_some() =>
+                        {
+                            Ok(())
                         }
                         None => Err(Refusal::NotFound),
                         Some(lease) => lease.check(now),
@@ -2259,7 +2279,10 @@ pub(crate) enum ForegroundSubject {
     Start(Id),
     Stop(Id),
     Script(Id),
-    Extend(Id),
+    Extend {
+        vm: Id,
+        selected_test_installed: bool,
+    },
 }
 
 impl ForegroundSubject {
@@ -2269,7 +2292,7 @@ impl ForegroundSubject {
             | Self::Start(id)
             | Self::Stop(id)
             | Self::Script(id)
-            | Self::Extend(id) => id,
+            | Self::Extend { vm: id, .. } => id,
         }
     }
 }
@@ -2737,6 +2760,60 @@ impl<C: Clock> VmController<C> {
 impl<C: Clock> VmController<C> {
     pub(crate) fn native_store(&self) -> &VmStore {
         &self.store
+    }
+
+    pub(crate) fn selected_golden(
+        &self,
+        recipe: super::qualification_record::RecipeIdentity,
+    ) -> Result<Option<SealedGolden>> {
+        self.store.try_native_transaction(|db| {
+            let Some((template, expected)) =
+                store::sealed_pair(db, &hex::encode(recipe.recipe_id), recipe.recipe_sha256)?
+            else {
+                return Ok(None);
+            };
+            let generation = expected.disk.generation;
+            Self::bound_native_workspace(db, generation)?;
+            Ok(store::native_golden_pair(db, generation)?
+                .filter(|(slots, _)| *slots == expected)
+                .map(|(slots, evidence)| SealedGolden {
+                    template,
+                    slots,
+                    evidence,
+                    retained: 0,
+                }))
+        })
+    }
+
+    /// Whether the VM's active TEST generation is bound to a native
+    /// workspace from one of the selected recipes, whether it is running or
+    /// stopped. Lease extension changes no artifacts, so no released pair
+    /// is required.
+    pub(crate) fn selected_test_vm(
+        &self,
+        vm: Id,
+        recipes: super::qualification_record::TestRecipes,
+    ) -> Result<bool> {
+        self.store.read_only(|db| {
+            let active = db
+                .query_row(
+                    "SELECT g.id,t.recipe_digest FROM vm_generations g
+                     JOIN vm_instances v ON v.id=g.vm_id
+                     JOIN vm_templates t ON t.id=v.template
+                     WHERE v.id=?1 AND g.active=1 AND g.static_id IS NULL",
+                    [vm],
+                    |row| Ok((row.get::<_, Id>(0)?, row.get::<_, [u8; 32]>(1)?)),
+                )
+                .optional()?;
+            Ok(active.is_some_and(|(generation, recipe)| {
+                [recipes.ubuntu.recipe_sha256, recipes.windows.recipe_sha256].contains(&recipe)
+                    && Self::bound_native_workspace(db, generation).is_ok()
+            }))
+        })
+    }
+
+    pub(crate) fn share_native_store(&self) -> Arc<VmStore> {
+        self.store.clone()
     }
 
     /// Read-only replay lookup for occupied-slot or already-known replay
@@ -3412,6 +3489,10 @@ pub(crate) struct SealedGolden {
     allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
 )]
 impl SealedGolden {
+    pub(crate) fn template(&self) -> Id {
+        self.template
+    }
+
     pub(crate) fn slots(&self) -> PairSlots {
         self.slots
     }
@@ -3815,5 +3896,81 @@ impl<C: Clock> VmController<C> {
         );
         self.store
             .transact(|db| store::snapshot::fail_copy(db, work, leaves, utc(self.clock.now())?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PollClock(Mutex<ClockReading>);
+
+    impl Clock for PollClock {
+        fn now(&self) -> ClockReading {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn operation_status_cannot_resurrect_an_expired_receipt_after_utc_rollback() {
+        const NOW: i64 = 1_800_000_000_000;
+        let root = crate::service::application::tests::private_temp();
+        let ctl = VmController::open(
+            root.path(),
+            VmPolicy::default(),
+            PollClock(Mutex::new(ClockReading {
+                utc_ms: NOW,
+                monotonic: Instant::now(),
+            })),
+        )
+        .unwrap();
+        let binding = store::Binding {
+            principal: "alice",
+            key: RequestId {
+                key: [1; 16],
+                issued_at_ms: NOW,
+            },
+            subject: Subject::Vm([2; 16]),
+            action: Action::Start as i64,
+        };
+        let operation = ctl
+            .store
+            .transact(|db| {
+                store::retry_time(db, NOW)?;
+                binding.record(db, NOW, Some([2; 16]), None)
+            })
+            .unwrap();
+        let set_utc = |utc_ms| ctl.clock.0.lock().unwrap().utc_ms = utc_ms;
+        let poll = || ctl.operation_status("alice", operation.id).unwrap();
+        let high_water = || {
+            ctl.store
+                .read_only(|db| store::count(db, "SELECT high_water_ms FROM vm_retry_clock", []))
+                .unwrap()
+        };
+        let last_valid = NOW + RETRY_WINDOW_MS;
+        set_utc(last_valid + 1);
+        assert_eq!(poll().unwrap().state, Status::Pending);
+        assert_eq!(high_water(), NOW);
+
+        ctl.store
+            .transact(|db| {
+                store::finish(
+                    db,
+                    operation.receipt.activity_id,
+                    Status::Succeeded,
+                    NOW,
+                    Some(true),
+                )
+            })
+            .unwrap();
+        set_utc(last_valid);
+        assert_eq!(poll().unwrap().state, Status::Succeeded);
+        assert_eq!(high_water(), NOW);
+
+        set_utc(last_valid + 1);
+        assert_eq!(poll(), Err(Refusal::NotFound));
+        set_utc(last_valid);
+        assert_eq!(poll(), Err(Refusal::NotFound));
+        assert_eq!(high_water(), last_valid + 1);
     }
 }

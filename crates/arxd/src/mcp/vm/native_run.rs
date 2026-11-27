@@ -16,7 +16,10 @@ use crate::{
             WorkspaceBinding,
         },
         runtime::ScriptAuthority,
-        test_issuer::{Installation, NativeTarget, SelectedSource, TestIssuer},
+        test_issuer::{
+            CONTENTION_BUDGET, Installation, NativeTarget, SelectedSource, TestIssuer,
+            retry_contended_async,
+        },
     },
 };
 use arx_guest::ScriptStatus;
@@ -37,6 +40,8 @@ const FENCE_RETRY_WINDOW: Duration = Duration::from_secs(3);
 /// most this long, well inside any script's own timeout, before the owner
 /// abandons it as channel loss and tears down.
 const SCRIPT_INTERRUPT: Duration = Duration::from_secs(2);
+/// Poll interval while a cleanup turn waits for an ended owner to leave.
+const CLEANUP_POLL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 pub(super) struct BlockingBarrier {
@@ -175,8 +180,7 @@ impl<S: SelectedSource, C: Clock> ScriptAuthorizer for TestIssuer<'_, S, C> {
     }
 }
 
-/// The fixture-installed admission inputs for owned scripts. No production
-/// path installs it before 7c 16, so the script route stays closed.
+/// The selected admission inputs for scripts on an owned TEST channel.
 #[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
 pub(super) struct NativeScripts {
     pub(super) installation: Installation,
@@ -259,6 +263,16 @@ impl Run {
             state.ended = true;
             state.witness = None;
         }
+    }
+
+    /// Ends this run for expiry or recovery cleanup. The witness goes first,
+    /// then the live loop, a boot and any in-flight script are interrupted.
+    /// No owner stop receipt exists, so an interrupted script settles as
+    /// lost and teardown fences the writer before it commits the release.
+    fn end_for_cleanup(&self) {
+        self.withdraw();
+        self.cancel.cancel();
+        self.retry.notify_one();
     }
 
     /// Whether a new script could still be queued for this live run.
@@ -375,6 +389,13 @@ impl Run {
 
     fn project(&self, supervisor: &Supervisor, mut row: Value) -> Value {
         row["ready"] = json!(false);
+        if supervisor
+            .selected_test
+            .as_ref()
+            .is_some_and(|selected| selected.refresh().is_err())
+        {
+            return row;
+        }
         match supervisor
             .controller
             .native_run_current(&self.principal, self.target, true)
@@ -664,8 +685,7 @@ impl<'a> LiveLaunch for NativeLaunch<'a> {
     }
 }
 
-// The activation chunk supplies the selected source on the tracked worker.
-// Until then, only fixtures can construct the installation required here.
+// The selected source runs on the tracked worker.
 #[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
 impl Gate {
     /// The caller holds the foreground gate. A fresh start commits its pending
@@ -815,19 +835,35 @@ fn replay_start(supervisor: &Supervisor, request: &Request<'_>) -> Outcome<Optio
 
 #[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
 impl Run {
-    async fn run<S: SelectedSource>(
+    pub(super) async fn run<S: SelectedSource>(
         &self,
         supervisor: &Supervisor,
         start: Start,
         issuer: &TestIssuer<'_, S, ForegroundClock>,
-        qualification: &ForegroundQualification<'_>,
+        qualification: &ForegroundQualification,
     ) -> anyhow::Result<()> {
         let controller = &supervisor.controller;
         let pair = StartPair {
             slots: start.active.pair.0,
             evidence: start.active.pair.1,
         };
-        let expected = binding(controller.native_workspace_scope(self.target.generation)?);
+        let stopped = || self.cancel.is_cancelled() || supervisor.cancel.is_cancelled();
+        let revoked = || issuer.epoch().effects_revoked();
+        let Ok(scope) = retry_contended_async(
+            &stopped,
+            &revoked,
+            || anyhow::anyhow!("TEST qualification missing"),
+            || controller.native_workspace_scope(self.target.generation),
+        )
+        .await
+        else {
+            // No workspace was touched. Hand the committed epoch to recovery
+            // instead of failing the worker, which would fence all TEST
+            // admission.
+            self.hand_off(supervisor).await;
+            return Ok(());
+        };
+        let expected = binding(scope);
         let workspace = qualification.hold_start_workspace(expected);
         if let Ok(workspace) = workspace {
             // An already spent preparation window refuses at the first check.
@@ -846,9 +882,14 @@ impl Run {
                     .map_err(fail)?;
                 let (slots, evidence) = start.active.golden.ok_or_else(|| fail(PATH))?;
                 let golden = binding(
-                    controller
-                        .native_workspace_scope(slots.disk.generation)
-                        .map_err(|_| fail(PATH))?,
+                    retry_contended_async(
+                        &stopped,
+                        &revoked,
+                        || anyhow::anyhow!("TEST qualification missing"),
+                        || controller.native_workspace_scope(slots.disk.generation),
+                    )
+                    .await
+                    .map_err(|_| fail(PATH))?,
                 );
                 let backing = qualification
                     .hold_start_workspace(golden)
@@ -1203,15 +1244,26 @@ impl Run {
             return false;
         };
         let cancelled = || self.cancel.is_cancelled() || supervisor.cancel.is_cancelled();
+        // A refused observation or ledger read may be transient store
+        // contention: observe again, bounded. Loss stays loss once the
+        // contention budget is spent; cancellation ends it at once.
+        let contended_until = Instant::now() + CONTENTION_BUDGET;
         loop {
-            if !live() {
+            if live() {
+                if let Ok(_gate) = supervisor.gate.try_lock() {
+                    match supervisor.controller.finish_native_start(
+                        worker,
+                        &self.principal,
+                        self.target,
+                        cancelled,
+                    ) {
+                        Ok(committed) => return committed && self.publish(id, supervisor),
+                        Err(_) if Instant::now() >= contended_until => return false,
+                        Err(_) => {}
+                    }
+                }
+            } else if Instant::now() >= contended_until {
                 return false;
-            }
-            if let Ok(_gate) = supervisor.gate.try_lock() {
-                return supervisor
-                    .controller
-                    .finish_native_start(worker, &self.principal, self.target, cancelled)
-                    .is_ok_and(|committed| committed && self.publish(id, supervisor));
             }
             if cancelled() || Instant::now() + GATE_RETRY >= worker.deadline() {
                 return false;
@@ -1256,7 +1308,7 @@ impl Run {
         }
     }
 
-    async fn hand_off(&self, supervisor: &Supervisor) {
+    pub(super) async fn hand_off(&self, supervisor: &Supervisor) {
         while supervisor.controller.fence_native_run(self.target).is_err() {
             tokio::select! {
                 biased;
@@ -1266,7 +1318,11 @@ impl Run {
         }
     }
 
-    async fn settle_proof(&self, supervisor: &Supervisor, proof: &ReleasedGeneration<'_>) {
+    pub(super) async fn settle_proof(
+        &self,
+        supervisor: &Supervisor,
+        proof: &ReleasedGeneration<'_>,
+    ) {
         self.settle_with(
             supervisor,
             || {
@@ -1376,6 +1432,31 @@ impl Supervisor {
             }
             Ok(None) => self.with_test_orphan_fence(&self.native_runs, vm, recover),
             Err(_) => false,
+        }
+    }
+
+    /// Expiry or recovery of a live TEST run: end its owner, then wait up to
+    /// `join_by` for the owner to settle its release and leave. No gate or
+    /// registry lock is held while waiting. Returns whether no owner remains;
+    /// an owner still tearing down keeps sole custody of its handles.
+    pub(super) fn end_native_run(&self, vm: Id, join_by: Instant) -> bool {
+        match self.observe_test_worker(&self.native_runs, vm, |owner| owner.cloned()) {
+            Ok(None) => return true,
+            Ok(Some(owner)) => owner.end_for_cleanup(),
+            Err(_) => return false,
+        }
+        loop {
+            if matches!(
+                self.native_runs.with_entry(vm, |owner| owner.is_none()),
+                Ok(true)
+            ) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= join_by {
+                return false;
+            }
+            std::thread::sleep(CLEANUP_POLL.min(join_by - now));
         }
     }
 }

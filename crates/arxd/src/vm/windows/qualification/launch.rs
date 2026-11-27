@@ -836,7 +836,7 @@ fn asset_pin(expected: ArtifactPin) -> crate::vm::AssetPin {
     }
 }
 
-fn content(pin: &PathPin) -> Result<ArtifactPin, NativeRefusal> {
+pub(super) fn content(pin: &PathPin) -> Result<ArtifactPin, NativeRefusal> {
     pin.verified_content
         .ok_or(NativeRefusal::DistributionUnverified)
 }

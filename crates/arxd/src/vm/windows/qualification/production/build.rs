@@ -757,4 +757,4 @@ mod health;
 
 #[cfg(test)]
 #[path = "build_tests.rs"]
-mod tests;
+pub(super) mod tests;

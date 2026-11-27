@@ -731,6 +731,39 @@ async fn reaper_wakes_a_live_owner_and_recovers_only_without_one() {
 }
 
 #[tokio::test]
+async fn expiry_ends_a_live_owner_and_waits_for_it_only_until_join_by() {
+    let mut h = windows_harness().await;
+    let client = h.client(0).await;
+    let Starting { owner, worker, registration, observed } = reserved(&h, &client).await;
+    record_checked_creation(&h, &observed);
+    assert!(owner.commit_ready(h.supervisor(), &worker, || Some([42; 16]), || true).await);
+    assert!(owner.witnessed());
+    let vm = observed.target.vm;
+    let supervisor = h.supervisor();
+    // An owner still registered at join_by leaves the turn unconfirmed, but
+    // its witness is gone and its live loop, boot or script is interrupted.
+    let began = Instant::now();
+    assert!(!supervisor.end_native_run(vm, began + Duration::from_millis(100)));
+    assert!(began.elapsed() >= Duration::from_millis(100));
+    assert!(!owner.witnessed(), "expiry left the live witness public");
+    assert!(owner.stop_signalled(), "expiry did not interrupt the live run");
+    assert!(owner.retry_signalled().await, "expiry did not wake a retrying owner");
+    // The turn confirms as soon as the owner settles and leaves.
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(registration);
+    });
+    let began = Instant::now();
+    assert!(supervisor.end_native_run(vm, began + Duration::from_secs(5)));
+    assert!(began.elapsed() < Duration::from_secs(5));
+    release.join().unwrap();
+    assert!(supervisor.end_native_run(vm, Instant::now()));
+    assert_admission_closed(&h);
+    drop(client);
+    let _ = h.shutdown().await;
+}
+
+#[tokio::test]
 async fn release_settles_without_a_receipt_and_keeps_its_proof_across_store_failure() {
     let mut h = windows_harness().await;
     let client = h.client(0).await;

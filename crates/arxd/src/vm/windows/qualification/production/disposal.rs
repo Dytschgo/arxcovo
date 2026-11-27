@@ -203,7 +203,7 @@ pub(crate) struct NativeDisposal<'a> {
     guards: &'a GenerationGuards,
 }
 
-impl ForegroundQualification<'_> {
+impl ForegroundQualification {
     /// Constructs a scoped native TEST disposal handle bound to the enrolled
     /// production root and owner SID. Keeps production TEST admission closed.
     pub(crate) fn disposal<'a>(
@@ -899,7 +899,7 @@ pub(super) fn leaf_name(slot: ArtifactSlot) -> String {
     format!("{}-{}", slot.role, hex::encode(slot.key))
 }
 
-pub(super) fn binding_from_scope(gen_scope: native::Scope) -> WorkspaceBinding {
+pub(crate) fn binding_from_scope(gen_scope: native::Scope) -> WorkspaceBinding {
     WorkspaceBinding {
         generation: gen_scope.generation,
         production: gen_scope.production,

@@ -11,9 +11,8 @@
 //! effect's own authority type exists. Recovery authority is separate and
 //! cannot launch.
 //!
-//! No production path constructs an [`Installation`] before 7c 16, so no
-//! configured input reaches an effect here. Native paths are **unverified on
-//! real hardware**.
+//! The foreground opens one issuer only after explicit opt-in and checked
+//! selection. Native paths are **unverified on real hardware**.
 #![cfg_attr(
     not(test),
     allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
@@ -37,23 +36,90 @@ use super::{
 };
 use crate::{config::TestQualificationSelection, service::Shutdown, store::vm::native::Scope};
 use serde_json::{Value, json};
-use std::{sync::Mutex, time::Instant};
+use std::{
+    ops::Deref,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 const REFUSED: NativeRefusal = NativeRefusal::QualificationMissing;
 /// One worker's intent names at most this many distinct effects.
 const MAX_EFFECTS: usize = 16;
+/// A background worker's preparation or permit call rides out transient
+/// store contention, such as a concurrent `vm_operation` poll, for at most
+/// this long. Monitors keep their single nonblocking sample.
+pub(crate) const CONTENTION_BUDGET: Duration = Duration::from_millis(500);
+const CONTENTION_RETRY: Duration = Duration::from_millis(5);
+
+/// Retries `attempt` through transient refusal until it succeeds, the
+/// worker is cancelled, the selection epoch is revoked or
+/// [`CONTENTION_BUDGET`] passes. Cancellation and revocation return the
+/// explicit refusal even when an attempt succeeded.
+pub(crate) fn retry_contended<T, E>(
+    cancelled: &dyn Fn() -> bool,
+    revoked: &dyn Fn() -> bool,
+    refusal: impl FnOnce() -> E,
+    mut attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let deadline = Instant::now() + CONTENTION_BUDGET;
+    loop {
+        if cancelled() || revoked() {
+            return Err(refusal());
+        }
+        let result = attempt();
+        if cancelled() || revoked() {
+            return Err(refusal());
+        }
+        if result.is_ok() || Instant::now() >= deadline {
+            return result;
+        }
+        std::thread::sleep(CONTENTION_RETRY);
+    }
+}
+
+/// [`retry_contended`] for a worker's async preparation.
+pub(crate) async fn retry_contended_async<T, E>(
+    cancelled: &dyn Fn() -> bool,
+    revoked: &dyn Fn() -> bool,
+    refusal: impl FnOnce() -> E,
+    mut attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let deadline = Instant::now() + CONTENTION_BUDGET;
+    loop {
+        if cancelled() || revoked() {
+            return Err(refusal());
+        }
+        let result = attempt();
+        if cancelled() || revoked() {
+            return Err(refusal());
+        }
+        if result.is_ok() || Instant::now() >= deadline {
+            return result;
+        }
+        tokio::time::sleep(CONTENTION_RETRY).await;
+    }
+}
 
 /// Only this module can construct it, so only a consumed permit yields an
 /// effect authority.
 pub(crate) struct Minted(());
 
-/// The single installation point for native TEST effects and recovery. Its
-/// production constructor lands with activation in 7c 16. Until then only
-/// fixtures hold one, so no profile, configured selection or filter can open
-/// an issuer or mint recovery authority.
+/// The installation marker issued by the verified production selection.
 pub(crate) struct Installation(());
 
 impl Installation {
+    /// Production installs only the concrete foreground selection.
+    #[cfg(not(test))]
+    pub(crate) fn selected<C>(_: &TestIssuer<'_, ForegroundQualification, C>) -> Self {
+        Self(())
+    }
+
+    /// Tests also install the fixture selection through the same routes.
+    #[cfg(test)]
+    pub(crate) fn selected<S: SelectedSource, C>(_: &TestIssuer<'_, S, C>) -> Self {
+        Self(())
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         Self(())
@@ -87,28 +153,43 @@ pub(crate) struct NativeTarget {
     pub writer_epoch: Option<Id>,
 }
 
+enum ControllerHandle<'a, C> {
+    Owned(Arc<VmController<C>>),
+    Borrowed(&'a VmController<C>),
+}
+
+impl<C> Deref for ControllerHandle<'_, C> {
+    type Target = VmController<C>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(controller) => controller,
+            Self::Borrowed(controller) => controller,
+        }
+    }
+}
+
 pub(crate) struct TestIssuer<'a, S, C> {
-    controller: &'a VmController<C>,
+    controller: ControllerHandle<'a, C>,
     source: S,
     epoch: SelectionEpoch,
     seal_sha256: Hash,
     recipes: TestRecipes,
 }
 
-impl<'a, C: Clock> TestIssuer<'a, ForegroundQualification<'a>, C> {
+impl<C: Clock> TestIssuer<'static, ForegroundQualification, C> {
     /// The startup path: hold the configured selection, then open it.
     pub(crate) fn open_configured(
-        installation: &Installation,
-        controller: &'a VmController<C>,
+        controller: Arc<VmController<C>>,
         config: &TestQualificationSelection,
     ) -> Result<Self, NativeRefusal> {
         let source = ForegroundQualification::open(
-            controller.native_store(),
+            controller.share_native_store(),
             config.enrollment().as_str(),
             config.dossier().as_str(),
             config.selection(),
         )?;
-        Self::open(installation, controller, source, config)
+        Self::verify_selection(ControllerHandle::Owned(controller), source, config)
     }
 }
 
@@ -118,6 +199,23 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
     pub(crate) fn open(
         _: &Installation,
         controller: &'a VmController<C>,
+        source: S,
+        config: &TestQualificationSelection,
+    ) -> Result<Self, NativeRefusal> {
+        Self::verify_selection(ControllerHandle::Borrowed(controller), source, config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_owned_fixture(
+        controller: Arc<VmController<C>>,
+        source: S,
+        config: &TestQualificationSelection,
+    ) -> Result<Self, NativeRefusal> {
+        Self::verify_selection(ControllerHandle::Owned(controller), source, config)
+    }
+
+    fn verify_selection(
+        controller: ControllerHandle<'a, C>,
         source: S,
         config: &TestQualificationSelection,
     ) -> Result<Self, NativeRefusal> {
@@ -145,6 +243,28 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
             seal_sha256: selection.seal_sha256,
             recipes,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn map_source<T: SelectedSource>(
+        self,
+        wrap: impl FnOnce(S) -> T,
+    ) -> TestIssuer<'a, T, C> {
+        TestIssuer {
+            controller: self.controller,
+            source: wrap(self.source),
+            epoch: self.epoch,
+            seal_sha256: self.seal_sha256,
+            recipes: self.recipes,
+        }
+    }
+
+    pub(crate) fn source(&self) -> &S {
+        &self.source
+    }
+
+    pub(crate) fn recipes(&self) -> TestRecipes {
+        self.recipes
     }
 
     pub(crate) fn epoch(&self) -> &SelectionEpoch {
@@ -361,9 +481,29 @@ impl<'i, S: SelectedSource, C: Clock> Intent<'i, S, C> {
         slots: &[ArtifactSlot],
         inspection: Option<InspectionBinding>,
     ) -> Result<(), NativeRefusal> {
-        self.guard(slots, inspection)?;
-        let captured = self.issuer.refresh()?;
-        self.guard(slots, inspection)?;
+        // A worker's ledger reads are nonblocking. Each step retries its own
+        // transient contention, bounded, while neither cancellation nor
+        // revocation holds, so a slow refresh cannot spend the trailing
+        // guard's window. The observation must still be fresh once the
+        // trailing guard passes, so the retries never extend its freshness.
+        let cancelled = || self.cancel.is_cancelled();
+        let revoked = || self.issuer.epoch.effects_revoked();
+        retry_contended(
+            &cancelled,
+            &revoked,
+            || REFUSED,
+            || self.guard(slots, inspection),
+        )?;
+        let captured = retry_contended(&cancelled, &revoked, || REFUSED, || self.issuer.refresh())?;
+        retry_contended(
+            &cancelled,
+            &revoked,
+            || REFUSED,
+            || self.guard(slots, inspection),
+        )?;
+        if cancelled() || revoked() {
+            return Err(REFUSED);
+        }
         fresh_observation(captured, Instant::now(), REFUSED)
     }
 

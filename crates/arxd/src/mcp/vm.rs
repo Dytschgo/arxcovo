@@ -2,6 +2,8 @@
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod native_run;
 mod owned_worker;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod selected_test;
 mod vault_test;
 use crate::{
     config::{TestVms, VmRuntimeProfile},
@@ -267,7 +269,12 @@ pub(crate) struct Supervisor {
     controller: Arc<Controller>,
     #[cfg(all(windows, target_arch = "x86_64"))]
     native_runs: owned_worker::Registry<Arc<native_run::Run>>,
-    /// Owned-script admission inputs. Only fixtures install them before 7c 16.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    selected_test: Option<Arc<selected_test::SelectedTest>>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    test_staging: owned_worker::Registry<()>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    test_generations: crate::vm::qualification::GenerationGuards,
     #[cfg(all(windows, target_arch = "x86_64"))]
     native_scripts: std::sync::OnceLock<native_run::NativeScripts>,
     gate: Mutex<Gate>,
@@ -279,8 +286,7 @@ pub(crate) struct Supervisor {
     // Two TEST recipes and the independent A2 web recipe share one page.
     recipes: [Option<Recipe>; 3],
     native_refusal: NativeRefusal,
-    /// The validated native runtime profile, if configured. It only selects
-    /// the closed candidate runtime; it never authorizes a launch here.
+    /// The runtime profile also serves the independent legacy candidate.
     runtime: Option<VmRuntimeProfile>,
     publisher: Publication,
     compose: compose::Host,
@@ -341,6 +347,17 @@ pub(crate) struct Supervisor {
 }
 
 impl Supervisor {
+    fn has_selected_test(&self) -> bool {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            self.selected_test.is_some()
+        }
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn open(
         root: &Path,
         mut profile: TestVms,
@@ -388,6 +405,10 @@ impl Supervisor {
             custody.verify()?;
             crate::store::vm::compose::enroll(state.controller.compose_store(), &enrollments)?;
         }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if profile.enabled {
+            state.install_test();
+        }
         state.custody = Some(custody);
         let gate = state
             .gate
@@ -396,7 +417,7 @@ impl Supervisor {
         gate.allow_agent_public_sites = profile.allow_agent_public_sites;
         gate.publish_profile = profile.publication.map(Arc::from);
         state.recipes[1] = Some((WEB_RECIPE_ID, None));
-        state.recipes[2] = Some((Controller::windows_recipe_id(), None));
+        state.recipes[2].get_or_insert((Controller::windows_recipe_id(), None));
         Ok(supervisor)
     }
 
@@ -433,6 +454,12 @@ impl Supervisor {
             }),
             #[cfg(all(windows, target_arch = "x86_64"))]
             native_runs: Default::default(),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            selected_test: None,
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            test_staging: Default::default(),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            test_generations: Default::default(),
             #[cfg(all(windows, target_arch = "x86_64"))]
             native_scripts: Default::default(),
             fenced: AtomicBool::new(false),
@@ -585,6 +612,11 @@ impl Supervisor {
         #[cfg(test)]
         if let Some(reaper) = fixture {
             self.controller.sweep_with(&reaper, &*reaper.custody)?;
+            return Ok(());
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(cleanup) = self.test_cleanup() {
+            self.controller.sweep_with(&cleanup, &cleanup.custody)?;
             return Ok(());
         }
         self.controller.sweep_once(&self.candidate())?;
@@ -815,15 +847,25 @@ impl Supervisor {
             return json!({"available":true});
         }
         let _ = gate;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(selected) = &self.selected_test {
+            return selected.catalog().unwrap_or_else(
+                |reason| json!({"available":false,"reason":native_reason(reason)}),
+            );
+        }
         json!({"available":false,"reason":native_reason(self.native_refusal)})
     }
 }
 
 impl Drop for Supervisor {
     /// Production store users reach the store only through this supervisor,
-    /// so the pinned root outlives them all. Native workers that clone the
-    /// controller would break that; activation must keep this assertion.
+    /// so the pinned root outlives them all.
     fn drop(&mut self) {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            self.native_scripts.take();
+            self.selected_test.take();
+        }
         debug_assert!(
             self.custody.is_none()
                 || std::thread::panicking()
@@ -1536,7 +1578,7 @@ impl VmInventory {
     }
 
     /// File an exact, closed reason under the authenticated principal.
-    fn refuse(&self, action: i64, vm: Option<Id>, reason: Fault) -> Outcome<Value> {
+    fn refuse<T>(&self, action: i64, vm: Option<Id>, reason: Fault) -> Outcome<T> {
         if let Some(code) = refusal_from_wire(reason.0) {
             self.supervisor
                 .controller
@@ -1609,7 +1651,10 @@ impl VmInventory {
             Work::Start => Some(ForegroundSubject::Start(request.id)),
             Work::Stop => Some(ForegroundSubject::Stop(request.id)),
             Work::Script(..) => Some(ForegroundSubject::Script(request.id)),
-            Work::Extend(_) => Some(ForegroundSubject::Extend(request.id)),
+            Work::Extend(_) => Some(ForegroundSubject::Extend {
+                vm: request.id,
+                selected_test_installed: self.supervisor.has_selected_test(),
+            }),
             Work::Publish | Work::Unpublish => return self.publication(gate, action, request),
             Work::Snapshot(snapshot) => {
                 let result = controller.foreground_snapshot_precheck(
@@ -1643,6 +1688,10 @@ impl VmInventory {
                     return fixture.snapshot(self, action, request, route);
                 }
                 let _route = route;
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                if !is_static && let Some(selected) = &self.supervisor.selected_test {
+                    return selected.dispatch(self, gate, action, request);
+                }
                 return self.refuse(
                     action,
                     request.vm(),
@@ -1669,6 +1718,10 @@ impl VmInventory {
         #[cfg(test)]
         if let Some(fixture) = &mut gate.fixture {
             return fixture.admit(self, action, request, digest);
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(selected) = &self.supervisor.selected_test {
+            return selected.dispatch(self, gate, action, request);
         }
         let _ = gate;
         self.refuse(
@@ -13250,6 +13303,73 @@ pub(crate) mod tests {
         assert_eq!(terminal(&a, &revoke).await["state"], "succeeded");
         drop(a);
         h.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn static_vm_extend_without_selected_test_is_not_found() {
+        let temp = crate::service::application::tests::private_temp();
+        let supervisor = Supervisor::new(
+            temp.path(),
+            VmPolicy::default(),
+            ForegroundClock {
+                utc: Some(Arc::new(AtomicI64::new(UTC))),
+            },
+            None,
+            NativeRefusal::Disabled,
+            None,
+        )
+        .unwrap();
+        assert!(supervisor.lock().unwrap().fixture.is_none());
+        assert!(!supervisor.has_selected_test());
+
+        let vm: Id = [2; 16];
+        let generation: Id = [3; 16];
+        let store = supervisor.controller.store_for_test();
+        store
+            .transact(|db| {
+                db.execute(
+                    "INSERT INTO vm_static_instances(id,name,principal,host,template,
+                        source_generation,recipe_digest,disk_digest,vars_digest,state,
+                        persistent,staging,origin_generation)
+                     VALUES(?1,'web-site','alice',?2,zeroblob(16),?3,
+                        zeroblob(32),zeroblob(32),zeroblob(32),1,4096,0,?3)",
+                    rusqlite::params![vm, supervisor.host_id, generation],
+                )?;
+                db.execute(
+                    "INSERT INTO vm_generations(id,static_id,generation,active) VALUES(?1,?2,1,1)",
+                    rusqlite::params![generation, vm],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let connection = supervisor.connection("alice".into());
+        let refused = connection.inventory().dispatch(
+            request(
+                "vm_extend",
+                json!({"vm_id":hex::encode(vm),"ttl_s":600,"request_id":key(1)}),
+            ),
+            || false,
+        );
+        assert_eq!(refused.unwrap_err().0, "not_found");
+        store
+            .read_only(|db| {
+                assert_eq!(
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM activity WHERE principal='alice' AND vm=?1
+                            AND action=?2 AND status=4 AND reason=?3",
+                        rusqlite::params![vm, Action::Extend as i64, Refusal::NotFound as i64],
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    crate::store::vm::count(db, "SELECT count(*) FROM vm_operations", [])?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[tokio::test]

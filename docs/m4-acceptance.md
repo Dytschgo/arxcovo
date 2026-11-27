@@ -12,7 +12,7 @@ daemon configuration and client configuration private. The
 [local bridge setup](windows-execution-accounts.md) describes the server identity
 pin. The client derives the media inventory from the foreground's configured
 custody root. Before startup, it verifies an empty store or an idle ledger
-at the VM store schema version compiled into the client (currently v16). The
+at the VM store schema version compiled into the client (currently v17). The
 reader refuses older, newer, or unknown versions without mutating the database.
 The only media allowed are the selected sealed TEST goldens, and the generation
 directory set on disk must match those selected goldens exactly. Empty, extra,
@@ -49,6 +49,12 @@ stop the foreground cleanly, archive or remove the historic state directory
 outside the enrolled root, enroll a fresh private store directory on D:,
 verify startup preflight against the enrolled store pins, and rebuild both
 qualified TEST goldens under native custody.
+
+After activation lands, qualify the exact reviewed release on the owner host.
+The runtime must explicitly select that native TEST dossier as described in
+[ADR 0054](adr/0054-m4-dedicated-windows-runtime.md#native-test-activation).
+Native launch, snapshot and teardown are **unverified on real hardware** until
+the owner journey below passes.
 
 Prepare an owner-private JSON plan on D:. The qualification digest is an expected
 pin. The client records a digest only after an authenticated daemon receipt
