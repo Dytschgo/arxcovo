@@ -247,7 +247,7 @@ pub(crate) struct Roles {
 }
 
 impl Roles {
-    fn qualify(self) -> Result<(), Failure> {
+    pub(super) fn qualify(self) -> Result<(), Failure> {
         let ids = [self.owner, self.daemon, self.agent, self.build];
         for (index, uid) in ids.iter().enumerate() {
             if *uid == 0 || *uid == u32::MAX || ids[..index].contains(uid) {
@@ -264,6 +264,12 @@ impl Roles {
         }
         Ok(())
     }
+}
+
+/// Current primary and supplementary groups of a local account, for owner
+/// publication's effective search-permission check.
+pub(super) fn account_groups(uid: u32) -> Option<Vec<u32>> {
+    groups(uid).ok()
 }
 
 fn groups(uid: u32) -> Result<Vec<libc::gid_t>, Failure> {
@@ -353,6 +359,12 @@ fn no_acl(path: &Path) -> Result<(), BindError> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Object(u64, u64);
+
+/// Read-only ADR 0046 owner-route qualification (owners, modes and POSIX
+/// ACLs of every socket ancestor) for owner publication before any bind.
+pub(super) fn route_qualified(path: &Path, owner: u32, daemon: u32, group: u32) -> bool {
+    route(path, owner, daemon, Some(group)).is_ok()
+}
 
 fn route(
     path: &Path,

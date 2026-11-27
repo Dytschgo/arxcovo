@@ -31,6 +31,8 @@ const CLOSE: Duration = Duration::from_secs(10);
 
 use super::config::ServiceLaunch;
 
+pub(super) mod install;
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
@@ -206,14 +208,48 @@ impl Settings {
         ordinary: &[&Path],
         expected: Option<ConfigStamp>,
     ) -> anyhow::Result<(Self, ConfigStamp)> {
+        Self::vetted_layout(path, None, uid, ordinary, expected)
+            .map(|(settings, stamp, _)| (settings, stamp))
+    }
+
+    /// `vetted`, also returning the pinned component handles so a caller can
+    /// bind the observed file and directory identities to its own descriptors.
+    /// With `staged`, the configuration is an unnamed (`O_TMPFILE`) file that
+    /// will be linked at `path`. It is adopted at that position instead of
+    /// being opened by name, must have no link yet, and is read from its
+    /// current offset. Every other check is the same.
+    fn vetted_layout(
+        path: &Path,
+        staged: Option<File>,
+        uid: u32,
+        ordinary: &[&Path],
+        expected: Option<ConfigStamp>,
+    ) -> anyhow::Result<(Self, ConfigStamp, LayoutPass)> {
         let mut pass = LayoutPass::new()?;
-        if !pass.open(path, true)? {
-            return Err(refusal());
-        }
+        let links = match staged {
+            None => {
+                if !pass.open(path, true)? {
+                    return Err(refusal());
+                }
+                1
+            }
+            Some(file) => {
+                let parent = path.parent().ok_or_else(refusal)?;
+                if !pass.open(parent, false)?
+                    || !pass.0[parent].1.is_dir()
+                    || pass.0.contains_key(path)
+                {
+                    return Err(refusal());
+                }
+                let metadata = file.metadata().map_err(|_| refusal())?;
+                pass.0.insert(path.to_path_buf(), (file, metadata));
+                0
+            }
+        };
         let (file, metadata) = &pass.0[path];
         if uid == 0
             || !metadata.is_file()
-            || metadata.nlink() != 1
+            || metadata.nlink() != links
             || metadata.uid() != uid
             || metadata.mode() & 0o077 != 0
         {
@@ -309,7 +345,21 @@ impl Settings {
         for root in ordinary {
             pass.ordinary_disjoint(root, &paths)?;
         }
-        Ok((settings, stamp))
+        Ok((settings, stamp, pass))
+    }
+
+    /// Static installation role and launch intent pairing (ADR 0047), shared
+    /// by the worker and by owner `service configure`.
+    fn compatible(&self, intent: Intent) -> bool {
+        let founder = matches!(intent, Intent::CreateFounder | Intent::RecoverFounder);
+        self.founder_cluster.is_some() == founder
+            && self.founder_cluster != Some([0; 16])
+            && match intent {
+                Intent::Join => self.issuer_peer.is_some(),
+                Intent::CreateFounder | Intent::RecoverFounder => self.issuer_peer.is_none(),
+                // The immutable join installation keeps its route. Recovery never uses it.
+                Intent::RecoverJoiner => true,
+            }
     }
 
     fn checked(
@@ -337,9 +387,12 @@ impl Settings {
             .filter(|(address, _)| *address == peer.ip())
             .map(|(_, route)| route)
             .collect::<Vec<_>>();
-        let issuer = match (intent, settings.issuer_peer) {
+        if !settings.compatible(intent) {
+            return Err(refusal());
+        }
+        let issuer = match (intent, settings.issuer_peer.as_deref()) {
             (Intent::Join, Some(issuer)) => {
-                let address = activation::peer_endpoint(&issuer).ok_or_else(refusal)?;
+                let address = activation::peer_endpoint(issuer).ok_or_else(refusal)?;
                 if address == peer
                     || address == enrollment
                     || !routes.iter().any(|route| covers(*route, address.ip()))
@@ -348,18 +401,9 @@ impl Settings {
                 }
                 Some(address)
             }
-            (Intent::Join, None) | (Intent::CreateFounder | Intent::RecoverFounder, Some(_)) => {
-                return Err(refusal());
-            }
-            // The immutable join installation keeps its route. Recovery never uses it.
+            // `compatible` refused every other Join or founder pairing.
             _ => None,
         };
-        if settings.founder_cluster.is_some()
-            != matches!(intent, Intent::CreateFounder | Intent::RecoverFounder)
-            || settings.founder_cluster == Some([0; 16])
-        {
-            return Err(refusal());
-        }
         if let Some(build) = &settings.delegated_build
             && (!build.valid(peer, enrollment)
                 || build.agent_group == settings.owner_gid
@@ -1547,6 +1591,13 @@ pub(super) async fn broker_refusal_close_control(
     .unwrap();
 }
 
+/// A vetted installation fits a launch only with the same daemon group and a
+/// compatible role and intent; `Settings::checked` repeats both in the worker.
+fn launch_matches(settings: &Settings, launch: &ServiceLaunch) -> bool {
+    settings.daemon_gid == launch.daemon_gid
+        && Intent::parse(&launch.intent).is_some_and(|intent| settings.compatible(intent))
+}
+
 #[derive(Clone, Copy)]
 enum WorkerIdentity {
     Dedicated(u32, u32),
@@ -1596,6 +1647,37 @@ impl Child {
         service: &super::config::ServiceConfig,
     ) -> Result<Self, super::ExitCode> {
         use super::ExitCode;
+        let stamp = Self::qualify(launch, layout, service)?;
+        let mut command =
+            std::process::Command::new(std::env::current_exe().map_err(|_| ExitCode::Layout)?);
+        command
+            .arg("cluster-service-worker")
+            .arg(&launch.config)
+            .arg("--cluster-intent")
+            .arg(&launch.intent);
+        Self::spawn_worker(
+            command,
+            WorkerIdentity::Dedicated(launch.daemon_uid, launch.daemon_gid),
+            Some(stamp),
+        )
+    }
+
+    /// Owner `service configure` runs the exact start-time checks before it
+    /// writes a `cluster` launch setting.
+    pub(super) fn preflight(
+        launch: &ServiceLaunch,
+        layout: &super::layout::Layout,
+        service: &super::config::ServiceConfig,
+    ) -> Result<(), super::ExitCode> {
+        Self::qualify(launch, layout, service).map(|_| ())
+    }
+
+    fn qualify(
+        launch: &ServiceLaunch,
+        layout: &super::layout::Layout,
+        service: &super::config::ServiceConfig,
+    ) -> Result<ConfigStamp, super::ExitCode> {
+        use super::ExitCode;
         use super::config::{AccountKind, Resolver};
         if !launch.config.is_absolute()
             || Intent::parse(&launch.intent).is_none()
@@ -1610,7 +1692,7 @@ impl Child {
             return Err(ExitCode::Permissions);
         }
         let account = super::native::NativeResolver
-            .account("arxd-cluster")
+            .account(super::cluster_install::DAEMON_ACCOUNT)
             .map_err(|_| ExitCode::Config)?;
         let uid = launch.daemon_uid.to_string();
         if account.kind != AccountKind::User
@@ -1630,25 +1712,21 @@ impl Child {
         ordinary.push(layout.binary().parent().ok_or(ExitCode::Layout)?);
         ordinary.push(layout.endpoint().parent().ok_or(ExitCode::Layout)?);
         ordinary.push(Path::new(service.workspace()));
-        let (settings, stamp) =
-            Settings::vetted(&launch.config, launch.daemon_uid, &ordinary, None)
+        let (settings, stamp, pass) =
+            Settings::vetted_layout(&launch.config, None, launch.daemon_uid, &ordinary, None)
                 .map_err(|_| ExitCode::Config)?;
-        if settings.daemon_gid != launch.daemon_gid {
+        // The root parent opens what the worker may not: require the worker's
+        // own search access (primary GID only, no extended ACLs).
+        if !launch_matches(&settings, launch)
+            || !install::Access::worker(launch.daemon_uid, launch.daemon_gid).permits(
+                &pass,
+                &settings,
+                &launch.config,
+            )
+        {
             return Err(ExitCode::Config);
         }
-
-        let mut command =
-            std::process::Command::new(std::env::current_exe().map_err(|_| ExitCode::Layout)?);
-        command
-            .arg("cluster-service-worker")
-            .arg(&launch.config)
-            .arg("--cluster-intent")
-            .arg(&launch.intent);
-        Self::spawn_worker(
-            command,
-            WorkerIdentity::Dedicated(launch.daemon_uid, launch.daemon_gid),
-            Some(stamp),
-        )
+        Ok(stamp)
     }
 
     fn spawn_worker(

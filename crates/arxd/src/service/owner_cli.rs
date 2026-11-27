@@ -2,7 +2,8 @@
 #[cfg(any(unix, test))]
 use super::owner_plan::Plan;
 use super::{
-    config::{ConfigureRequest, Resolver, Rights, ServiceConfig},
+    cluster_install::{self, InstallError, Role},
+    config::{ClusterRequest, ConfigureRequest, Resolver, Rights, ServiceConfig},
     layout::{Error, Layout},
     owner_plan::{self, OwnerContext},
     owner_transactions::{Failure, RightReport},
@@ -18,6 +19,8 @@ pub(super) struct ConfigureArgs {
     workspace: String,
     environment: Vec<(String, String)>,
     agents: Vec<(String, String)>,
+    /// Linux `cluster` launch setting: installation file and intent.
+    cluster: Option<(String, String)>,
 }
 impl ConfigureArgs {
     fn request(&self) -> ConfigureRequest<'_> {
@@ -28,6 +31,10 @@ impl ConfigureArgs {
             workspace: &self.workspace,
             environment: &self.environment,
             agents: &self.agents,
+            cluster: self
+                .cluster
+                .as_ref()
+                .map(|(config, intent)| ClusterRequest { config, intent }),
         }
     }
 }
@@ -43,6 +50,7 @@ enum Command {
     Status,
     Uninstall,
     Client(ClientArgs),
+    ClusterConfig(cluster_install::Request),
 }
 struct Usage;
 fn parse(args: &[OsString]) -> Result<Command, Usage> {
@@ -64,6 +72,9 @@ fn parse(args: &[OsString]) -> Result<Command, Usage> {
         ["service", "uninstall"] => return Ok(Command::Uninstall),
         _ => {}
     }
+    if a.starts_with(&["service", "cluster-config"]) {
+        return parse_cluster_config(&a[2..]).map(Command::ClusterConfig);
+    }
     let client = a.starts_with(&["client-config", "new"]);
     if !client && !a.starts_with(&["service", "configure"]) {
         return Err(Usage);
@@ -73,6 +84,7 @@ fn parse(args: &[OsString]) -> Result<Command, Usage> {
     }
     let (mut build, mut account, mut rights, mut workspace, mut principal, mut out) =
         (None, None, None, None, None, None);
+    let (mut cluster_config, mut cluster_intent) = (None, None);
     let (mut environment, mut agents) = (Vec::new(), Vec::new());
     for pair in a[2..].chunks_exact(2) {
         let (flag, value) = (pair[0], pair[1]);
@@ -86,6 +98,8 @@ fn parse(args: &[OsString]) -> Result<Command, Usage> {
             (false, "--client-account") => &mut account,
             (false, "--rights") => &mut rights,
             (false, "--workspace") => &mut workspace,
+            (false, "--cluster-config") => &mut cluster_config,
+            (false, "--cluster-intent") => &mut cluster_intent,
             (false, "--env" | "--agent") => {
                 let (key, val) = value.split_once('=').ok_or(Usage)?;
                 if key.is_empty() || (flag == "--agent" && val.is_empty()) {
@@ -125,13 +139,96 @@ fn parse(args: &[OsString]) -> Result<Command, Usage> {
         workspace: workspace.ok_or(Usage)?,
         environment,
         agents,
+        cluster: match (cluster_config, cluster_intent) {
+            (Some(config), Some(intent)) => Some((config, intent)),
+            (None, None) => None,
+            _ => return Err(Usage),
+        },
     }))
+}
+
+/// `service cluster-config`: every flag appears exactly once, except the
+/// joiner-only `--issuer-peer`. Values are checked by `cluster_install::check`.
+fn parse_cluster_config(a: &[&str]) -> Result<cluster_install::Request, Usage> {
+    const FLAGS: [&str; 16] = [
+        "--out",
+        "--role",
+        "--workspace",
+        "--state",
+        "--credentials",
+        "--wrap",
+        "--custody",
+        "--history",
+        "--owner-socket",
+        "--peer",
+        "--enrollment",
+        "--issuer-peer",
+        "--operator-account",
+        "--control-group",
+        "--agent-account",
+        "--build-account",
+    ];
+    if !a.len().is_multiple_of(2) {
+        return Err(Usage);
+    }
+    let mut values: [Option<String>; 16] = Default::default();
+    for pair in a.chunks_exact(2) {
+        let (flag, value) = (pair[0], pair[1]);
+        let index = FLAGS.iter().position(|f| *f == flag).ok_or(Usage)?;
+        if value.is_empty() || value.starts_with("--") {
+            return Err(Usage);
+        }
+        if values[index].replace(value.to_owned()).is_some() {
+            return Err(Usage);
+        }
+    }
+    let [
+        out,
+        role,
+        workspace,
+        state,
+        credentials,
+        wrap,
+        custody,
+        history,
+        owner_socket,
+        peer,
+        enrollment,
+        issuer_peer,
+        operator_account,
+        control_group,
+        agent_account,
+        build_account,
+    ] = values;
+    Ok(cluster_install::Request {
+        out: out.ok_or(Usage)?,
+        role: match role.as_deref() {
+            Some("founder") => Role::Founder,
+            Some("joiner") => Role::Joiner,
+            _ => return Err(Usage),
+        },
+        workspace: workspace.ok_or(Usage)?,
+        state: state.ok_or(Usage)?,
+        credentials: credentials.ok_or(Usage)?,
+        wrap: wrap.ok_or(Usage)?,
+        custody: custody.ok_or(Usage)?,
+        history: history.ok_or(Usage)?,
+        owner_socket: owner_socket.ok_or(Usage)?,
+        peer: peer.ok_or(Usage)?,
+        enrollment: enrollment.ok_or(Usage)?,
+        issuer_peer,
+        operator_account: operator_account.ok_or(Usage)?,
+        control_group: control_group.ok_or(Usage)?,
+        agent_account: agent_account.ok_or(Usage)?,
+        build_account: build_account.ok_or(Usage)?,
+    })
 }
 
 pub(super) enum CliError {
     Service(Error),
     Owner(Failure),
     Client(ClientError),
+    Cluster(InstallError),
 }
 impl From<Error> for CliError {
     fn from(e: Error) -> Self {
@@ -189,6 +286,7 @@ fn error(e: CliError) -> (&'static str, i32) {
             ClientError::Io => ("client-config-io", 1),
             ClientError::Partial => ("client-config-partial", 1),
         },
+        CliError::Cluster(e) => (e.token(), e.exit_code()),
     }
 }
 pub(super) trait OwnerOps {
@@ -199,6 +297,8 @@ pub(super) trait OwnerOps {
     fn status(&mut self) -> Result<&'static str, CliError>;
     fn uninstall(&mut self) -> Result<Option<RightReport>, CliError>;
     fn client(&mut self, args: &ClientArgs) -> Result<String, CliError>;
+    /// Writes the private installation file; returns the `arxd-cluster` UID.
+    fn cluster_config(&mut self, args: &cluster_install::Request) -> Result<u32, CliError>;
 }
 // Shared by real dispatch and fake dispatch; tokens belong to library Display.
 fn right_output(report: RightReport) -> String {
@@ -226,6 +326,13 @@ fn dispatch(
         Command::Client(a) => ops.client(&a).map(|hash| {
             let _ = writeln!(out, "{}={hash}", a.principal);
         }),
+        // Pure argument checks run on every platform before native authority.
+        Command::ClusterConfig(a) => cluster_install::check(&a)
+            .map_err(CliError::Cluster)
+            .and_then(|()| ops.cluster_config(&a))
+            .map(|uid| {
+                let _ = writeln!(out, "daemon-uid={uid}");
+            }),
     };
     match result {
         Ok(()) => 0,
@@ -311,9 +418,12 @@ fn unix_configure(
     l: &Layout,
     ctx: &OwnerContext<'_>,
     args: &ConfigureArgs,
+    cluster: impl FnOnce(&ServiceConfig) -> Result<(), Error>,
     execute: impl FnOnce(&Plan) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let new = ServiceConfig::from_request(&args.request(), l, res)?;
+    // Linux vets a requested cluster file and layout before any mutation.
+    cluster(&new)?;
     let prev = read_previous()?;
     let old = prev
         .as_ref()
@@ -386,6 +496,9 @@ impl OwnerOps for NativeOps {
     fn client(&mut self, a: &ClientArgs) -> Result<String, CliError> {
         crate::client_config::create(&a.principal, &a.out).map_err(CliError::Client)
     }
+    fn cluster_config(&mut self, _: &cluster_install::Request) -> Result<u32, CliError> {
+        Err(CliError::Cluster(InstallError::Unsupported))
+    }
 }
 #[cfg(all(not(test), unix))]
 fn unix_context<T>(
@@ -422,6 +535,7 @@ impl OwnerOps for NativeOps {
                 l,
                 c,
                 a,
+                |new| linux_cluster_preflight(l, new),
                 super::owner_unix::execute,
             )?)
         })
@@ -463,6 +577,28 @@ impl OwnerOps for NativeOps {
     fn client(&mut self, a: &ClientArgs) -> Result<String, CliError> {
         crate::client_config::create(&a.principal, &a.out).map_err(CliError::Client)
     }
+    fn cluster_config(&mut self, a: &cluster_install::Request) -> Result<u32, CliError> {
+        #[cfg(target_os = "linux")]
+        {
+            let layout = Layout::system()?;
+            super::cluster_runtime::install::publish(a, &layout).map_err(CliError::Cluster)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = a;
+            Err(CliError::Cluster(InstallError::Unsupported))
+        }
+    }
+}
+/// Linux vets the cluster file and layout as `Child::spawn` would at start.
+#[cfg(all(not(test), unix))]
+fn linux_cluster_preflight(l: &Layout, new: &ServiceConfig) -> Result<(), Error> {
+    #[cfg(target_os = "linux")]
+    if let Some(launch) = new.cluster() {
+        return super::cluster_runtime::Child::preflight(launch, l, new).map_err(|_| Error::Config);
+    }
+    let _ = (l, new);
+    Ok(())
 }
 
 #[cfg(test)]
