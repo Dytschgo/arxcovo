@@ -347,6 +347,17 @@ pub(crate) struct Supervisor {
 }
 
 impl Supervisor {
+    fn has_selected_test(&self) -> bool {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            self.selected_test.is_some()
+        }
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn open(
         root: &Path,
         mut profile: TestVms,
@@ -1640,16 +1651,10 @@ impl VmInventory {
             Work::Start => Some(ForegroundSubject::Start(request.id)),
             Work::Stop => Some(ForegroundSubject::Stop(request.id)),
             Work::Script(..) => Some(ForegroundSubject::Script(request.id)),
-            Work::Extend(_) => {
-                #[cfg(all(windows, target_arch = "x86_64"))]
-                let selected_test_installed = self.supervisor.selected_test.is_some();
-                #[cfg(not(all(windows, target_arch = "x86_64")))]
-                let selected_test_installed = false;
-                Some(ForegroundSubject::Extend {
-                    vm: request.id,
-                    selected_test_installed,
-                })
-            }
+            Work::Extend(_) => Some(ForegroundSubject::Extend {
+                vm: request.id,
+                selected_test_installed: self.supervisor.has_selected_test(),
+            }),
             Work::Publish | Work::Unpublish => return self.publication(gate, action, request),
             Work::Snapshot(snapshot) => {
                 let result = controller.foreground_snapshot_precheck(
@@ -13315,8 +13320,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(supervisor.lock().unwrap().fixture.is_none());
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        assert!(supervisor.selected_test.is_none());
+        assert!(!supervisor.has_selected_test());
 
         let vm: Id = [2; 16];
         let generation: Id = [3; 16];
