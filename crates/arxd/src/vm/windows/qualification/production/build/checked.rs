@@ -46,10 +46,14 @@ impl<'a> HealthSession for CheckedHealth<'_, 'a> {
     ) -> Result<(ScriptStatus, Option<u32>), Q> {
         let (script, timeout_s) = probe.into_parts();
         let fresh = self.fresh;
-        self.launch
-            .run_script(script, timeout_s, self.cancel, move || fresh(by), || true)
-            .await
-            .map_err(|failed| failed.reason)
+        let result = self
+            .launch
+            .exchange_script(script, timeout_s, by, self.cancel, move || fresh(by))
+            .await;
+        if result.is_err() {
+            let _ = self.launch.stop_generation(self.cancel, || true).await;
+        }
+        result
     }
 
     async fn stop(self) -> Option<ReleasedGeneration<'a>> {

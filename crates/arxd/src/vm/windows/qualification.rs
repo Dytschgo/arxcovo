@@ -27,9 +27,9 @@ pub(crate) use production::consume_checked;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]
 pub(crate) use production::{
     BuildSeal, FinalizedPair, GenerationGuards, HeldStartRefusal, HelperSettlement, HelperTarget,
-    InstallerSettlement, LaunchFailure, LaunchPermit, LaunchPermitBinding, LaunchRequest,
-    LaunchTarget, NativeLaunch, NativeRecovery, ProductionWorkspace, ReleasedGeneration,
-    StartCreation, StartPair, StartRefusal, WorkspaceBinding,
+    InstallerSettlement, LaunchPermit, LaunchPermitBinding, LaunchRequest, LaunchTarget,
+    NativeLaunch, NativeRecovery, ProductionWorkspace, ReleasedGeneration, StartCreation,
+    StartPair, StartRefusal, WorkspaceBinding,
 };
 mod recipe;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]

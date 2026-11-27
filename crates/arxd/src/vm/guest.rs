@@ -22,6 +22,10 @@ pub const GUEST_READY_BUDGET: Duration = Duration::from_secs(180);
 /// arrive within this bound, inside any outer deadline.
 pub const FRAME_BOUND: Duration = Duration::from_secs(10);
 
+/// A script exchange may outlast the guest's own timeout by this much, so the
+/// guest's typed timeout result can still arrive inside the host bound.
+pub const SCRIPT_EXCHANGE_SLACK: Duration = Duration::from_secs(5);
+
 /// Challenges a boot may issue. Issuing one more refuses.
 pub const MAX_CHALLENGES: usize = 32;
 
@@ -155,7 +159,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> GuestChannel<T> {
         };
         request.validate().map_err(|_| ChannelError::Invalid)?;
         let (transport, response) = self
-            .request(cancel, request, u64::from(timeout_s) + 5)
+            .request(
+                cancel,
+                request,
+                u64::from(timeout_s) + SCRIPT_EXCHANGE_SLACK.as_secs(),
+            )
             .await?;
         let Response::ScriptResult {
             id: echo,

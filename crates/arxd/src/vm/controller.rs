@@ -26,6 +26,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) enum OwnedStop {
+    Replay,
+    Pending(store::native::release::StopReceipt),
+    Recovery,
+}
+
 /// Only a fresh admission yields a worker handle. A status lookup has no
 /// dispatch authority. Deadlines are process-local and never persisted.
 /// Every field is private to the controller: no other code can mint a
@@ -2799,6 +2806,122 @@ impl<C: Clock> VmController<C> {
         })
     }
 
+    /// Admit one guest script for the exact running epoch of a current TEST
+    /// run owner. The run check and the durable receipt share one
+    /// transaction; a receipt for any other run rolls back as busy. The
+    /// worker deadline covers the guest's own timeout plus the channel's
+    /// exchange slack, so a typed guest timeout still settles as a result.
+    pub(crate) fn admit_native_script(
+        &self,
+        _installation: &super::test_issuer::Installation,
+        request: &Request<'_>,
+        target: store::native::release::Target,
+        host: HostObservation,
+        resources: Resources,
+    ) -> Result<Admission> {
+        let Operation::Script {
+            timeout_seconds, ..
+        } = request.operation
+        else {
+            anyhow::bail!("invalid TEST script");
+        };
+        ensure!(request.vm == target.vm, "invalid TEST script");
+        validate_principal(request.principal)?;
+        let gate = self
+            .gate
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("VM gate unavailable"))?;
+        let stale = std::cell::Cell::new(false);
+        let result = self.store.try_native_transaction(|db| {
+            let clock = self.clock.now();
+            let mut decision = self.admit_inner(db, request, host, resources, clock, &gate)?;
+            if let Admission::Admitted(worker) = &mut decision {
+                if !Self::native_run_matches(db, request.principal, target, true, utc(clock)?)? {
+                    stale.set(true);
+                    anyhow::bail!("TEST script has no current run");
+                }
+                worker.deadline = clock.monotonic
+                    + Duration::from_secs(timeout_seconds)
+                    + super::guest::SCRIPT_EXCHANGE_SLACK;
+            }
+            Ok(decision)
+        });
+        if stale.get() {
+            return Ok(Admission::Refused(Refusal::Busy));
+        }
+        result
+    }
+
+    /// One nonblocking settlement of the exact script receipt. The live
+    /// owner withdraws before any transaction can move its VM into recovery.
+    pub(crate) fn settle_native_script(
+        &self,
+        worker: &PendingOperation,
+        target: store::native::release::Target,
+        mut completion: Completion,
+        mut script: Option<ScriptResult>,
+        mut cause: Option<FailureReason>,
+        withdraw: impl FnOnce(),
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        let admitted = worker
+            .admitted()
+            .ok_or_else(|| anyhow::anyhow!("invalid script worker"))?;
+        ensure!(
+            admitted.action == Action::Script as i64,
+            "invalid script worker"
+        );
+        self.store.try_native_transaction(|db| {
+            if store::count(
+                db,
+                "SELECT count(*) FROM vm_operations
+                 WHERE activity_id=?1 AND operation_id=?2 AND vm=?3 AND status=0",
+                params![worker.activity_id, admitted.operation, target.vm],
+            )? == 0
+            {
+                // Stop, recovery or a previous attempt already settled it.
+                return Ok(());
+            }
+            let clock = self.clock.now();
+            let now = utc(clock)?;
+            if clock.monotonic >= worker.deadline
+                || (script.is_some()
+                    && !Self::native_run_matches(db, &admitted.principal, target, true, now)?)
+            {
+                completion = Completion::CleanupUnconfirmed;
+                if script.take().is_some() {
+                    cause = Some(FailureReason::ExecutionUnknown);
+                }
+            }
+            if completion == Completion::CleanupUnconfirmed {
+                withdraw();
+                if store::count(
+                    db,
+                    "SELECT count(*) FROM vm_generations g JOIN vm_instances v ON v.id=g.vm_id
+                     JOIN vm_snapshot_release r ON r.generation=g.id AND r.disposition IS NULL
+                     WHERE g.vm_id=?1 AND g.id=?2 AND r.epoch=?3 AND g.active=1
+                       AND g.static_id IS NULL AND v.state IN (1,2)",
+                    params![target.vm, target.generation, target.epoch],
+                )? == 0
+                {
+                    // This receipt is still ours, but the old run cannot
+                    // change the state of a replacement or released writer.
+                    return store::finish_with_script(
+                        db,
+                        worker.activity_id,
+                        Status::Interrupted,
+                        now,
+                        Some(false),
+                        None,
+                        cause,
+                    );
+                }
+            }
+            store::settle_with_script(db, worker.activity_id, now, completion, script, cause)?;
+            Ok(())
+        })
+    }
+
     pub(crate) fn native_workspace_scope(&self, generation: Id) -> Result<store::native::Scope> {
         let db = self.store.try_live_connection()?;
         Self::bound_native_workspace(&db, generation)
@@ -2846,6 +2969,8 @@ impl<C: Clock> VmController<C> {
              JOIN vm_operations o ON o.operation_id=r.epoch AND o.vm=v.id AND o.action=3
              WHERE v.id=?1 AND g.id=?2 AND r.epoch=?3 AND v.principal=?4 AND o.principal=?4
                AND v.expires_ms>?5 AND v.state=?6 AND o.status=?7
+               AND (?6<>2 OR EXISTS(SELECT 1 FROM vm_native_writer w
+                   WHERE w.generation=g.id AND w.epoch=r.epoch AND w.boot IS NOT NULL))
                AND NOT EXISTS(SELECT 1 FROM vm_operations s WHERE s.vm=v.id AND s.action=4 AND s.status=0)",
             params![target.vm, target.generation, target.epoch, principal, now,
                 if running { 2 } else { 1 }, if running { 1 } else { 0 }],
@@ -2892,13 +3017,19 @@ impl<C: Clock> VmController<C> {
     }
 
     /// Only an extant run owner can supply the exact target. The stop receipt
-    /// and interruption of an in-progress start are atomic.
+    /// and interruption of an in-progress start are atomic. The ledger admits
+    /// one pending operation per VM. A pending script normally settles
+    /// as failed with `script` in the same transaction, while the owner
+    /// cancels its exchange. A script write fault records an interrupted
+    /// stop and fences the exact run into recovery with its script intact.
     pub(crate) fn admit_owned_native_stop(
         &self,
         principal: &str,
         key: RequestId,
         target: store::native::release::Target,
-    ) -> Result<Result<(Id, Option<store::native::release::StopReceipt>), Refusal>> {
+        script: FailureReason,
+        stop_requested: bool,
+    ) -> Result<Result<(Id, OwnedStop), Refusal>> {
         validate_principal(principal)?;
         self.store.try_native_transaction(|db| {
             let clock = self.clock.now();
@@ -2910,13 +3041,14 @@ impl<C: Clock> VmController<C> {
                 action: Action::Stop as i64,
             };
             match binding.replay(db, now, false)? {
-                Ok(Some(replay)) => return Ok(Ok((replay.operation.id, None))),
+                Ok(Some(replay)) => return Ok(Ok((replay.operation.id, OwnedStop::Replay))),
                 Err(reason) => return Ok(Err(reason)),
+                Ok(None) if stop_requested => return Ok(Err(Refusal::Busy)),
                 Ok(None) => {}
             }
             let start = db
                 .query_row(
-                    "SELECT o.activity_id,o.status FROM vm_instances v
+                    "SELECT o.activity_id,o.status,v.state FROM vm_instances v
                  JOIN vm_generations g ON g.vm_id=v.id AND g.active=1 AND g.static_id IS NULL
                  JOIN vm_native_generations n ON n.generation=g.id AND n.state='bound'
                  JOIN vm_snapshot_release r ON r.generation=g.id AND r.disposition IS NULL
@@ -2925,20 +3057,58 @@ impl<C: Clock> VmController<C> {
                    AND v.state IN (1,2,3) AND NOT EXISTS(SELECT 1 FROM vm_operations s
                        WHERE s.vm=v.id AND s.action=4 AND s.status=0)",
                     params![target.vm, target.generation, target.epoch, principal],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            let Some((activity, status)) = start else {
+            let Some((activity, status, state)) = start else {
                 return Ok(Err(Refusal::Busy));
             };
-            if store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?
-                >= store::MAX_CALLER_PENDING
-                && status != Status::Pending.code()
+            let pending_start = status == Status::Pending.code();
+            let pending_script = db
+                .query_row(
+                    "SELECT id FROM activity WHERE vm=?1 AND action=2 AND status=0",
+                    [target.vm],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if !pending_start
+                && pending_script.is_none()
+                && store::count(db, "SELECT count(*) FROM vm_operations WHERE status=0", [])?
+                    >= store::MAX_CALLER_PENDING
             {
                 return Ok(Err(Refusal::PendingFull));
             }
-            if status == Status::Pending.code() {
+            if pending_start {
                 store::finish(db, activity, Status::Interrupted, now, Some(false))?;
+            }
+            if let Some(pending_script) = pending_script {
+                db.execute_batch("SAVEPOINT native_stop_script")?;
+                if store::settle_with_script(
+                    db,
+                    pending_script,
+                    now,
+                    Completion::Failed,
+                    None,
+                    Some(script),
+                )
+                .is_err()
+                {
+                    db.execute_batch("ROLLBACK TO native_stop_script; RELEASE native_stop_script")?;
+                    if state != 3 {
+                        store::begin_recovery(db, target.vm, now)?;
+                    }
+                    let stop = binding.record_interrupted_stop(db, now, target.vm)?;
+                    store::prune(db)?;
+                    store::require_headroom(db)?;
+                    return Ok(Ok((stop.id, OwnedStop::Recovery)));
+                }
+                db.execute_batch("RELEASE native_stop_script")?;
             }
             let operation = binding.record(db, now, Some(target.vm), None)?;
             let stamp = store::native::release::StopReceipt::at_admission(
@@ -2948,7 +3118,7 @@ impl<C: Clock> VmController<C> {
                 clock.monotonic + Duration::from_secs(120),
             )?;
             store::require_headroom(db)?;
-            Ok(Ok((operation.id, Some(stamp))))
+            Ok(Ok((operation.id, OwnedStop::Pending(stamp))))
         })
     }
 

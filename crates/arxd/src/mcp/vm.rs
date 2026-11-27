@@ -267,6 +267,9 @@ pub(crate) struct Supervisor {
     controller: Arc<Controller>,
     #[cfg(all(windows, target_arch = "x86_64"))]
     native_runs: owned_worker::Registry<Arc<native_run::Run>>,
+    /// Owned-script admission inputs. Only fixtures install them before 7c 16.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    native_scripts: std::sync::OnceLock<native_run::NativeScripts>,
     gate: Mutex<Gate>,
     /// Lock-free foreground admission fence, sampled inside the gate.
     fenced: AtomicBool,
@@ -430,6 +433,8 @@ impl Supervisor {
             }),
             #[cfg(all(windows, target_arch = "x86_64"))]
             native_runs: Default::default(),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            native_scripts: Default::default(),
             fenced: AtomicBool::new(false),
             cancel: Shutdown::default(),
             cursor_key: hmac::Key::new(hmac::HMAC_SHA256, &secret),
@@ -1653,6 +1658,13 @@ impl VmInventory {
                 Precheck::NotReady => NOT_READY,
             };
             return self.refuse(action, request.vm(), reason);
+        }
+        // A current TEST run owner serves its scripts on the owned channel.
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Work::Script(script, timeout) = &request.work
+            && let Some(result) = self.script_subject(action, &request, script, *timeout)
+        {
+            return result;
         }
         #[cfg(test)]
         if let Some(fixture) = &mut gate.fixture {

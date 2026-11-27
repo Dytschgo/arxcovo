@@ -661,6 +661,8 @@ pub(crate) struct NativeLaunch<'a> {
     core: CheckedLaunchCore<'a>,
     qualification: &'a ForegroundQualification<'a>,
     binding: WorkspaceBinding,
+    /// The exact unresolved writer epoch this launch was created under.
+    writer_epoch: Id,
     targets: ReleaseTargets,
     serial: Option<&'a SerialName>,
     _offline: Option<&'a crate::vm::runtime::OfflineLease>,
@@ -873,6 +875,7 @@ impl<'a> NativeLaunch<'a> {
             core,
             qualification,
             binding: workspace_binding,
+            writer_epoch,
             targets,
             serial: boot_inputs.map(QualifiedBoot::serial),
             _offline: offline,
@@ -934,43 +937,76 @@ impl<'a> NativeLaunch<'a> {
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<(), NativeRefusal> {
-        self.guest_exchange(GuestRequest::Ping, cancel, refresh)
+        self.guest_exchange(GuestRequest::Ping, None, cancel, refresh)
             .await
             .map(|_| ())
     }
 
+    /// One guest script, only under an authority consumed for exactly these
+    /// bytes, this timeout and this launch's generation and writer epoch.
+    /// A typed guest result, including a nonzero exit or the guest's own
+    /// timeout, is returned as is. Any transport failure returns before
+    /// teardown, like [`Self::ping`], so the owner withdraws the witness
+    /// first and settles the same launch. The exchange never outlasts
+    /// `deadline`, the admitted worker's own cutoff.
     pub(crate) async fn run_script(
+        &mut self,
+        authority: crate::vm::runtime::ScriptAuthority,
+        script: String,
+        timeout_s: u32,
+        deadline: Instant,
+        cancel: &Shutdown,
+        refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
+    ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal> {
+        if !authority.names(
+            self.binding.generation,
+            self.writer_epoch,
+            &script,
+            timeout_s,
+        ) {
+            return Err(NativeRefusal::QualificationMissing);
+        }
+        self.exchange_script(script, timeout_s, deadline, cancel, refresh)
+            .await
+    }
+
+    // Both callers consume their own scope and payload authority before
+    // entering this transport. Each caller owns its own failure teardown.
+    async fn exchange_script(
         &mut self,
         script: String,
         timeout_s: u32,
+        deadline: Instant,
         cancel: &Shutdown,
         refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
-        verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> Result<(ScriptStatus, Option<u32>), LaunchFailure<'a>> {
-        match self
-            .guest_exchange(GuestRequest::Script(script, timeout_s), cancel, refresh)
-            .await
-        {
-            Ok(result) => Ok(result.expect("script request returns a script result")),
-            Err(reason) => Err(self.settle_failure(reason, cancel, verify_release).await),
-        }
+    ) -> Result<(ScriptStatus, Option<u32>), NativeRefusal> {
+        self.guest_exchange(
+            GuestRequest::Script(script, timeout_s),
+            Some(deadline),
+            cancel,
+            refresh,
+        )
+        .await?
+        .ok_or(NativeRefusal::GuestEndpointUnverified)
     }
 
     async fn guest_exchange(
         &mut self,
         request: GuestRequest,
+        cap: Option<Instant>,
         cancel: &Shutdown,
         mut refresh: impl FnMut() -> Result<Instant, NativeRefusal>,
     ) -> Result<Option<(ScriptStatus, Option<u32>)>, NativeRefusal> {
         let unavailable = NativeRefusal::GuestEndpointUnverified;
         let seconds = match &request {
             GuestRequest::Ping => 5,
-            GuestRequest::Script(_, timeout) => u64::from(*timeout) + 5,
+            GuestRequest::Script(_, timeout) => {
+                u64::from(*timeout) + crate::vm::guest::SCRIPT_EXCHANGE_SLACK.as_secs()
+            }
         };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
         match self.live.as_deref_mut() {
             Some((_, guest)) if !cancel.is_cancelled() => {
-                monitor_running(
+                monitor_guest_exchange(
                     async {
                         match request {
                             GuestRequest::Ping => guest.ping(cancel).await.map(|()| None),
@@ -987,26 +1023,12 @@ impl<'a> NativeLaunch<'a> {
                         )
                     },
                     cancel,
-                    deadline,
-                    |_| unavailable,
+                    Duration::from_secs(seconds),
+                    cap,
                 )
                 .await
             }
             _ => Err(unavailable),
-        }
-    }
-
-    async fn settle_failure(
-        &mut self,
-        reason: NativeRefusal,
-        cancel: &Shutdown,
-        verify_release: impl FnOnce() -> bool + Send + 'static,
-    ) -> LaunchFailure<'a> {
-        let (disposition, released) = self.stop_generation(cancel, verify_release).await;
-        LaunchFailure {
-            reason,
-            disposition,
-            released: released.map(Box::new),
         }
     }
 
@@ -1143,16 +1165,58 @@ impl custody::TestRelease<'_> {
     }
 }
 
+async fn monitor_guest_exchange<T>(
+    exchange: impl std::future::Future<Output = Result<T, NativeRefusal>>,
+    observe: impl FnMut() -> Result<(), NativeRefusal>,
+    cancel: &Shutdown,
+    budget: Duration,
+    cap: Option<Instant>,
+) -> Result<T, NativeRefusal> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = cap.map_or(deadline, |cap| deadline.min(cap.into()));
+    monitor_running(exchange, observe, cancel, deadline, |_| {
+        NativeRefusal::GuestEndpointUnverified
+    })
+    .await
+}
+
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn guest_exchange_applies_the_admitted_cutoff_to_typed_replies() {
+    use tokio::time::{Instant, sleep_until};
+
+    let cancel = Shutdown::default();
+    let cap = Duration::from_secs(1);
+    let typed = (ScriptStatus::Exited, Some(7));
+    for reply_after in [
+        Duration::from_millis(500),
+        cap,
+        cap + Duration::from_millis(1),
+    ] {
+        let started = Instant::now();
+        let result = monitor_guest_exchange(
+            async {
+                sleep_until(started + reply_after).await;
+                Ok(typed)
+            },
+            || Ok(()),
+            &cancel,
+            Duration::from_secs(6),
+            Some((started + cap).into_std()),
+        )
+        .await;
+        if reply_after < cap {
+            assert_eq!(result.unwrap(), typed);
+        } else {
+            assert_eq!(result.unwrap_err(), NativeRefusal::GuestEndpointUnverified);
+            assert!((cap..=cap + Duration::from_millis(5)).contains(&started.elapsed()));
+        }
+    }
+}
+
 enum GuestRequest {
     Ping,
     Script(String, u32),
-}
-
-#[must_use = "settle the failed effect with its held proof or retain its charge"]
-pub(crate) struct LaunchFailure<'a> {
-    pub reason: NativeRefusal,
-    pub disposition: StopDisposition,
-    pub released: Option<Box<ReleasedGeneration<'a>>>,
 }
 
 fn check_permit(
