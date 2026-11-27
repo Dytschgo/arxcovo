@@ -506,7 +506,11 @@ Jobs and abort owned work if reserves drop or there is unexpected host impact.
    Remove-Item -LiteralPath 'D:\ArxcovoData\qualify\trial.vhdx' -ErrorAction Stop
    ```
 
-Use the [M4 owner-host acceptance runbook](m4-acceptance.md) after qualification and native issuance are ready.
+After the reviewed activation lands, follow the
+[ADR 0054 TEST opt-in](adr/0054-m4-dedicated-windows-runtime.md#native-test-activation)
+with fresh native qualification for the exact deployed release. Use the
+[M4 owner-host acceptance runbook](m4-acceptance.md) to verify the native
+journey under the enrolled owner's current login.
 
 ## Foreground VM profile: state root custody
 

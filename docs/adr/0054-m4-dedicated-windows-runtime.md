@@ -2073,3 +2073,28 @@ disposal proof. Static VMs and protected backups stay outside TEST copy
 and disposal authority. Native execution is **unverified on real hardware**.
 
 Read-only inspection skips the `StorePins` store and boot-marker check because it owns no writer epoch.
+
+## Native TEST activation
+
+Native TEST admission is off by default. To opt in, enable the foreground
+TEST profile and its Windows x64 runtime. Set the runtime execution profile
+to `current_user` and provide its `test_qualification` object with
+`enrollment`, `dossier`, `sha256`, and `scope`. The last two fields pin
+the native TEST qualification seal and scope. Omit the object when TEST
+admission should remain closed. The foreground account must be the enrolled
+owner running under the non-elevated Medium primary token in the active
+console session, following [ADR 0029](0029-owner-selectable-windows-execution-account.md)
+and [ADR 0058](0058-v1-scope-static-vms-and-cloudflare.md). Use the enrolled storage root and independently reviewed
+release and evidence.
+
+The foreground holds one verified selection and reports its seal digest
+and Ubuntu and Windows recipe pins before the owner-idle wait. Fresh effects
+require current selection, idleness, reserves and durable authenticated
+admission. Exact owned stops and checked recovery continue across closure.
+The same ordinary reaper handles failed staging, targeted vault teardown
+and expiry. Selection grants authority over native TEST work only.
+
+After this activation lands, complete fresh owner-host qualification for
+the reviewed binaries and exact enrolled scope, then run the
+[M4 owner-host acceptance journey](../m4-acceptance.md) in the approved
+window. Native paths are **unverified on real hardware** until this succeeds.

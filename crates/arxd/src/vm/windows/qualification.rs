@@ -29,7 +29,7 @@ pub(crate) use production::{
     BuildSeal, FinalizedPair, GenerationGuards, HeldStartRefusal, HelperSettlement, HelperTarget,
     InstallerSettlement, LaunchPermit, LaunchPermitBinding, LaunchRequest, LaunchTarget,
     NativeLaunch, NativeRecovery, ProductionWorkspace, ReleasedGeneration, StartCreation,
-    StartPair, StartRefusal, WorkspaceBinding,
+    StartPair, StartRefusal, TEST_RESOURCES, WorkspaceBinding, binding_from_scope,
 };
 mod recipe;
 #[allow(unused_imports, reason = "consumed by the 7c foreground issuer")]

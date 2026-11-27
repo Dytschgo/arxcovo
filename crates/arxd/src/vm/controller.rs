@@ -160,7 +160,7 @@ pub(crate) enum AdmittedEffect {
 /// Foreground VM-profile metadata. A successful admission commits intent;
 /// there is no runtime, transport, or process launcher in this controller.
 pub struct VmController<C> {
-    store: VmStore,
+    store: Arc<VmStore>,
     policy: VmPolicy,
     clock: C,
     gate: Mutex<AdmissionGate>,
@@ -331,7 +331,7 @@ impl<C: Clock> VmController<C> {
     pub fn open(vm_state_root: &Path, policy: VmPolicy, clock: C) -> Result<Self> {
         let store = VmStore::open(vm_state_root, utc(clock.now())?)?;
         Ok(Self {
-            store,
+            store: Arc::new(store),
             policy,
             clock,
             gate: Mutex::default(),
@@ -2739,6 +2739,49 @@ impl<C: Clock> VmController<C> {
         &self.store
     }
 
+    pub(crate) fn selected_golden(
+        &self,
+        recipe: super::qualification_record::RecipeIdentity,
+    ) -> Result<Option<SealedGolden>> {
+        self.store.try_native_transaction(|db| {
+            let Some((template, expected)) =
+                store::sealed_pair(db, &hex::encode(recipe.recipe_id), recipe.recipe_sha256)?
+            else {
+                return Ok(None);
+            };
+            let generation = expected.disk.generation;
+            Self::bound_native_workspace(db, generation)?;
+            Ok(store::native_golden_pair(db, generation)?
+                .filter(|(slots, _)| *slots == expected)
+                .map(|(slots, evidence)| SealedGolden {
+                    template,
+                    slots,
+                    evidence,
+                    retained: 0,
+                }))
+        })
+    }
+
+    pub(crate) fn selected_test_generation(
+        &self,
+        vm: Id,
+        recipes: super::qualification_record::TestRecipes,
+    ) -> Result<bool> {
+        self.store.read_only(|db| {
+            Ok(
+                store::snapshot::active(db, vm, false)?.is_some_and(|active| {
+                    [recipes.ubuntu.recipe_sha256, recipes.windows.recipe_sha256]
+                        .contains(&active.recipe)
+                        && Self::bound_native_workspace(db, active.pair.0.disk.generation).is_ok()
+                }),
+            )
+        })
+    }
+
+    pub(crate) fn share_native_store(&self) -> Arc<VmStore> {
+        self.store.clone()
+    }
+
     /// Read-only replay lookup for occupied-slot or already-known replay
     /// checks. Preserves exact binding, key-collision and stale-key checks
     /// without advancing `vm_retry_clock` or pruning expired terminal rows.
@@ -3412,6 +3455,10 @@ pub(crate) struct SealedGolden {
     allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
 )]
 impl SealedGolden {
+    pub(crate) fn template(&self) -> Id {
+        self.template
+    }
+
     pub(crate) fn slots(&self) -> PairSlots {
         self.slots
     }

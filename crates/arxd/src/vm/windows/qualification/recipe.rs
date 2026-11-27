@@ -240,7 +240,7 @@ pub(crate) fn stage_supported(slot: ArtifactSlot, phase: InstallerPhase) -> bool
         )
 }
 
-impl ForegroundQualification<'_> {
+impl ForegroundQualification {
     pub(crate) fn stage_installer<'a>(
         &self,
         reservation: InstallerReservation<'a>,

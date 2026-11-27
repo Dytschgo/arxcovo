@@ -108,7 +108,7 @@ impl HeldGolden {
     }
 }
 
-impl ForegroundQualification<'_> {
+impl ForegroundQualification {
     pub(crate) fn hold_golden(
         &self,
         ledger: &dyn CustodyCheckpoints,
@@ -166,7 +166,7 @@ pub(crate) trait OverlayHelper {
 /// The production overlay helper: one permit minted for exactly the stage's
 /// plan, then the checked creation. **Unverified on real hardware.**
 pub(crate) struct CheckedOverlay<'q, M, R> {
-    pub qualification: &'q ForegroundQualification<'q>,
+    pub qualification: &'q ForegroundQualification,
     pub cwd: &'q LocalPath,
     pub cancel: &'q Shutdown,
     pub cancelled: &'q dyn Fn() -> bool,

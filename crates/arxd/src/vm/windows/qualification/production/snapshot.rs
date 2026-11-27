@@ -325,7 +325,7 @@ pub(crate) trait SnapshotInspector {
 
 /// Checks and runs the read-only helper on the blocking copy worker.
 pub(crate) struct CheckedSnapshotInspector<'a, M, R> {
-    pub qualification: &'a ForegroundQualification<'a>,
+    pub qualification: &'a ForegroundQualification,
     pub image: &'a Artifact,
     pub cwd: &'a LocalPath,
     pub cancel: &'a Shutdown,

@@ -175,8 +175,7 @@ impl<S: SelectedSource, C: Clock> ScriptAuthorizer for TestIssuer<'_, S, C> {
     }
 }
 
-/// The fixture-installed admission inputs for owned scripts. No production
-/// path installs it before 7c 16, so the script route stays closed.
+/// The selected admission inputs for scripts on an owned TEST channel.
 #[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
 pub(super) struct NativeScripts {
     pub(super) installation: Installation,
@@ -375,6 +374,13 @@ impl Run {
 
     fn project(&self, supervisor: &Supervisor, mut row: Value) -> Value {
         row["ready"] = json!(false);
+        if supervisor
+            .selected_test
+            .as_ref()
+            .is_some_and(|selected| selected.refresh().is_err())
+        {
+            return row;
+        }
         match supervisor
             .controller
             .native_run_current(&self.principal, self.target, true)
@@ -664,8 +670,7 @@ impl<'a> LiveLaunch for NativeLaunch<'a> {
     }
 }
 
-// The activation chunk supplies the selected source on the tracked worker.
-// Until then, only fixtures can construct the installation required here.
+// The selected source runs on the tracked worker.
 #[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
 impl Gate {
     /// The caller holds the foreground gate. A fresh start commits its pending
@@ -815,12 +820,12 @@ fn replay_start(supervisor: &Supervisor, request: &Request<'_>) -> Outcome<Optio
 
 #[allow(dead_code, reason = "TEST installation is closed until 7c 16")]
 impl Run {
-    async fn run<S: SelectedSource>(
+    pub(super) async fn run<S: SelectedSource>(
         &self,
         supervisor: &Supervisor,
         start: Start,
         issuer: &TestIssuer<'_, S, ForegroundClock>,
-        qualification: &ForegroundQualification<'_>,
+        qualification: &ForegroundQualification,
     ) -> anyhow::Result<()> {
         let controller = &supervisor.controller;
         let pair = StartPair {

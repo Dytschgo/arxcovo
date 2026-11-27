@@ -572,7 +572,8 @@ fn open_requires_the_exact_selection() {
     };
     let windows = recipes().windows.recipe_id;
     type Mutate = fn(&mut FakeSource, Id);
-    let mutations: [(&str, Mutate, NativeRefusal); 9] = [
+    let mutations: [(&str, Mutate, NativeRefusal); 10] = [
+        ("missing seal", |s, _| s.seal = [0; 32], REFUSED),
         ("seal", |s, _| s.seal = [0xa2; 32], REFUSED),
         ("scope", |s, _| s.scope = [0xb3; 32], REFUSED),
         (
@@ -638,9 +639,6 @@ fn configured_startup_refuses_without_held_evidence() {
     };
     let configured = configured(&path("enrollment.json"), &path("dossier"));
     assert!(
-        TestIssuer::open_configured(&Installation::fixture(), &fixture.ctl, &configured).is_err()
-    );
-    assert!(
         TestIssuer::open(
             &Installation::fixture(),
             &fixture.ctl,
@@ -649,6 +647,7 @@ fn configured_startup_refuses_without_held_evidence() {
         )
         .is_ok()
     );
+    assert!(TestIssuer::open_configured(Arc::new(fixture.ctl), &configured).is_err());
     assert_admission_closed();
 }
 

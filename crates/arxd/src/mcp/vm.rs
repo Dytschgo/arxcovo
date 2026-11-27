@@ -2,6 +2,8 @@
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod native_run;
 mod owned_worker;
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod selected_test;
 mod vault_test;
 use crate::{
     config::{TestVms, VmRuntimeProfile},
@@ -267,7 +269,12 @@ pub(crate) struct Supervisor {
     controller: Arc<Controller>,
     #[cfg(all(windows, target_arch = "x86_64"))]
     native_runs: owned_worker::Registry<Arc<native_run::Run>>,
-    /// Owned-script admission inputs. Only fixtures install them before 7c 16.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    selected_test: Option<Arc<selected_test::SelectedTest>>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    test_staging: owned_worker::Registry<()>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    test_generations: crate::vm::qualification::GenerationGuards,
     #[cfg(all(windows, target_arch = "x86_64"))]
     native_scripts: std::sync::OnceLock<native_run::NativeScripts>,
     gate: Mutex<Gate>,
@@ -279,8 +286,7 @@ pub(crate) struct Supervisor {
     // Two TEST recipes and the independent A2 web recipe share one page.
     recipes: [Option<Recipe>; 3],
     native_refusal: NativeRefusal,
-    /// The validated native runtime profile, if configured. It only selects
-    /// the closed candidate runtime; it never authorizes a launch here.
+    /// The runtime profile also serves the independent legacy candidate.
     runtime: Option<VmRuntimeProfile>,
     publisher: Publication,
     compose: compose::Host,
@@ -388,6 +394,10 @@ impl Supervisor {
             custody.verify()?;
             crate::store::vm::compose::enroll(state.controller.compose_store(), &enrollments)?;
         }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if profile.enabled {
+            state.install_test();
+        }
         state.custody = Some(custody);
         let gate = state
             .gate
@@ -396,7 +406,7 @@ impl Supervisor {
         gate.allow_agent_public_sites = profile.allow_agent_public_sites;
         gate.publish_profile = profile.publication.map(Arc::from);
         state.recipes[1] = Some((WEB_RECIPE_ID, None));
-        state.recipes[2] = Some((Controller::windows_recipe_id(), None));
+        state.recipes[2].get_or_insert((Controller::windows_recipe_id(), None));
         Ok(supervisor)
     }
 
@@ -433,6 +443,12 @@ impl Supervisor {
             }),
             #[cfg(all(windows, target_arch = "x86_64"))]
             native_runs: Default::default(),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            selected_test: None,
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            test_staging: Default::default(),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            test_generations: Default::default(),
             #[cfg(all(windows, target_arch = "x86_64"))]
             native_scripts: Default::default(),
             fenced: AtomicBool::new(false),
@@ -585,6 +601,11 @@ impl Supervisor {
         #[cfg(test)]
         if let Some(reaper) = fixture {
             self.controller.sweep_with(&reaper, &*reaper.custody)?;
+            return Ok(());
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(cleanup) = self.test_cleanup() {
+            self.controller.sweep_with(&cleanup, &cleanup.custody)?;
             return Ok(());
         }
         self.controller.sweep_once(&self.candidate())?;
@@ -815,15 +836,25 @@ impl Supervisor {
             return json!({"available":true});
         }
         let _ = gate;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(selected) = &self.selected_test {
+            return selected.catalog().unwrap_or_else(
+                |reason| json!({"available":false,"reason":native_reason(reason)}),
+            );
+        }
         json!({"available":false,"reason":native_reason(self.native_refusal)})
     }
 }
 
 impl Drop for Supervisor {
     /// Production store users reach the store only through this supervisor,
-    /// so the pinned root outlives them all. Native workers that clone the
-    /// controller would break that; activation must keep this assertion.
+    /// so the pinned root outlives them all.
     fn drop(&mut self) {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            self.native_scripts.take();
+            self.selected_test.take();
+        }
         debug_assert!(
             self.custody.is_none()
                 || std::thread::panicking()
@@ -1536,7 +1567,7 @@ impl VmInventory {
     }
 
     /// File an exact, closed reason under the authenticated principal.
-    fn refuse(&self, action: i64, vm: Option<Id>, reason: Fault) -> Outcome<Value> {
+    fn refuse<T>(&self, action: i64, vm: Option<Id>, reason: Fault) -> Outcome<T> {
         if let Some(code) = refusal_from_wire(reason.0) {
             self.supervisor
                 .controller
@@ -1643,6 +1674,10 @@ impl VmInventory {
                     return fixture.snapshot(self, action, request, route);
                 }
                 let _route = route;
+                #[cfg(all(windows, target_arch = "x86_64"))]
+                if !is_static && let Some(selected) = &self.supervisor.selected_test {
+                    return selected.dispatch(self, gate, action, request);
+                }
                 return self.refuse(
                     action,
                     request.vm(),
@@ -1669,6 +1704,10 @@ impl VmInventory {
         #[cfg(test)]
         if let Some(fixture) = &mut gate.fixture {
             return fixture.admit(self, action, request, digest);
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if let Some(selected) = &self.supervisor.selected_test {
+            return selected.dispatch(self, gate, action, request);
         }
         let _ = gate;
         self.refuse(

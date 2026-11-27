@@ -183,7 +183,7 @@ impl<'w> PreparedHelper<'w, '_> {
     #[allow(clippy::too_many_arguments, reason = "one checked creation's inputs")]
     pub(crate) async fn run(
         &'w self,
-        qualification: &'w ForegroundQualification<'w>,
+        qualification: &'w ForegroundQualification,
         plan: CommandPlan<'w>,
         cwd: &'w LocalPath,
         permit: impl LaunchPermit,

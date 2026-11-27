@@ -11,9 +11,8 @@
 //! effect's own authority type exists. Recovery authority is separate and
 //! cannot launch.
 //!
-//! No production path constructs an [`Installation`] before 7c 16, so no
-//! configured input reaches an effect here. Native paths are **unverified on
-//! real hardware**.
+//! The foreground opens one issuer only after explicit opt-in and checked
+//! selection. Native paths are **unverified on real hardware**.
 #![cfg_attr(
     not(test),
     allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
@@ -37,7 +36,11 @@ use super::{
 };
 use crate::{config::TestQualificationSelection, service::Shutdown, store::vm::native::Scope};
 use serde_json::{Value, json};
-use std::{sync::Mutex, time::Instant};
+use std::{
+    ops::Deref,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 const REFUSED: NativeRefusal = NativeRefusal::QualificationMissing;
 /// One worker's intent names at most this many distinct effects.
@@ -47,13 +50,14 @@ const MAX_EFFECTS: usize = 16;
 /// effect authority.
 pub(crate) struct Minted(());
 
-/// The single installation point for native TEST effects and recovery. Its
-/// production constructor lands with activation in 7c 16. Until then only
-/// fixtures hold one, so no profile, configured selection or filter can open
-/// an issuer or mint recovery authority.
+/// The installation marker issued by the verified production selection.
 pub(crate) struct Installation(());
 
 impl Installation {
+    pub(crate) fn selected<C>(_: &TestIssuer<'_, ForegroundQualification, C>) -> Self {
+        Self(())
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         Self(())
@@ -87,28 +91,43 @@ pub(crate) struct NativeTarget {
     pub writer_epoch: Option<Id>,
 }
 
+enum ControllerHandle<'a, C> {
+    Owned(Arc<VmController<C>>),
+    Borrowed(&'a VmController<C>),
+}
+
+impl<C> Deref for ControllerHandle<'_, C> {
+    type Target = VmController<C>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(controller) => controller,
+            Self::Borrowed(controller) => controller,
+        }
+    }
+}
+
 pub(crate) struct TestIssuer<'a, S, C> {
-    controller: &'a VmController<C>,
+    controller: ControllerHandle<'a, C>,
     source: S,
     epoch: SelectionEpoch,
     seal_sha256: Hash,
     recipes: TestRecipes,
 }
 
-impl<'a, C: Clock> TestIssuer<'a, ForegroundQualification<'a>, C> {
+impl<C: Clock> TestIssuer<'static, ForegroundQualification, C> {
     /// The startup path: hold the configured selection, then open it.
     pub(crate) fn open_configured(
-        installation: &Installation,
-        controller: &'a VmController<C>,
+        controller: Arc<VmController<C>>,
         config: &TestQualificationSelection,
     ) -> Result<Self, NativeRefusal> {
         let source = ForegroundQualification::open(
-            controller.native_store(),
+            controller.share_native_store(),
             config.enrollment().as_str(),
             config.dossier().as_str(),
             config.selection(),
         )?;
-        Self::open(installation, controller, source, config)
+        Self::verify_selection(ControllerHandle::Owned(controller), source, config)
     }
 }
 
@@ -118,6 +137,14 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
     pub(crate) fn open(
         _: &Installation,
         controller: &'a VmController<C>,
+        source: S,
+        config: &TestQualificationSelection,
+    ) -> Result<Self, NativeRefusal> {
+        Self::verify_selection(ControllerHandle::Borrowed(controller), source, config)
+    }
+
+    fn verify_selection(
+        controller: ControllerHandle<'a, C>,
         source: S,
         config: &TestQualificationSelection,
     ) -> Result<Self, NativeRefusal> {
@@ -145,6 +172,14 @@ impl<'a, S: SelectedSource, C: Clock> TestIssuer<'a, S, C> {
             seal_sha256: selection.seal_sha256,
             recipes,
         })
+    }
+
+    pub(crate) fn source(&self) -> &S {
+        &self.source
+    }
+
+    pub(crate) fn recipes(&self) -> TestRecipes {
+        self.recipes
     }
 
     pub(crate) fn epoch(&self) -> &SelectionEpoch {

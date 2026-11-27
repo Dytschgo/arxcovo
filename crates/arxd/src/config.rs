@@ -65,7 +65,7 @@ struct RawTestQualification {
 /// The configured TEST selection, only from a validated profile. It keeps
 /// the profile's current-user SID so startup can require the enrollment
 /// owner and the live token to be that account. Configuration alone grants
-/// no effect: the issuer's closed installation decides whether it is read.
+/// no effect until the foreground issuer verifies that selection.
 #[derive(Clone)]
 #[cfg_attr(
     not(all(windows, target_arch = "x86_64")),
@@ -243,8 +243,8 @@ impl VmRuntimeProfile {
     /// The validated TEST opt-in, if configured. `parse` refused any other
     /// shape, so a present value is always exact.
     #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the closed TEST installation lands in 7c 16")
+        not(any(test, all(windows, target_arch = "x86_64"))),
+        allow(dead_code, reason = "the native TEST issuer is Windows x64 only")
     )]
     pub(crate) fn test_qualification(&self) -> Option<TestQualificationSelection> {
         self.0
@@ -929,6 +929,11 @@ pub(crate) struct VmCustody {
 }
 
 impl VmCustody {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn configured_state(&self) -> &Path {
+        &self.configured_state
+    }
+
     pub(crate) fn state_path(&self, canonical: &Path) -> VmStatePath {
         self.state.state_path(canonical)
     }

@@ -2339,6 +2339,16 @@ pub(crate) fn sealed_golden(
     }) else {
         return Ok(None);
     };
+    Ok(native_golden_pair(db, generation)?.map(|(slots, pair)| (slots, pair, retained)))
+}
+
+/// Read the two native checkpoints of a sealed pair. The caller binds the
+/// generation to a selected TEST recipe and an active template.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn native_golden_pair(
+    db: &Connection,
+    generation: Id,
+) -> Result<Option<(PairSlots, [ArtifactEvidence; 2])>> {
     let mut found = Vec::with_capacity(2);
     for role in ["disk", "vars"] {
         let row = db
@@ -2397,7 +2407,6 @@ pub(crate) fn sealed_golden(
             vars: *vars,
         },
         [*disk_evidence, *vars_evidence],
-        retained,
     )))
 }
 

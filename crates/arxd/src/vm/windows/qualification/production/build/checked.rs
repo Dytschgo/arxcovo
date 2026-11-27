@@ -74,9 +74,9 @@ fn installer_refusal(reason: InstallerFailureReason) -> Q {
 }
 
 struct Checked<'a, C> {
-    qualification: &'a ForegroundQualification<'a>,
-    issuer: &'a TestIssuer<'a, ForegroundQualification<'a>, C>,
-    intent: &'a Intent<'a, ForegroundQualification<'a>, C>,
+    qualification: &'a ForegroundQualification,
+    issuer: &'a TestIssuer<'a, ForegroundQualification, C>,
+    intent: &'a Intent<'a, ForegroundQualification, C>,
     cwd: LocalPath,
     cancel: &'a Shutdown,
     cancelled: &'a dyn Fn() -> bool,
@@ -304,11 +304,11 @@ impl<C: Clock> Effects for Checked<'_, C> {
     }
 }
 
-impl<'q> ForegroundQualification<'q> {
+impl ForegroundQualification {
     /// Runs an already-admitted build. Installation of the issuer and the
     /// entry point that admits native production requests land in chunk 16.
     #[allow(clippy::too_many_arguments, reason = "one admitted build's inputs")]
-    pub(crate) async fn build_test_golden<C: Clock>(
+    pub(crate) async fn build_test_golden<'q, C: Clock>(
         &'q self,
         controller: &VmController<C>,
         issuer: &'q TestIssuer<'q, Self, C>,

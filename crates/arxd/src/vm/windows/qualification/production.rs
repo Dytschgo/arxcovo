@@ -52,7 +52,7 @@ impl ProductionWorkspace {
     }
 }
 
-impl ForegroundQualification<'_> {
+impl ForegroundQualification {
     /// Requires the exact durable scope before taking the lease.
     pub(crate) fn hold_workspace(
         &self,
@@ -659,7 +659,7 @@ pub(crate) struct LaunchRequest<'a> {
 #[must_use = "a created native launch needs stop or teardown"]
 pub(crate) struct NativeLaunch<'a> {
     core: CheckedLaunchCore<'a>,
-    qualification: &'a ForegroundQualification<'a>,
+    qualification: &'a ForegroundQualification,
     binding: WorkspaceBinding,
     /// The exact unresolved writer epoch this launch was created under.
     writer_epoch: Id,
@@ -748,7 +748,7 @@ fn finish_spawn_preparation(
 
 impl<'a> NativeLaunch<'a> {
     pub(crate) fn hold(
-        qualification: &'a ForegroundQualification<'a>,
+        qualification: &'a ForegroundQualification,
         request: LaunchRequest<'a>,
         permit: impl LaunchPermit,
         refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
@@ -760,7 +760,7 @@ impl<'a> NativeLaunch<'a> {
     }
 
     fn hold_inner(
-        qualification: &'a ForegroundQualification<'a>,
+        qualification: &'a ForegroundQualification,
         request: LaunchRequest<'a>,
         permit: impl LaunchPermit,
         refresh: impl FnOnce() -> Result<Instant, NativeRefusal>,
@@ -867,7 +867,7 @@ impl<'a> NativeLaunch<'a> {
             },
             || {
                 finish_spawn_preparation(kind, prepare_by, cancelled, || {
-                    let store = qualification.store;
+                    let store = &qualification.store;
                     let pins = recovery::StorePins::open(qualification.production_root())?;
                     let origin = pins.origin(store, boot::marker()?)?;
                     store
@@ -1383,6 +1383,8 @@ impl FinalizedPair {
 
 mod build;
 mod clone;
+mod selected;
+pub(crate) use selected::TEST_RESOURCES;
 mod custody;
 mod disposal;
 mod helper;
@@ -1398,6 +1400,7 @@ use custody::reserve_workspace_under;
 pub(crate) use custody::{CustodyCheckpoints, HelperTarget};
 #[cfg(test)]
 pub(super) use custody::{WRITE_FAULT, WriteFault};
+pub(crate) use disposal::binding_from_scope;
 #[allow(
     unused_imports,
     reason = "consumed by the 7c foreground issuer and reaper"

@@ -7,10 +7,10 @@ use crate::vm::qualification_record::{
 };
 use crate::vm::selection_epoch::Invalidation::{self, Confirmed, Indeterminate};
 
-pub(crate) struct ForegroundQualification<'a> {
+pub(crate) struct ForegroundQualification {
     pub(super) held: Held,
     pub(super) recipes: std::sync::Mutex<launch::RecipeInputs>,
-    pub(super) store: &'a VmStore,
+    pub(super) store: std::sync::Arc<VmStore>,
     dependencies: Dependencies,
     evidence: VerifiedEvidence,
     seal_sha256: records::Hash,
@@ -18,9 +18,9 @@ pub(crate) struct ForegroundQualification<'a> {
     _rows: Vec<File>,
 }
 
-impl<'a> ForegroundQualification<'a> {
+impl ForegroundQualification {
     pub(crate) fn open(
-        store: &'a VmStore,
+        store: std::sync::Arc<VmStore>,
         enrollment: &str,
         dossier: &str,
         selection: &Selection,
@@ -31,14 +31,14 @@ impl<'a> ForegroundQualification<'a> {
             dossier,
             false,
             true,
-            CollectMode::Foreground(store),
+            CollectMode::Foreground(&store),
             |pin, owner, _, _| ReadDossier::open(pin, owner),
         )?;
         let mut dependencies = observations.dependencies();
         // This projection precedes all reads of the selected seal and rows.
         let recipes = launch::measure_recipes(&held, [0; 16], [0; 32])?;
         recipes.projection.bind(&mut dependencies);
-        let fresh = measure_fresh(&held, store, &dependencies)?;
+        let fresh = measure_fresh(&held, &store, &dependencies)?;
         let (evidence, rows) = dossier
             .read_selected(selection, &fresh)
             .map_err(|_| NativeRefusal::QualificationMissing)?;
@@ -57,6 +57,18 @@ impl<'a> ForegroundQualification<'a> {
         })
     }
 
+    pub(super) fn owner(&self) -> PSID {
+        self.held.token.account.0
+    }
+
+    pub(super) fn snapshot_firmware(&self) -> Result<crate::vm::paths::ArtifactPin, NativeRefusal> {
+        let inputs = self
+            .recipes
+            .lock()
+            .map_err(|_| NativeRefusal::QualificationMissing)?;
+        launch::content(&inputs.code)
+    }
+
     pub(crate) fn evidence(&self) -> &VerifiedEvidence {
         &self.evidence
     }
@@ -70,7 +82,7 @@ impl<'a> ForegroundQualification<'a> {
     /// issuance anchor means the boot marker changed.
     pub(crate) fn fresh(&self) -> Result<Fresh<'_>, Invalidation> {
         let reason = NativeRefusal::QualificationMissing;
-        let fresh = measure_fresh(&self.held, self.store, &self.dependencies)?;
+        let fresh = measure_fresh(&self.held, &self.store, &self.dependencies)?;
         let binding = self.evidence.seal.binding;
         let issued = binding
             .issued_on_boot(fresh.boot_marker)
@@ -111,7 +123,7 @@ impl<'a> ForegroundQualification<'a> {
     }
 }
 
-impl crate::vm::test_issuer::SelectedSource for ForegroundQualification<'_> {
+impl crate::vm::test_issuer::SelectedSource for ForegroundQualification {
     fn seal_sha256(&self) -> records::Hash {
         self.seal_sha256
     }

@@ -403,7 +403,7 @@ pub(in crate::vm::windows::qualification) fn check_helper_target(
         .confirm_identified(binding, target.slot, identity)
 }
 
-impl ForegroundQualification<'_> {
+impl ForegroundQualification {
     /// Creates and binds a new generation workspace (ADR 0072).
     pub(crate) fn reserve_workspace(
         &self,
