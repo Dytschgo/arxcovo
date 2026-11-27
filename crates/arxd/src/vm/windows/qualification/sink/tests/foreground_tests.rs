@@ -126,6 +126,9 @@ fn docker_fixture(
 #[test]
 fn docker_dossier_reads_only_its_own_class_and_exact_rows() {
     use records::*;
+
+    // Match service startup so the enrollment file is owned by TokenUser on elevated CI.
+    crate::service::windows::set_current_token_owner().expect("TokenOwner = TokenUser");
     let work = tempfile::tempdir().unwrap();
     let (path, dir) = claimed(work.path(), &[]);
     let (test_dependencies, _, test_bundle) = complete_test_fixture(&dir);
