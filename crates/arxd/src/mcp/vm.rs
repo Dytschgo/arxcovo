@@ -1512,7 +1512,10 @@ impl VmInventory {
         if request.name == ToolName::Stop.name()
             && let Some(result) = self.stop_subject(request.arguments.as_ref())
         {
-            return result;
+            let (reply, owner) = result?;
+            drop(gate);
+            owner.notify_retry();
+            return Ok(reply);
         }
         if gate.closed || self.supervisor.fenced.load(Ordering::SeqCst) {
             return Err(SHUTDOWN);
