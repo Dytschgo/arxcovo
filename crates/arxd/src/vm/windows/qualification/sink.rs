@@ -920,7 +920,18 @@ pub(super) fn empty(dir: &File) -> Result<bool, NativeRefusal> {
 /// Owner and DACL of the held object itself: owned by the expected user,
 /// with allow entries only for that user, SYSTEM and Administrators.
 pub(super) fn held_private(file: &File, owner: PSID) -> bool {
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    held_acl(file, owner, false)
+}
+
+pub(super) fn held_private_protected(file: &File, owner: PSID) -> bool {
+    held_acl(file, owner, true)
+}
+
+fn held_acl(file: &File, owner: PSID, protected: bool) -> bool {
+    use windows_sys::Win32::Security::{
+        Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+        GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+    };
     let mut actual_owner = null_mut();
     let mut dacl = null_mut();
     let mut descriptor = null_mut();
@@ -941,7 +952,14 @@ pub(super) fn held_private(file: &File, owner: PSID) -> bool {
         return false;
     }
     // Windows-owned SID and ACL storage stays live until LocalFree below.
-    let private = unsafe { private_descriptor(actual_owner, dacl, owner) };
+    let private = unsafe {
+        let mut control = 0;
+        let mut revision = 0;
+        private_descriptor(actual_owner, dacl, owner)
+            && (!protected
+                || (GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
+                    && control & SE_DACL_PROTECTED != 0))
+    };
     unsafe { LocalFree(descriptor) };
     private
 }
