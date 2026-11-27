@@ -260,8 +260,10 @@ async fn static_compose_start_commits_boot_and_sessions_together() -> Result<()>
 
 #[tokio::test]
 async fn static_compose_private_routes_use_the_exact_origin_and_wire_boot() -> Result<()> {
-    let (_dir, db, target, generation) = backup_owner_fixture()?;
+    let (_dir, _db, target, generation) = backup_owner_fixture()?;
     let mut origin = origin(generation);
+    let route_watch = Shutdown::default();
+    origin.retired = super::super::runtime::publication::Retirement::on_route(route_watch.clone());
     let routes = PrivateRoutes {
         vm: target.vm,
         zone: "owner.invalid".into(),
@@ -287,21 +289,19 @@ async fn static_compose_private_routes_use_the_exact_origin_and_wire_boot() -> R
     let sessions = sessions?;
     assert!(
         sessions
-            .lifecycle
-            .install_private_routes(&db, [1; 16], &origin, &routes)
+            .install_private_routes([1; 16], &routes, || true)
             .await
             .is_err()
     );
-    let origin_boot = origin.boot;
-    origin.boot = [5; 16];
+    let mut other_origin = origin.clone();
+    other_origin.boot = [5; 16];
+    assert!(!sessions.lifecycle.matches_origin(&other_origin));
     assert!(
         sessions
-            .lifecycle
-            .install_private_routes(&db, target.vm, &origin, &routes)
+            .install_private_routes(target.vm, &routes, || false)
             .await
             .is_err()
     );
-    origin.boot = origin_boot;
     let readiness =
         super::super::static_web::StaticOriginIdentity::for_generation(origin.origin_generation);
     let peer_route = async {
@@ -311,6 +311,7 @@ async fn static_compose_private_routes_use_the_exact_origin_and_wire_boot() -> R
             readiness_host,
             zone,
             routes: sent,
+            private,
         } = read(&mut peer).await
         else {
             panic!("expected only the fixed route installation action");
@@ -320,20 +321,29 @@ async fn static_compose_private_routes_use_the_exact_origin_and_wire_boot() -> R
         assert_eq!(readiness_host, readiness.provisioning().server_name());
         assert_eq!(zone, routes.zone);
         assert_eq!(sent, routes.routes);
+        assert!(private);
         write(&mut peer, Resp::ComposeRoutesInstalled { id, generation }).await;
     };
     let (result, ()) = tokio::join!(
-        sessions
-            .lifecycle
-            .install_private_routes(&db, target.vm, &origin, &routes),
+        sessions.install_private_routes(target.vm, &routes, || true),
         peer_route,
     );
     result?;
-    origin.retired.retire();
+    let retire_while_installing = async {
+        assert!(matches!(
+            read(&mut peer).await,
+            Req::ComposeInstallRoutes { private: true, .. }
+        ));
+        route_watch.cancel();
+    };
+    let (retired, ()) = tokio::join!(
+        sessions.install_private_routes(target.vm, &routes, || true),
+        retire_while_installing,
+    );
+    assert!(retired.is_err());
     assert!(
         sessions
-            .lifecycle
-            .install_private_routes(&db, target.vm, &origin, &routes)
+            .install_private_routes(target.vm, &routes, || true)
             .await
             .is_err()
     );

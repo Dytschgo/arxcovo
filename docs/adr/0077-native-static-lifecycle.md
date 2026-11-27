@@ -12,7 +12,7 @@ Production boot selects stock QEMU for restricted web origin or the enrolled pat
 
 Boot settlement holds process and media custody through the transaction. The route watch retires the associated origin and serial sessions on notification or a failed continuity check. Checked stop retires the origin first, then requests QMP powerdown and confirms process and media release. Inconclusive release enters recovery without deleting or rewriting the committed pair.
 
-Part B2i wires private routes with publishing off and opt-in Cloudflare activation and cleanup. It controls lifting the foreground static admission fence.
+Part B2i wires private routes, opt-in Cloudflare publication and the live foreground admission checks. See [ADR 0078](0078-watched-static-routing-and-publication.md).
 
 ## Verification
 

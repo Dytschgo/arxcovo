@@ -1900,6 +1900,13 @@ impl TestVms {
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn take_static_private_routes(
+        &mut self,
+    ) -> Option<crate::vm::compose::PrivateRoutes> {
+        self.static_compose.as_mut()?.private_routes.take()
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn take_static_backup_targets(
         &mut self,
     ) -> Vec<crate::vm::compose_backup::TargetEnrollment> {

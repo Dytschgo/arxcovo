@@ -807,6 +807,10 @@ impl Disk {
 struct MemoryStore(Arc<Mutex<Disk>>);
 
 impl ComposeStore for MemoryStore {
+    fn install_routes(&mut self, _: &super::routing::RoutingTable) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     fn load_state(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
         let mut disk = self.0.lock().unwrap();
         Ok(disk
@@ -1646,6 +1650,56 @@ fn staging_enforces_order_size_digest_and_session_reset() {
             rule: Some(ManifestRule::Malformed),
         }
     );
+}
+
+#[test]
+fn private_routes_reserve_an_undeployed_project_slot_and_validate_its_release() {
+    let h = Harness::new();
+    h.hello();
+    let request = |private| ComposeRequest::ComposeInstallRoutes {
+        id: 10,
+        generation: GENERATION,
+        readiness_host: "arx-boot.invalid".into(),
+        zone: "example.invalid".into(),
+        routes: vec![super::routing::RouteTarget {
+            hostname: "site.example.invalid".into(),
+            project_id: PROJECT.into(),
+            service: "web".into(),
+            project_slot: 3,
+            service_index: 0,
+            route_slot: 0,
+        }],
+        private,
+    };
+    assert!(matches!(
+        h.svc.handle(request(false)),
+        ComposeResponse::ComposeRejected {
+            code: RejectCode::UnknownProject,
+            ..
+        }
+    ));
+    assert!(matches!(
+        h.svc.handle(request(true)),
+        ComposeResponse::ComposeRoutesInstalled { .. }
+    ));
+    let mismatch = h.stage(&bytes(&plain(PROJECT, &[])));
+    assert!(matches!(
+        h.svc.handle(ComposeRequest::ComposeDeploy {
+            id: 11,
+            operation_id: op(1),
+            project_id: PROJECT.into(),
+            revision: 1,
+            digest: mismatch,
+        }),
+        ComposeResponse::ComposeRejected {
+            code: RejectCode::ProjectMismatch,
+            ..
+        }
+    ));
+    h.deployed();
+    let disk = h.disk.lock().unwrap();
+    let state: Value = serde_json::from_slice(disk.state.as_ref().unwrap()).unwrap();
+    assert_eq!(state["projects"][PROJECT]["slot"], 3);
 }
 
 #[test]

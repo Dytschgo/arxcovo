@@ -113,6 +113,8 @@ pub enum ComposeRequest {
         readiness_host: String,
         zone: String,
         routes: Vec<super::routing::RouteTarget>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        private: bool,
     },
     /// Private, non-logging secret delivery bound to an exact release digest.
     /// `data` is Base64 and is wiped when the request is dropped.
@@ -187,6 +189,7 @@ impl<'de> Deserialize<'de> for ComposeRequest {
             ReadinessHost,
             Zone,
             Routes,
+            Private,
             Volume,
             Database,
             MaxBytes,
@@ -223,6 +226,7 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                 let mut readiness_host = None;
                 let mut zone = None;
                 let mut routes = None;
+                let mut private = None;
                 let mut epoch: Option<u64> = None;
                 let mut volume: Option<String> = None;
                 let mut database: Option<String> = None;
@@ -260,6 +264,7 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                         Field::ReadinessHost => set_once!(readiness_host, "readiness_host"),
                         Field::Zone => set_once!(zone, "zone"),
                         Field::Routes => set_once!(routes, "routes"),
+                        Field::Private => set_once!(private, "private"),
                         Field::Epoch => set_once!(epoch, "epoch"),
                         Field::Volume => set_once!(volume, "volume"),
                         Field::Database => set_once!(database, "database"),
@@ -284,6 +289,7 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                         readiness_host: take!(readiness_host, "readiness_host"),
                         zone: take!(zone, "zone"),
                         routes: take!(routes, "routes"),
+                        private: private.take().unwrap_or(false),
                     },
                     "ComposeHello" => ComposeRequest::ComposeHello {
                         version: take!(version, "version"),
@@ -402,6 +408,7 @@ impl<'de> Deserialize<'de> for ComposeRequest {
                     || readiness_host.is_some()
                     || zone.is_some()
                     || routes.is_some()
+                    || private.is_some()
                     || epoch.is_some()
                     || volume.is_some()
                     || database.is_some()
@@ -786,6 +793,7 @@ impl Message for ComposeRequest {
                 readiness_host,
                 zone,
                 routes,
+                ..
             } => {
                 validate_id(*id)?;
                 field(
