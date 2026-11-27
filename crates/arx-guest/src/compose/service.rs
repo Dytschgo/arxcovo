@@ -392,6 +392,7 @@ struct Inner {
     staged: VecDeque<Staged>,
     running: Option<String>,
     generation: Option<u64>,
+    private_routes: Vec<super::routing::RouteTarget>,
     /// Set when a terminal or budget persistence call fails with an uncertain
     /// on-disk outcome; freezes dependent mutations until a durable checkpoint
     /// succeeds.
@@ -408,6 +409,13 @@ struct Shared {
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn route_service_matches(route: &super::routing::RouteTarget, manifest: &ProjectManifest) -> bool {
+    manifest
+        .services
+        .get(usize::from(route.service_index))
+        .is_some_and(|service| service.name == route.service && service.http_port.is_some())
 }
 
 fn reject(id: u32, code: RejectCode) -> ComposeResponse {
@@ -685,6 +693,7 @@ impl ComposeService {
                     staged: VecDeque::new(),
                     running: None,
                     generation: None,
+                    private_routes: Vec::new(),
                     store_uncertain,
                 }),
                 idle: Condvar::new(),
@@ -773,8 +782,9 @@ impl ComposeService {
                 readiness_host,
                 zone,
                 routes,
+                private,
             } => {
-                let inner = lock(&self.shared.inner);
+                let mut inner = lock(&self.shared.inner);
                 if inner.generation != Some(generation) {
                     return reject(id, RejectCode::GenerationMismatch);
                 }
@@ -782,8 +792,8 @@ impl ComposeService {
                     return reject(id, RejectCode::Busy);
                 }
                 let Ok(table) = super::routing::RoutingTable::new(
-                    readiness_host,
-                    Some(zone),
+                    &readiness_host,
+                    Some(zone.clone()),
                     super::routing::SLIRP_FORWARD_PEER,
                     routes,
                 ) else {
@@ -791,26 +801,52 @@ impl ComposeService {
                 };
                 for route in table.routes() {
                     let Some(project) = inner.state.projects.get(&route.project_id) else {
+                        if private
+                            && inner
+                                .state
+                                .projects
+                                .values()
+                                .all(|p| p.slot != route.project_slot)
+                        {
+                            continue;
+                        }
                         return reject(id, RejectCode::UnknownProject);
                     };
-                    let service = project.committed.as_ref().and_then(|revision| {
-                        revision
-                            .manifest
-                            .services
-                            .get(usize::from(route.service_index))
-                    });
+                    // Private routing is installed before the session can
+                    // recover persisted operations. Public ingress requires a
+                    // settled, started project.
+                    let public_unready = !private
+                        && (project.recovery_required
+                            || project.pending.is_some()
+                            || project.desired != Desired::Started);
                     if project.slot != route.project_slot
-                        || project.recovery_required
-                        || project.pending.is_some()
-                        || project.desired != Desired::Started
-                        || !service
-                            .is_some_and(|s| s.name == route.service && s.http_port.is_some())
+                        || public_unready
+                        || !project.committed.as_ref().map_or(private, |revision| {
+                            route_service_matches(route, &revision.manifest)
+                        })
                     {
                         return reject(id, RejectCode::ProjectMismatch);
                     }
                 }
-                if lock(&self.shared.store).install_routes(&table).is_err() {
+                let mut bindings = table.routes().to_vec();
+                if !private {
+                    bindings.extend(inner.private_routes.iter().cloned());
+                    bindings.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+                    bindings.dedup();
+                }
+                let Ok(active) = super::routing::RoutingTable::new(
+                    readiness_host,
+                    Some(zone),
+                    super::routing::SLIRP_FORWARD_PEER,
+                    bindings.clone(),
+                ) else {
+                    return reject(id, RejectCode::ProjectMismatch);
+                };
+                if lock(&self.shared.store).install_routes(&active).is_err() {
                     return reject(id, RejectCode::StoreFailure);
+                }
+                if private {
+                    inner.private_routes = bindings;
                 }
                 ComposeResponse::ComposeRoutesInstalled { id, generation }
             }
@@ -1078,12 +1114,32 @@ impl ComposeService {
                     return reject(id, RejectCode::ProjectLimit);
                 }
                 let used: Vec<u8> = inner.state.projects.values().map(|r| r.slot).collect();
-                let slot = (0..MAX_PROJECTS as u8)
-                    .find(|slot| !used.contains(slot))
-                    .expect("fewer than eight projects leave a slot");
+                let slot = inner
+                    .private_routes
+                    .iter()
+                    .find(|route| route.project_id == project_id)
+                    .map(|route| route.project_slot)
+                    .or_else(|| {
+                        (0..MAX_PROJECTS as u8).find(|slot| {
+                            !used.contains(slot)
+                                && inner
+                                    .private_routes
+                                    .iter()
+                                    .all(|route| route.project_slot != *slot)
+                        })
+                    });
+                let Some(slot) = slot.filter(|slot| !used.contains(slot)) else {
+                    return reject(id, RejectCode::ProjectLimit);
+                };
                 (slot, None)
             }
         };
+        if inner.private_routes.iter().any(|route| {
+            route.project_id == project_id
+                && (route.project_slot != slot || !route_service_matches(route, project.manifest()))
+        }) {
+            return reject(id, RejectCode::ProjectMismatch);
+        }
         if let Some(code) = check_volumes(&inner.state, &project) {
             return reject(id, code);
         }

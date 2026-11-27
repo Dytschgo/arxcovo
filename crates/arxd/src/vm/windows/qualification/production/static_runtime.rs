@@ -55,6 +55,11 @@ pub(crate) struct StaticMachine<'a> {
 type Pair = (PairSlots, [ArtifactEvidence; 2]);
 
 impl StaticMachine<'_> {
+    pub(crate) fn require_current(&self) -> Result<(), NativeRefusal> {
+        self.m4.fresh().map_err(NativeRefusal::from)?;
+        self.dossier.require_current()
+    }
+
     pub(crate) fn live(&self) -> Result<(Instant, crate::vm::HostObservation), NativeRefusal> {
         self.dossier.require_current()?;
         self.m4.observe_host(TEST_JOB_MEMORY)
@@ -933,13 +938,13 @@ impl StaticBoot<'_> {
 
     pub(crate) async fn stop(
         mut self,
-        settle: impl FnOnce(StopDisposition) -> anyhow::Result<()>,
+        settle: impl AsyncFnOnce(StopDisposition) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let (disposition, _held) = self
             .core
             .stop_held(Some(self.qmp), &Shutdown::default(), || true)
             .await;
-        settle(disposition)
+        settle(disposition).await
     }
 }
 

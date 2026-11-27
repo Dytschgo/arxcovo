@@ -330,6 +330,8 @@ pub(crate) struct Supervisor {
     selected_static: Option<Result<selected_static::SelectedStatic, NativeRefusal>>,
     #[cfg(all(windows, target_arch = "x86_64"))]
     static_runs: owned_worker::Registry<Arc<selected_static::Run>>,
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    static_private_routes: Option<compose::PrivateRoutes>,
     native_refusal: NativeRefusal,
     /// The runtime profile also serves the independent legacy candidate.
     runtime: Option<VmRuntimeProfile>,
@@ -486,6 +488,10 @@ impl Supervisor {
                 )?;
             }
         }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            state.static_private_routes = profile.take_static_private_routes();
+        }
         state.custody = Some(custody);
         let gate = state
             .gate
@@ -550,6 +556,8 @@ impl Supervisor {
             selected_static: None,
             #[cfg(all(windows, target_arch = "x86_64"))]
             static_runs: Default::default(),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            static_private_routes: None,
             native_refusal,
             runtime,
             publisher: Publication::default(),
@@ -952,13 +960,28 @@ impl Supervisor {
         Ok(())
     }
 
+    fn publication_origin(&self, gate: &Gate, vm: Id) -> Outcome<Option<Origin>> {
+        #[cfg(test)]
+        if let Some(fixture) = &gate.fixture {
+            return Ok(fixture.publish_origin(vm));
+        }
+        let _ = gate;
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        if self.selected_static.is_some() {
+            return self
+                .static_runs
+                .with_entry(vm, |run| run.and_then(|run| run.origin().cloned()));
+        }
+        Ok(self.candidate().publication_origin(vm))
+    }
+
     fn static_selection(&self) -> Option<&selected_static::SelectedStatic> {
         self.selected_static.as_ref()?.as_ref().ok()
     }
 
     fn static_refusal(&self) -> Option<NativeRefusal> {
         match self.selected_static.as_ref()? {
-            Ok(selected) => selected.refusal(),
+            Ok(selected) => selected.refusal(self),
             Err(reason) => Some(*reason),
         }
     }
@@ -1755,6 +1778,9 @@ impl VmInventory {
 
     fn mutate(&self, gate: &mut Gate, action: i64, request: Mutation) -> Outcome<Value> {
         let controller = &self.supervisor.controller;
+        if action == PUBLISH_ACTION && !gate.allow_agent_public_sites {
+            return self.refuse(action, request.vm(), Refusal::PublicSitesDisabled.into());
+        }
         let recipe = hex::encode(request.id);
         let configured = self
             .supervisor
@@ -2000,9 +2026,6 @@ impl VmInventory {
         let publish = action == PUBLISH_ACTION;
         let supervisor = &self.supervisor;
         let controller = &supervisor.controller;
-        if publish && !gate.allow_agent_public_sites {
-            return refuse(Refusal::PublicSitesDisabled);
-        }
         let mut owned = controller.foreground_static_rows(&self.principal, Some(vm), None, 1)?;
         let Some(row) = owned.pop() else {
             return refuse(Refusal::NotFound);
@@ -2042,33 +2065,39 @@ impl VmInventory {
             if row.state != StaticState::Running {
                 return refuse(Refusal::NotReady);
             }
-            let origin: Option<Origin> = supervisor.candidate().publication_origin(vm);
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            let origin = supervisor
-                .static_runs
-                .with_entry(vm, |run| run.and_then(|run| run.origin().cloned()))
-                .ok()
-                .flatten()
-                .or(origin);
-            #[cfg(test)]
-            let origin = gate
-                .fixture
-                .as_ref()
-                .and_then(|fixture| fixture.publish_origin(vm))
-                .or(origin);
-            let Some(origin) = origin else {
+            let Some(origin) = supervisor.publication_origin(gate, vm)? else {
                 return refuse(Refusal::NotReady);
             };
-            let credentials = supervisor
-                .publisher
-                .prepare(profile, supervisor.compose.session(vm));
+            if origin.retired.is_retired() {
+                return refuse(Refusal::NotReady);
+            }
+            if !profile.has_routes()
+                && supervisor.static_selection().is_some_and(|selection| {
+                    selection.recipe().recipe_sha256 == row.provenance.recipe_digest
+                })
+            {
+                return refuse(Refusal::PublishTargetMismatch);
+            }
+            let intent = profile.intent(vm, &origin)?;
+            let session = supervisor.compose.session(vm);
+            let credentials = supervisor.publisher.prepare(profile, session, &origin);
             let credentials = match credentials {
                 Ok(credentials) => credentials,
+                // A restart can lose the routed session while DNS ownership
+                // is still pending. Preserve the durable cleanup refusal.
+                Err(Refusal::NotReady) if controller.publication_intent()?.is_some() => {
+                    return refuse(Refusal::PublishCleanupPending);
+                }
                 Err(reason) => return refuse(reason),
             };
-            Some((profile.intent(vm, &origin)?, credentials, origin))
+            Some((intent, credentials, origin))
         } else {
             None
+        };
+        let cleanup_origin = if publish {
+            None
+        } else {
+            supervisor.publication_origin(gate, vm)?
         };
         let publisher = &supervisor.publisher;
         // Registered before the admission transaction, so an owner unpublish
@@ -2142,7 +2171,13 @@ impl VmInventory {
                 _ => {
                     supervisor
                         .publisher
-                        .unpublish(&supervisor.controller, operation, vm, &supervisor.cancel)
+                        .unpublish(
+                            &supervisor.controller,
+                            operation,
+                            vm,
+                            cleanup_origin.as_ref(),
+                            &supervisor.cancel,
+                        )
                         .await
                 }
             }
@@ -2309,6 +2344,8 @@ impl VmInventory {
                     let buildable =
                         if self.supervisor.recipes[3].is_some_and(|(id, _)| id == entry.id) {
                             static_available
+                        } else if entry.id == WEB_RECIPE_ID && static_available {
+                            true
                         } else {
                             available
                                 && (entry.id != WEB_RECIPE_ID || !static_blocked)
@@ -4519,6 +4556,17 @@ pub(crate) mod tests {
             }
         }
 
+        fn watch_publication_origin(&self, vm: Id) -> (Origin, Shutdown) {
+            let mut live = self.live.lock().unwrap();
+            let Some(Slot::Idle(boot)) = live.boots.get_mut(&vm) else {
+                panic!("expected settled static boot");
+            };
+            let origin = boot.publish_origin.as_mut().unwrap();
+            let watch = Shutdown::default();
+            origin.retired = crate::vm::runtime::publication::Retirement::on_route(watch.clone());
+            (origin.clone(), watch)
+        }
+
         pub(super) fn web_ready(&self, vm: Id) -> bool {
             let live = self.live.lock().unwrap();
             match live.boots.get(&vm) {
@@ -5157,9 +5205,13 @@ pub(crate) mod tests {
                         .or_else(|| registry.instances.get(&vm).copied());
                     let supervisor = inventory.supervisor.clone();
                     let controller = controller.clone();
+                    let selected_static = self.static_compose;
                     self.jobs.spawn(async move {
                         let _working = working;
                         let local = supervisor.publisher.stop_local(Some(vm)).await;
+                        if selected_static {
+                            supervisor.publisher.retire_boot(&controller, vm).await?;
+                        }
                         if dirty && let Some(boot) = boot {
                             boot.release().await?;
                             if local {
@@ -16091,11 +16143,13 @@ pub(crate) mod tests {
                     readiness_host,
                     zone,
                     routes,
+                    private,
                 } = serde_json::from_slice(&payload).unwrap()
                 else {
                     panic!("expected install")
                 };
                 assert_eq!(boot, generation);
+                assert!(!private);
                 assert!(!witness.local.load(SeqCst));
                 let names: Vec<_> = routes.iter().map(|route| route.hostname.clone()).collect();
                 assert!(witness.preflight_order.lock().unwrap().ends_with(&names));
@@ -16133,6 +16187,114 @@ pub(crate) mod tests {
             .unwrap();
         enroll(h, &fake, policy, profile);
         (vm_id, fake)
+    }
+
+    #[tokio::test]
+    async fn publication_route_watch_fences_activation_cleanup_and_restart() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.static_compose = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let (vm, fake) = enrolled(&h, &a, 4500).await;
+        let id = parse_id(vm.as_str().unwrap()).unwrap();
+        let args = |n| json!({"vm_id":vm,"request_id":key(n)});
+        let supervisor = h.supervisor();
+        let watched = || {
+            supervisor
+                .lock()
+                .unwrap()
+                .fixture
+                .as_ref()
+                .unwrap()
+                .watch_publication_origin(id)
+        };
+        let (first, watch) = watched();
+        let (hold, at_start, _release) = gate();
+        *fake.start_gate.lock().unwrap() = Some(hold);
+        let publish = call(&a, "publish_site", args(4503)).await;
+        entered(at_start).await;
+        watch.cancel();
+        assert_eq!(terminal(&a, &publish).await["state"], "failed");
+        assert_eq!(fake.posts.load(SeqCst), 0);
+        assert!(!fake.local.load(SeqCst));
+        assert!(
+            supervisor
+                .controller
+                .publication_intent()
+                .unwrap()
+                .is_none()
+        );
+
+        let stop = call(&a, "vm_stop", args(4504)).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let start = call(&a, "vm_start", args(4505)).await;
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
+        let (next, watch) = watched();
+        assert_ne!(first.boot, next.boot);
+        assert_eq!(first.generation, next.generation);
+        assert_eq!(fake.starts.load(SeqCst), 1);
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        let publish = call(&a, "publish_site", args(4506)).await;
+        assert_eq!(terminal(&a, &publish).await["state"], "succeeded");
+
+        let (hold, at_remove, _release) = gate();
+        *fake.remove_gate.lock().unwrap() = Some(hold);
+        let remove = call(&a, "unpublish_site", args(4507)).await;
+        entered(at_remove).await;
+        watch.cancel();
+        assert_ne!(terminal(&a, &remove).await["state"], "succeeded");
+        assert!(!fake.local.load(SeqCst));
+        assert!(fake.record.load(SeqCst));
+        assert_eq!(phase(&a, &vm).await["phase"], "cleanup_pending");
+        h.tick().await;
+        until(|| {
+            supervisor
+                .controller
+                .publication_intent()
+                .unwrap()
+                .is_none()
+        })
+        .await;
+        assert_eq!(fake.deletes.load(SeqCst), 1);
+
+        let stop = call(&a, "vm_stop", args(4508)).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        let start = call(&a, "vm_start", args(4509)).await;
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
+        let (third, _) = watched();
+        let publish = call(&a, "publish_site", args(4510)).await;
+        assert_eq!(terminal(&a, &publish).await["state"], "succeeded");
+        let stop = call(&a, "vm_stop", args(4511)).await;
+        assert_eq!(terminal(&a, &stop).await["state"], "succeeded");
+        assert!(!fake.local.load(SeqCst));
+        assert!(
+            supervisor
+                .controller
+                .publication_intent()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fake.deletes.load(SeqCst), 2);
+        let start = call(&a, "vm_start", args(4512)).await;
+        assert_eq!(
+            terminal_static_start(&a, &start).await["state"],
+            "succeeded"
+        );
+        let (fourth, _) = watched();
+        assert_ne!(third.boot, fourth.boot);
+        assert_eq!(phase(&a, &vm).await["phase"], "unpublished");
+        assert_eq!(fake.starts.load(SeqCst), 3);
+        drop(a);
+        h.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -16183,6 +16345,7 @@ pub(crate) mod tests {
         assert_eq!(refused["reason"], "public_sites_disabled", "{refused}");
         assert_eq!(fake.starts.load(SeqCst), 0);
         assert_eq!(fake.posts.load(SeqCst), 0);
+        assert_eq!(fake.credential_reads.load(SeqCst), 0);
         assert!(fake.preflight_order.lock().unwrap().is_empty());
 
         assert!(

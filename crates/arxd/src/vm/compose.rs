@@ -329,6 +329,34 @@ impl PreparedStaticSessions {
         })
     }
 
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    pub(crate) async fn install_private_routes(
+        &self,
+        vm: Id,
+        routes: &PrivateRoutes,
+        current: impl Fn() -> bool,
+    ) -> Result<()> {
+        let origin = &self.origin;
+        let identity =
+            super::static_web::StaticOriginIdentity::for_generation(origin.origin_generation);
+        ensure!(
+            routes.applies_to(vm) && self.lifecycle.matches_origin(origin),
+            "route session boot mismatch"
+        );
+        let provisioning = identity.provisioning();
+        tokio::select! {
+            biased;
+            () = origin.retired.cancelled() => anyhow::bail!("static route retired"),
+            result = self.lifecycle.apply_routes(
+                provisioning.server_name(),
+                routes,
+                true,
+                origin.retired.token(),
+                || Ok(current() && !origin.retired.is_retired()),
+            ) => result,
+        }
+    }
+
     /// Publish both views of the same pipe after the ledger settles. Registry
     /// readers cannot observe either session before its boot is committed.
     #[allow(dead_code, reason = "native static boot owner is pending")]
@@ -372,6 +400,11 @@ pub(crate) struct PrivateRoutes {
 }
 
 impl PrivateRoutes {
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    pub(crate) fn applies_to(&self, vm: Id) -> bool {
+        self.vm == vm
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         arx_guest::compose::routing::validate_routes(Some(&self.zone), &self.routes)
             .map_err(|_| anyhow::anyhow!("invalid private Compose route bindings"))
@@ -393,6 +426,10 @@ impl Session {
             origin_boot: Some(origin.boot),
             ..Self::new(origin.generation, channel)
         }
+    }
+
+    pub(crate) fn matches_origin(&self, origin: &super::runtime::publication::Origin) -> bool {
+        self.generation == origin.generation && self.origin_boot == Some(origin.boot)
     }
 
     pub(crate) async fn install_routes(
@@ -418,50 +455,24 @@ impl Session {
                 Ok(slot.target(&host.hostname))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.apply_routes(
-            db,
-            readiness.as_str(),
-            &PrivateRoutes {
-                vm: intent.vm,
-                zone: zone.as_str().into(),
-                routes,
-            },
-            cancel,
-        )
-        .await
-    }
-
-    pub(crate) async fn install_private_routes(
-        &self,
-        db: &crate::store::vm::VmStore,
-        vm: Id,
-        origin: &super::runtime::publication::Origin,
-        routes: &PrivateRoutes,
-    ) -> Result<()> {
-        ensure!(
-            vm == routes.vm
-                && self.generation == origin.generation
-                && self.origin_boot == Some(origin.boot)
-                && !origin.retired.is_retired(),
-            "route session boot mismatch"
-        );
-        let identity =
-            super::static_web::StaticOriginIdentity::for_generation(origin.origin_generation);
-        self.apply_routes(
-            db,
-            identity.provisioning().server_name(),
+        let bindings = PrivateRoutes {
+            vm: intent.vm,
+            zone: zone.as_str().into(),
             routes,
-            origin.retired.token(),
-        )
+        };
+        self.apply_routes(readiness.as_str(), &bindings, false, cancel, || {
+            db.transact(|tx| store::live_boot(tx, bindings.vm, self.generation, self.wire_boot))
+        })
         .await
     }
 
     async fn apply_routes(
         &self,
-        db: &crate::store::vm::VmStore,
         readiness: &str,
         routes: &PrivateRoutes,
+        private: bool,
         cancel: &Shutdown,
+        live: impl Fn() -> Result<bool>,
     ) -> Result<()> {
         arx_guest::compose::routing::RoutingTable::new(
             readiness,
@@ -474,8 +485,6 @@ impl Session {
             .channel
             .try_lock()
             .map_err(|_| anyhow::anyhow!("guest channel busy"))?;
-        let live =
-            || db.transact(|tx| store::live_boot(tx, routes.vm, self.generation, self.wire_boot));
         ensure!(live()? && !cancel.is_cancelled(), "route session retired");
         let ack = channel
             .exchange(cancel, |id| Req::ComposeInstallRoutes {
@@ -484,6 +493,7 @@ impl Session {
                 readiness_host: readiness.into(),
                 zone: routes.zone.clone(),
                 routes: routes.routes.clone(),
+                private,
             })
             .await?;
         ensure!(

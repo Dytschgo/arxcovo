@@ -29,9 +29,7 @@ pub(in crate::mcp::vm) struct Run {
 
 impl Run {
     pub(in crate::mcp::vm) fn origin(&self) -> Option<&Origin> {
-        self.origin
-            .get()
-            .filter(|origin| !origin.retired.is_retired())
+        self.origin.get()
     }
 }
 
@@ -42,6 +40,31 @@ impl SelectedStatic {
             #[cfg(test)]
             Source::Fixture(_) => None,
         }
+    }
+
+    pub(in crate::mcp::vm) fn runtime_current(
+        dossier: &StaticDossier,
+        supervisor: &Supervisor,
+    ) -> Result<(), NativeRefusal> {
+        if dossier.retirement().is_cancelled() {
+            return Err(NativeRefusal::NetworkFenceUnverified);
+        }
+        let m4 = supervisor
+            .selected_test
+            .as_ref()
+            .ok_or(NativeRefusal::QualificationMissing)?;
+        supervisor
+            .custody
+            .as_ref()
+            .ok_or(NativeRefusal::PathCustodyUnverified)?
+            .verify()
+            .map_err(|_| NativeRefusal::PathCustodyUnverified)?;
+        StaticMachine {
+            m4: m4.native_source(),
+            dossier,
+            cancel: &supervisor.cancel,
+        }
+        .require_current()
     }
 
     pub(in crate::mcp::vm) fn native_web_digest(&self) -> Option<Hash> {
@@ -240,6 +263,14 @@ impl SelectedStatic {
                         row.provenance.recipe_digest == recipe.identity(dossier).recipe_sha256
                     })
                     .ok_or(unavailable(NativeRefusal::QualificationMissing))?;
+                if recipe != StaticRecipe::Compose
+                    && supervisor
+                        .static_private_routes
+                        .as_ref()
+                        .is_some_and(|routes| routes.applies_to(id))
+                {
+                    return refuse(Refusal::RecipeUnqualified.into());
+                }
                 let (stop, stops) = mpsc::unbounded_channel();
                 let run = Arc::new(Run {
                     stop,
@@ -383,6 +414,10 @@ async fn run_static(
         !supervisor.cancel.is_cancelled()
             && !route.is_cancelled()
             && machine.dossier.require_current().is_ok()
+            && supervisor
+                .custody
+                .as_ref()
+                .is_some_and(|custody| custody.verify().is_ok())
             && boot.current()
     };
     // Keep the attributed transport open for the web guest as well. EOF
@@ -397,6 +432,20 @@ async fn run_static(
                 () = supervisor.cancel.cancelled() => anyhow::bail!("static boot cancelled"),
                 sessions = tokio::time::timeout_at(worker.deadline().into(), compose::PreparedStaticSessions::negotiate(pipe, &origin, started.wire_boot)) => sessions??,
             };
+            if let Some(routes) = supervisor
+                .static_private_routes
+                .as_ref()
+                .filter(|routes| routes.applies_to(vm))
+            {
+                tokio::select! {
+                    biased;
+                    () = supervisor.cancel.cancelled() => anyhow::bail!("static boot cancelled"),
+                    installed = tokio::time::timeout_at(
+                        worker.deadline().into(),
+                        sessions.install_private_routes(vm, routes, current),
+                    ) => installed??,
+                }
+            }
             let channel = sessions.activate(controller, worker, &supervisor.compose, &supervisor.compose_backup, vm, current)?;
             Ok(Some(channel))
         } else {
@@ -409,7 +458,7 @@ async fn run_static(
         Err(_) => {
             origin.retired.retire();
             return boot
-                .stop(|_| {
+                .stop(async |_| {
                     controller
                         .finish(worker, Completion::CleanupUnconfirmed)
                         .map(|_| ())
@@ -435,10 +484,29 @@ async fn run_static(
         }
     };
     origin.retired.retire();
+    // Quiesce public ingress before releasing the guest. Reconcile the
+    // retired publication under the effects slot before a new boot can start.
+    let ingress_stopped = supervisor.publisher.stop_local(Some(vm)).await;
     stops.close();
     let stop = stop.or_else(|| stops.try_recv().ok());
-    boot.stop(|disposition| settle_static_stop(controller, vm, stop.as_ref(), disposition))
-        .await
+    boot.stop(async |disposition| {
+        // After guest release, clear verified DNS ownership before settling
+        // an explicit stop when possible.
+        if let Some(stop) = &stop {
+            let _ = tokio::time::timeout_at(
+                stop.deadline().into(),
+                supervisor.publisher.retire_boot(controller, vm),
+            )
+            .await;
+        }
+        let disposition = if ingress_stopped {
+            disposition
+        } else {
+            StopDisposition::ChargedQuarantine
+        };
+        settle_static_stop(controller, vm, stop.as_ref(), disposition)
+    })
+    .await
 }
 
 fn settle_static_stop(

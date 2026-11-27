@@ -792,6 +792,10 @@ pub(crate) mod publication {
             Ok(())
         }
 
+        pub(crate) fn has_routes(&self) -> bool {
+            !self.routes.is_empty()
+        }
+
         pub(crate) fn target(&self, host: Id, name: &StaticName) -> bool {
             self.host_id == hex::encode(host) && self.static_name == name.as_str()
         }
@@ -914,7 +918,7 @@ pub(crate) mod publication {
     }
 
     impl Retirement {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(any(test, all(windows, target_arch = "x86_64")))]
         pub(crate) fn on_route(route: Shutdown) -> Self {
             Self {
                 route: Some(route),
@@ -933,6 +937,21 @@ pub(crate) mod publication {
 
         pub(crate) fn token(&self) -> &Shutdown {
             &self.token
+        }
+
+        async fn route_cancelled(&self) {
+            match &self.route {
+                Some(route) => route.cancelled().await,
+                None => std::future::pending().await,
+            }
+        }
+
+        pub(crate) async fn cancelled(&self) {
+            tokio::select! {
+                biased;
+                () = self.route_cancelled() => {}
+                () = self.token.cancelled() => {}
+            }
         }
 
         fn fence(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -955,7 +974,7 @@ pub(crate) mod publication {
     }
 
     struct GuestRoutes {
-        session: Option<Arc<crate::vm::compose::Session>>,
+        session: Arc<crate::vm::compose::Session>,
         zone: Hostname,
     }
 
@@ -1284,6 +1303,7 @@ pub(crate) mod publication {
                     // As the native start, revocation or shutdown aborts it.
                     tokio::select! {
                         biased;
+                        _ = origin.retired.cancelled() => return Err(Failure::OriginUnavailable),
                         _ = shutdown.cancelled() => return Err(Failure::OriginUnavailable),
                         held = hold(&fake.start_gate) => held.map_err(|_| Failure::ConnectorFailed)?,
                     }
@@ -1588,16 +1608,18 @@ pub(crate) mod publication {
     struct Linked(Shutdown, tokio::task::AbortHandle);
 
     impl Linked {
-        fn new(first: &Shutdown, second: &Shutdown) -> Self {
+        fn new(first: &Shutdown, second: &Shutdown, retired: &Retirement) -> Self {
             let token = Shutdown::default();
-            if first.is_cancelled() || second.is_cancelled() {
+            if first.is_cancelled() || second.is_cancelled() || retired.is_retired() {
                 token.cancel();
             }
             let (first, second, linked) = (first.clone(), second.clone(), token.clone());
+            let retired = retired.clone();
             let task = tokio::spawn(async move {
                 tokio::select! {
                     _ = first.cancelled() => {}
                     _ = second.cancelled() => {}
+                    _ = retired.cancelled() => {}
                 }
                 linked.cancel();
             });
@@ -1725,10 +1747,17 @@ pub(crate) mod publication {
             &self,
             profile: &Arc<Profile>,
             session: Option<Arc<crate::vm::compose::Session>>,
+            origin: &Origin,
         ) -> Result<Prepared, Refusal> {
+            if !origin.current() {
+                return Err(Refusal::NotReady);
+            }
             let routes = if profile.routes.is_empty() {
                 None
             } else {
+                let session = session
+                    .filter(|session| session.matches_origin(origin))
+                    .ok_or(Refusal::NotReady)?;
                 Some(GuestRoutes {
                     session,
                     zone: profile.zone_name.clone().ok_or(Refusal::Invalid)?,
@@ -1737,6 +1766,7 @@ pub(crate) mod publication {
             #[cfg(test)]
             if let Some(fake) = self.fake.lock().unwrap().as_ref() {
                 use std::sync::atomic::Ordering;
+                fake.credential_reads.fetch_add(1, Ordering::SeqCst);
                 if !fake.credential.load(Ordering::SeqCst) {
                     return Err(Refusal::PublishCredentialMissing);
                 }
@@ -2087,7 +2117,12 @@ pub(crate) mod publication {
                         && !shutdown.is_cancelled()
                 })
                 .ok_or(Failure::OriginUnavailable)?;
-            live.connector.ready(intent.phase != Phase::Published).await
+            tokio::select! {
+                biased;
+                () = live.origin.retired.cancelled() => Err(Failure::OriginUnavailable),
+                () = shutdown.cancelled() => Err(Failure::Cancelled),
+                result = live.connector.ready(intent.phase != Phase::Published) => result,
+            }
         }
 
         #[allow(clippy::too_many_arguments)] // Explicit admission evidence and both cancellations.
@@ -2160,6 +2195,7 @@ pub(crate) mod publication {
                             Some(reason),
                             Evidence::Unknown,
                             bound,
+                            Some(&origin),
                         )
                         .await?;
                         return Ok(());
@@ -2184,6 +2220,7 @@ pub(crate) mod publication {
                     Some(failure),
                     evidence,
                     Some(shutdown),
+                    Some(&origin),
                 )
                 .await?;
             let clean = cleanup == Cleanup::Released && !residue;
@@ -2231,7 +2268,7 @@ pub(crate) mod publication {
                 tokio::select! {
                     biased;
                     _ = revoked.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
-                    _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                    _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
                     _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
                     result = prepared.dns.preflight(route) => result.map_err(map)?,
                 }
@@ -2241,20 +2278,19 @@ pub(crate) mod publication {
                 if local.is_some() {
                     return Err((Failure::CleanupUnconfirmed, Evidence::Unknown));
                 }
-                let stop = Linked::new(revoked, shutdown);
+                let stop = Linked::new(revoked, shutdown, &origin.retired);
                 if let Some(routes) = prepared.routes {
-                    let unavailable = (Failure::OriginUnavailable, Evidence::Unknown);
-                    let session = routes.session.ok_or(unavailable)?;
-                    let install = session.install_routes(
+                    let readiness = origin.name().map_err(|e| (e, Evidence::Unknown))?;
+                    let install = routes.session.install_routes(
                         controller.compose_store(),
                         intent,
-                        origin.name().map_err(|e| (e, Evidence::Unknown))?,
+                        readiness,
                         routes.zone,
                         &stop.0,
                     );
                     tokio::select! {
                         biased;
-                        _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                        _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
                         _ = stop.0.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
                         result = install => result.map_err(|_| (Failure::OriginUnavailable,Evidence::Unknown))?,
                     }
@@ -2346,7 +2382,7 @@ pub(crate) mod publication {
                 let submission = Submission::with(&permit);
                 let id = tokio::select! {
                     biased;
-                    _ = origin.retired.token().cancelled() => Err(None),
+                    _ = origin.retired.cancelled() => Err(None),
                     _ = shutdown.cancelled() => Err(None),
                     // Owner revocation abandons the POST only while it is unsent.
                     _ = async {
@@ -2408,7 +2444,7 @@ pub(crate) mod publication {
                 }
                 tokio::select! {
                     biased;
-                    _ = origin.retired.token().cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
+                    _ = origin.retired.cancelled() => return Err((Failure::OriginUnavailable, Evidence::Unknown)),
                     _ = shutdown.cancelled() => return Err((Failure::Cancelled, Evidence::Unknown)),
                     result = prepared.dns.verify(route, &id) => result.map_err(map)?,
                 }
@@ -2434,13 +2470,21 @@ pub(crate) mod publication {
             controller: &VmController<C>,
             operation: OperationRef,
             vm: Id,
+            origin: Option<&Origin>,
             shutdown: &Shutdown,
         ) -> Result<()> {
             #[cfg(test)]
             let _ = hold(&self.unpublish_gate).await;
             let _slot = self.slot().await;
             let released = self
-                .cleanup(controller, vm, None, Evidence::Unknown, Some(shutdown))
+                .cleanup(
+                    controller,
+                    vm,
+                    None,
+                    Evidence::Unknown,
+                    Some(shutdown),
+                    origin,
+                )
                 .await?
                 == Cleanup::Released;
             controller.finish_publication(
@@ -2449,6 +2493,19 @@ pub(crate) mod publication {
                 (!released).then_some(Failure::CleanupUnconfirmed),
                 Some(released),
             )
+        }
+
+        #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+        pub(crate) async fn retire_boot<C: Clock>(
+            &self,
+            controller: &VmController<C>,
+            vm: Id,
+        ) -> Result<bool> {
+            let _slot = self.slot().await;
+            Ok(self
+                .cleanup(controller, vm, None, Evidence::Unknown, None, None)
+                .await?
+                == Cleanup::Released)
         }
 
         /// One reaper turn. Skips as busy while another effect holds the slot.
@@ -2537,7 +2594,7 @@ pub(crate) mod publication {
                     match stale {
                         None => Turn::Healthy,
                         Some(reason) => match self
-                            .cleanup(controller, intent.vm, reason, Evidence::Unknown, None)
+                            .cleanup(controller, intent.vm, reason, Evidence::Unknown, None, None)
                             .await?
                         {
                             Cleanup::Released => Turn::Idle,
@@ -2568,6 +2625,7 @@ pub(crate) mod publication {
             reason: Option<Failure>,
             evidence: Evidence,
             shutdown: Option<&Shutdown>,
+            origin: Option<&Origin>,
         ) -> Result<Cleanup> {
             #[cfg(test)]
             self.cleanup_registry
@@ -2589,6 +2647,17 @@ pub(crate) mod publication {
                 } else {
                     Cleanup::Pending(Failure::CleanupUnconfirmed)
                 });
+            };
+            let origin = origin.filter(|origin| {
+                origin.generation == intent.generation && origin.boot == intent.boot
+            });
+            // The live operation is fenced by its boot's watch. The reaper
+            // can subsequently reconcile only the exact durable DNS ownership.
+            let route_cancelled = || async {
+                match origin {
+                    Some(origin) => origin.retired.route_cancelled().await,
+                    None => std::future::pending().await,
+                }
             };
             // A latched owner cause wins over the reason this cleanup supplies.
             let reason = self.cause(&intent.nonce, reason);
@@ -2618,15 +2687,18 @@ pub(crate) mod publication {
                     .flatten();
                 let row_result = if !host.post_possible || unsubmitted {
                     Ok(())
-                } else if let Some(shutdown) = shutdown {
+                } else {
                     tokio::select! {
                         biased;
-                        _ = shutdown.cancelled() => Err(Failure::Cancelled),
+                        () = route_cancelled() => Err(Failure::OriginUnavailable),
+                        () = async {
+                            match shutdown {
+                                Some(shutdown) => shutdown.cancelled().await,
+                                None => std::future::pending().await,
+                            }
+                        } => Err(Failure::Cancelled),
                         result = self.remove_host_dns(controller, &intent, host, row_ack) => result,
                     }
-                } else {
-                    self.remove_host_dns(controller, &intent, host, row_ack)
-                        .await
                 };
                 match row_result {
                     Ok(()) => {
@@ -2734,6 +2806,8 @@ pub(crate) mod publication {
         fn cleanup_dns(&self, intent: &Intent) -> Option<Dns> {
             #[cfg(test)]
             if let Some(fake) = self.fake.lock().unwrap().as_ref() {
+                fake.credential_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return fake
                     .credential
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -2755,6 +2829,7 @@ pub(crate) mod publication {
     #[derive(Default)]
     pub(crate) struct Fake {
         pub(crate) credential: std::sync::atomic::AtomicBool,
+        pub(crate) credential_reads: std::sync::atomic::AtomicUsize,
         pub(crate) foreign: std::sync::atomic::AtomicBool,
         pub(crate) health: std::sync::atomic::AtomicU8,
         pub(crate) local: std::sync::atomic::AtomicBool,
