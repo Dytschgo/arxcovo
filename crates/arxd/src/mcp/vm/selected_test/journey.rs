@@ -322,14 +322,18 @@ fn inventory(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<
         .collect()
 }
 
+fn fixture_recipes() -> crate::vm::qualification_record::TestRecipes {
+    use crate::vm::test_issuer::SelectedSource;
+    let source = crate::vm::test_issuer::tests::FakeSource::new(Instant::now());
+    (&source).recipes()
+}
+
 #[tokio::test]
 async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() {
     let dir = crate::service::application::tests::private_temp();
     let root = dir.path();
     let now = Arc::new(AtomicI64::new(UTC));
-    let origin = Instant::now();
-    let source = FixtureQualification::open(root, origin);
-    let recipes = crate::vm::test_issuer::SelectedSource::recipes(&source);
+    let recipes = fixture_recipes();
     let path = |leaf| root.join(leaf).to_str().unwrap().replace('\\', "/");
     let state = root.to_str().unwrap().replace('\\', "/");
     let mut profile = profile(&path("missing.json"), &path("dossier"));
@@ -380,11 +384,14 @@ async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() 
         assert!(inventory(root).is_empty());
     }
 
+    let origin = Instant::now();
+    let source = FixtureQualification::open(root, origin);
     Arc::get_mut(&mut supervisor)
         .unwrap()
         .install_test_with(|controller, selection| {
             TestIssuer::open_owned_fixture(controller, Source::Fixture(Box::new(source)), selection)
         });
+    let advance = tick(&now, origin);
     supervisor.startup_sweep().unwrap();
     let vault = crate::service::application::tests::private_temp();
     supervisor.open_vault(vault.path()).unwrap();
@@ -416,13 +423,6 @@ async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() 
     assert!(inventory(root).is_empty());
     set_busy(&supervisor, false);
 
-    let now_ticks = now.clone();
-    let advance = tokio::spawn(async move {
-        loop {
-            now_ticks.fetch_max(UTC + origin.elapsed().as_millis() as i64, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    });
     let ubuntu = session
         .mutate("vm_template_build", json!({"recipe_id":ubuntu_recipe}))
         .unwrap();
@@ -709,9 +709,8 @@ async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() 
 
 /// A foreground whose fixture selection is installed through the
 /// production installation route, after its startup sweep.
-fn fixture_foreground(root: &Path, now: &Arc<AtomicI64>, origin: Instant) -> Arc<Supervisor> {
-    let source = FixtureQualification::open(root, origin);
-    let recipes = crate::vm::test_issuer::SelectedSource::recipes(&source);
+fn fixture_foreground(root: &Path, now: &Arc<AtomicI64>) -> (Arc<Supervisor>, Instant) {
+    let recipes = fixture_recipes();
     let path = |leaf| root.join(leaf).to_str().unwrap().replace('\\', "/");
     let state = root.to_str().unwrap().replace('\\', "/");
     let mut profile = profile(&path("missing.json"), &path("dossier"));
@@ -736,6 +735,8 @@ fn fixture_foreground(root: &Path, now: &Arc<AtomicI64>, origin: Instant) -> Arc
     ] {
         crate::dashboard::tests::set_owner_private(&path);
     }
+    let origin = Instant::now();
+    let source = FixtureQualification::open(root, origin);
     {
         let supervisor = Arc::get_mut(&mut supervisor).unwrap();
         supervisor.custody = Some(Arc::new(crate::config::VmCustody::test_only(root).unwrap()));
@@ -744,7 +745,7 @@ fn fixture_foreground(root: &Path, now: &Arc<AtomicI64>, origin: Instant) -> Arc
         });
     }
     supervisor.startup_sweep().unwrap();
-    supervisor
+    (supervisor, origin)
 }
 
 /// The UTC clock follows the monotonic one, as on a real host.
@@ -766,8 +767,7 @@ async fn closed_admission_withdraws_witness_and_settles_exact_owner_stop() {
     let dir = crate::service::application::tests::private_temp();
     let root = dir.path();
     let now = Arc::new(AtomicI64::new(UTC));
-    let origin = Instant::now();
-    let supervisor = fixture_foreground(root, &now, origin);
+    let (supervisor, origin) = fixture_foreground(root, &now);
     let advance = tick(&now, origin);
     let _close = CloseOnDrop(supervisor.clone());
     let mut session = Session::new(&supervisor, now.clone());
@@ -860,7 +860,7 @@ async fn selected_dispatch_refuses_a_static_vm_as_unqualified() {
     let dir = crate::service::application::tests::private_temp();
     let root = dir.path();
     let now = Arc::new(AtomicI64::new(UTC));
-    let supervisor = fixture_foreground(root, &now, Instant::now());
+    let (supervisor, _) = fixture_foreground(root, &now);
     let _close = CloseOnDrop(supervisor.clone());
     let session = Session::new(&supervisor, now.clone());
     set_busy(&supervisor, false);

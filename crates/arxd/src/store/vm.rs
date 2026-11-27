@@ -735,7 +735,6 @@ impl VmStore {
         Ok(result)
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) fn read_only<T>(
         &self,
         read: impl FnOnce(&Transaction<'_>) -> Result<T>,

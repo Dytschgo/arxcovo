@@ -58,6 +58,8 @@ enum Fault {
     CancelAtCapture,
     /// The pre-seal observation ages past freshness before the seal gate.
     StaleSample,
+    /// A concurrent store reader briefly holds the mutex during pre-seal refresh.
+    ContendedPreSeal,
     /// The installer stage reaches its own deadline.
     InstallerTimeout,
     CancelBeforeStage,
@@ -235,7 +237,23 @@ impl<S: SelectedSource, C: crate::vm::Clock> Effects for Peer<'_, S, C> {
             // Still fresh before the seal transaction, stale inside it.
             return Ok(Instant::now() - Duration::from_secs(4));
         }
-        self.issuer.refresh()
+        if self.fault == Fault::ContendedPreSeal {
+            let held = std::sync::Barrier::new(2);
+            return std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    self.store
+                        .read_only(|_| {
+                            held.wait();
+                            std::thread::sleep(Duration::from_millis(60));
+                            Ok(())
+                        })
+                        .unwrap()
+                });
+                held.wait();
+                checked::refresh_pre_seal(self.issuer, &|| self.cancel.is_cancelled())
+            });
+        }
+        checked::refresh_pre_seal(self.issuer, &|| self.cancel.is_cancelled())
     }
 
     fn crossing(&self, point: &'static str) {
@@ -1185,6 +1203,52 @@ async fn build_replay_and_new_request_reuse_the_exact_sealed_pair() {
     assert_eq!(reuse.receipt.status, Status::Succeeded);
     assert_eq!(fx.count("SELECT count(*) FROM vm_templates"), 1);
     assert_eq!(fx.count("SELECT count(*) FROM vm_generations"), 1);
+}
+
+#[tokio::test]
+async fn build_pre_seal_fresh_rides_out_transient_store_contention() {
+    assert_admission_closed();
+    let fx = SweepFixture::new();
+    let Outcome {
+        status,
+        seal_checks,
+        cause,
+        ..
+    } = run(&fx, true, Fault::ContendedPreSeal, 61).await;
+    assert_eq!(
+        status.expect("transient store contention must not abort pre-seal refresh"),
+        Status::Succeeded
+    );
+    assert_eq!(seal_checks, 2);
+    assert_eq!(cause, 0);
+    assert_eq!(fx.count("SELECT count(*) FROM vm_templates"), 1);
+
+    // Cancellation ends pre-seal retry immediately under a long store hold.
+    let source = FakeSource::new(fx.clock.now().monotonic);
+    let issuer = TestIssuer::open(&Installation::fixture(), fx.ctl(), &source, &config()).unwrap();
+    let cancel = Shutdown::default();
+    cancel.cancel();
+    let held = std::sync::Barrier::new(2);
+    let budget = crate::vm::test_issuer::CONTENTION_BUDGET;
+    let elapsed = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            fx.store()
+                .read_only(|_| {
+                    held.wait();
+                    std::thread::sleep(budget * 2);
+                    Ok(())
+                })
+                .unwrap()
+        });
+        held.wait();
+        let began = Instant::now();
+        assert!(checked::refresh_pre_seal(&issuer, &|| cancel.is_cancelled()).is_err());
+        began.elapsed()
+    });
+    assert!(
+        elapsed < budget / 5,
+        "cancelled pre-seal retry waited {elapsed:?}"
+    );
 }
 
 impl super::super::FixtureQualification {

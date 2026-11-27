@@ -83,9 +83,22 @@ struct Checked<'a, S, C> {
     limits: BuildRequest<'a>,
 }
 
+/// Refreshes the selection epoch for post-release and pre-seal checks, riding
+/// out transient store-mutex contention without blocking past cancellation or
+/// confirmed epoch revocation. Live-child monitors keep single nonblocking
+/// samples by calling `issuer.refresh()` directly.
+pub(super) fn refresh_pre_seal<S: SelectedSource, C: Clock>(
+    issuer: &TestIssuer<'_, S, C>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Instant, Q> {
+    crate::vm::test_issuer::retry_contended(cancelled, &|| issuer.epoch().effects_revoked(), || {
+        issuer.refresh()
+    })
+}
+
 impl<S: SelectedSource, C: Clock> Effects for Checked<'_, S, C> {
     fn fresh(&self) -> Result<Instant, Q> {
-        self.issuer.refresh()
+        refresh_pre_seal(self.issuer, self.cancelled)
     }
 
     fn stage<'w>(
@@ -140,7 +153,7 @@ impl<S: SelectedSource, C: Clock> Effects for Checked<'_, S, C> {
                         permit,
                         self.cancel,
                         self.cancelled,
-                        || self.fresh(),
+                        || self.issuer.refresh(),
                     )
                     .await
             }
@@ -197,7 +210,7 @@ impl<S: SelectedSource, C: Clock> Effects for Checked<'_, S, C> {
         let check = |by| launch::check_preparation(by, &cancelled);
         let fresh = |by: Instant| -> Result<Instant, Q> {
             check(by)?;
-            let captured = self.fresh()?;
+            let captured = self.issuer.refresh()?;
             check(by)?;
             Ok(captured)
         };
@@ -295,7 +308,9 @@ impl<S: SelectedSource, C: Clock> Effects for Checked<'_, S, C> {
                 (release, None)
             }
         };
-        fresh(cutoff)?;
+        check(cutoff)?;
+        self.fresh()?;
+        check(cutoff)?;
         Ok(BootRelease {
             release: release.for_build(workspace, pair)?,
             phase: installer.map(InstallerStage::phase),
