@@ -964,7 +964,8 @@ impl Supervisor {
     }
 
     /// The rollback check of a fresh admission: an `Err` from the store
-    /// closure rolls back the fresh rows written in the same transaction.
+    /// closure rolls back any fresh rows and bookkeeping writes in the same
+    /// transaction.
     fn commit_fresh_intent(
         &self,
         fenced: &std::cell::Cell<Option<NativeRefusal>>,
@@ -2836,9 +2837,7 @@ impl VmInventory {
             )?;
             #[cfg(test)]
             self.supervisor.during_static_admission();
-            if admitted.is_ok() {
-                self.supervisor.commit_fresh_intent(&fenced)?;
-            }
+            self.supervisor.commit_fresh_intent(&fenced)?;
             Ok(admitted)
         });
         let admission = admission.map_err(|error| fresh_fault(&fenced, error))?;
@@ -3023,9 +3022,7 @@ impl VmInventory {
                     )
                 },
             )?;
-            if admitted.is_ok() {
-                self.supervisor.commit_fresh_intent(&fenced)?;
-            }
+            self.supervisor.commit_fresh_intent(&fenced)?;
             Ok(admitted)
         });
         let admission = admission.map_err(|error| fresh_fault(&fenced, error))?;
@@ -17250,6 +17247,316 @@ pub(crate) mod tests {
         );
         assert_no_queued_frame(&mut compose_peer).await;
         assert_no_queued_frame(&mut backup_peer).await;
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    /// Spec P2 (PR #402 review 3): when the route watch retires inside the
+    /// backup capacity callback and capacity returns `None` (matching
+    /// `selected_static.rs`), retirement must win (`network_fence_unverified`)
+    /// and roll back preceding retry-clock advancement and orphan pruning.
+    /// When the watch stays live with `None` capacity, `not_ready` commits
+    /// normally.
+    #[tokio::test]
+    async fn static_retirement_backup_none_capacity_rolls_back_bookkeeping() {
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.static_compose = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let (vm, vm_id, generation, _target, _root, _managed) =
+            setup_compose_backup_project(&h, &a, 6200, 64 * 1024).await;
+        let boot = 6201;
+        let supervisor = h.supervisor();
+        let mut backup_peer = backup_test_peer(&h, vm_id, generation, boot).await;
+        let store = supervisor.controller.compose_store();
+        let selection = supervisor.static_selection().unwrap();
+        assert!(supervisor.static_refusal().is_none());
+
+        let high_water = || -> i64 {
+            store
+                .read_only(|db| {
+                    Ok(db.query_row(
+                        "SELECT high_water_ms FROM vm_retry_clock WHERE singleton=1",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        let op_rows = || {
+            store
+                .read_only(|db| {
+                    Ok([
+                        "vm_operations",
+                        "vm_compose_operations",
+                        "vm_compose_backup_ops",
+                    ]
+                    .map(|table| {
+                        crate::store::vm::count(db, &format!("SELECT count(*) FROM {table}"), [])
+                            .unwrap()
+                    }))
+                })
+                .unwrap()
+        };
+
+        let orphan_backup_id: Id = [0xC1; 16];
+        let orphan_op_id: Id = [0xC2; 16];
+        store
+            .transact(|tx| {
+                tx.execute(
+                    "INSERT INTO vm_compose_backups(
+                        id,operation_id,principal,vm,project,generation,boot,revision,
+                        volume,database,state,host_staging_charge,guest_staging_charge,
+                        retained_charge,created_ms,namespace_tracked
+                     ) VALUES(?1,?2,'alpha',?3,'calm-life',?4,?5,1,
+                        'data','calm-life.sqlite3','cleaned',0,0,0,?6,1)",
+                    rusqlite::params![orphan_backup_id, orphan_op_id, vm_id, generation, boot, UTC],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let orphan_count = || {
+            store
+                .read_only(|db| {
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_compose_backups WHERE id=?1",
+                        [orphan_backup_id],
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(orphan_count(), 1);
+        let clock_before = high_water();
+        let advanced_now = clock_before + 60_000;
+        h.now.store(advanced_now, Ordering::Relaxed);
+        *supervisor.compose_backup.capacity.lock().unwrap() = None;
+        let rows_before = op_rows();
+
+        // Watch retires inside the capacity callback while capacity is `None`:
+        // wire response must be `network_fence_unverified` and both the
+        // retry-clock advance and orphan pruning must roll back.
+        selection.revive_fixture_network();
+        supervisor
+            .retire_static_in_admission
+            .store(true, Ordering::Release);
+        let retired = call(
+            &a,
+            "compose_backup",
+            json!({"vm_id":vm,"project_id":"calm-life","request_id":key(6210)}),
+        )
+        .await;
+        assert_eq!(
+            retired["reason"], "network_fence_unverified",
+            "retired backup with None capacity: {retired}"
+        );
+        assert!(
+            !supervisor
+                .retire_static_in_admission
+                .load(Ordering::Acquire),
+            "compose_backup did not reach capacity callback hook"
+        );
+        assert_eq!(
+            high_water(),
+            clock_before,
+            "retired backup committed retry-clock advance"
+        );
+        assert_eq!(
+            orphan_count(),
+            1,
+            "retired backup committed orphaned cleaned backup pruning"
+        );
+        assert_eq!(op_rows(), rows_before);
+
+        // Live control: watch stays live with `capacity == None`. Must return
+        // `not_ready` and commit the preceding retry-clock advance and pruning
+        // (proving those mutations genuinely ran before `check_disk`).
+        selection.revive_fixture_network();
+        let live = call(
+            &a,
+            "compose_backup",
+            json!({"vm_id":vm,"project_id":"calm-life","request_id":key(6211)}),
+        )
+        .await;
+        assert_eq!(
+            live["reason"], "not_ready",
+            "live backup with None capacity: {live}"
+        );
+        assert_eq!(
+            high_water(),
+            advanced_now,
+            "live backup control did not advance retry clock"
+        );
+        assert_eq!(
+            orphan_count(),
+            0,
+            "live backup control did not prune orphaned cleaned backup"
+        );
+        assert_eq!(op_rows(), rows_before);
+
+        assert_no_queued_frame(&mut backup_peer).await;
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    /// Spec P2 (PR #402 review 3): concurrent route-watch retirement during
+    /// fresh Compose admission must still win and roll back preceding
+    /// retry-clock advancement and expired-operation pruning even when
+    /// `db::admit` returns a typed refusal (`NotFound`).
+    #[tokio::test]
+    async fn static_retirement_compose_typed_refusal_rolls_back_bookkeeping() {
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.static_compose = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let (vm, vm_id, generation, _target, _root, _managed) =
+            setup_compose_backup_project(&h, &a, 6250, 64 * 1024).await;
+        let boot = 6251;
+        let supervisor = h.supervisor();
+        let (host_io, mut compose_peer) = tokio::io::duplex(64 * 1024);
+        let (channel, ()) = tokio::join!(
+            crate::vm::guest::ComposeChannel::negotiate(host_io, boot, &supervisor.cancel),
+            fake_compose_hello(&mut compose_peer, boot)
+        );
+        let store = supervisor.controller.compose_store();
+        store
+            .transact(|tx| crate::store::vm::compose::register_boot(tx, vm_id, generation, boot))
+            .unwrap();
+        supervisor
+            .compose
+            .attach(
+                store,
+                vm_id,
+                compose::Session::new(generation, channel.unwrap()),
+            )
+            .unwrap();
+        let selection = supervisor.static_selection().unwrap();
+        assert!(supervisor.static_refusal().is_none());
+
+        let high_water = || -> i64 {
+            store
+                .read_only(|db| {
+                    Ok(db.query_row(
+                        "SELECT high_water_ms FROM vm_retry_clock WHERE singleton=1",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+
+        let expired_op_id: Id = [0xD1; 16];
+        let expired_req_key: Id = [0xD2; 16];
+        store
+            .transact(|tx| {
+                tx.execute(
+                    "INSERT INTO vm_compose_operations(
+                        id,principal,request,vm,project,generation,boot,kind,release,
+                        revision,valid_through_ms,emergency,activity_id,sent,receipt,
+                        closed,secret_refs,secret_sent
+                     ) VALUES(?1,'alpha',?2,?3,'calm-life',?4,?5,'start',?6,
+                        1,?7,0,NULL,0,NULL,'refused','[]',0)",
+                    rusqlite::params![
+                        expired_op_id,
+                        expired_req_key,
+                        vm_id,
+                        generation,
+                        boot,
+                        [0x61u8; 16],
+                        UTC
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let expired_op_count = || {
+            store
+                .read_only(|db| {
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_compose_operations WHERE id=?1",
+                        [expired_op_id],
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(expired_op_count(), 1);
+        let clock_before = high_water();
+        let advanced_now = clock_before + 60_000;
+        h.now.store(advanced_now, Ordering::Relaxed);
+        let unknown_release = hex::encode([0xEEu8; 16]);
+
+        // Watch retires inside fresh Compose admission on a typed refusal:
+        // wire response must be `network_fence_unverified` and both the
+        // retry-clock advance and expired-op pruning must roll back.
+        selection.revive_fixture_network();
+        supervisor
+            .retire_static_in_admission
+            .store(true, Ordering::Release);
+        let retired = call(
+            &a,
+            "compose_deploy",
+            json!({
+                "vm_id": vm,
+                "project_id": "calm-life",
+                "release_id": unknown_release,
+                "request_id": key(6260),
+            }),
+        )
+        .await;
+        assert_eq!(
+            retired["reason"], "network_fence_unverified",
+            "retired compose_deploy typed refusal: {retired}"
+        );
+        assert!(
+            !supervisor
+                .retire_static_in_admission
+                .load(Ordering::Acquire),
+            "compose_deploy did not reach admission hook"
+        );
+        assert_eq!(
+            high_water(),
+            clock_before,
+            "retired compose_deploy committed retry-clock advance"
+        );
+        assert_eq!(
+            expired_op_count(),
+            1,
+            "retired compose_deploy committed expired operation pruning"
+        );
+
+        // Live control: watch stays live with the same unknown `release_id`.
+        // Must return `not_found` and commit both bookkeeping mutations.
+        selection.revive_fixture_network();
+        let live = call(
+            &a,
+            "compose_deploy",
+            json!({
+                "vm_id": vm,
+                "project_id": "calm-life",
+                "release_id": unknown_release,
+                "request_id": key(6261),
+            }),
+        )
+        .await;
+        assert_eq!(
+            live["reason"], "not_found",
+            "live compose_deploy unknown release: {live}"
+        );
+        assert_eq!(
+            high_water(),
+            advanced_now,
+            "live compose_deploy control did not advance retry clock"
+        );
+        assert_eq!(
+            expired_op_count(),
+            0,
+            "live compose_deploy control did not prune expired operation"
+        );
+
+        assert_no_queued_frame(&mut compose_peer).await;
         drop(a);
         h.shutdown().await.unwrap();
     }
