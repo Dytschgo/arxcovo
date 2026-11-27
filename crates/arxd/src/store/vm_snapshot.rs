@@ -289,18 +289,9 @@ impl Refused {
     }
 }
 
+/// Admission maps [`Refused::reason`]; the foreground keeps the
+/// retiring/held distinction of unsettled work.
 pub(crate) fn precheck(
-    db: &Connection,
-    principal: &str,
-    vm: Id,
-    request: &crate::vm::snapshot::Request,
-    now: i64,
-) -> Result<Result<bool, Refusal>> {
-    Ok(precheck_detail(db, principal, vm, request, now)?.map_err(Refused::reason))
-}
-
-/// [`precheck`] that keeps the retiring/held distinction of unsettled work.
-pub(crate) fn precheck_detail(
     db: &Connection,
     principal: &str,
     vm: Id,

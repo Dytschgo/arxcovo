@@ -3545,7 +3545,7 @@ impl<C: Clock> VmController<C> {
         use store::snapshot::Refused;
         self.store.transact(|db| {
             let now = utc(self.clock.now())?;
-            let result = store::snapshot::precheck_detail(db, principal, vm, request, now)?;
+            let result = store::snapshot::precheck(db, principal, vm, request, now)?;
             // A Compose backup ID is outside the snapshot namespace. The
             // caller's own VM gets the explicit typed refusal; everyone else
             // keeps the uncorrelated not_found.
@@ -3684,7 +3684,7 @@ impl<C: Clock> VmController<C> {
             }
             let is_static = match snapshot::precheck(db, principal, vm, request, now)? {
                 Ok(is_static) => is_static,
-                Err(reason) => return Ok(Err(reason)),
+                Err(refused) => return Ok(Err(refused.reason())),
             };
             if is_static && route.is_none_or(|route| route.vm() != vm) {
                 return Ok(Err(Refusal::SnapshotPublishNotQuiesced));
