@@ -4,22 +4,27 @@ baseline below. For the Windows per-user foreground backend preview, use
 [Windows execution accounts](windows-execution-accounts.md). That route defaults
 to the unelevated daemon account; it does not use the installed service's
 LocalSystem client identity. Neither route has complete M2 acceptance.
-See [v1 readiness](v1-readiness.md) for current delivery limits.
+See [v1 readiness](v1-readiness.md) for current delivery limits. For the
+step-by-step Mac mini and Linux host route, see
+[host onboarding](host-onboarding.md).
 
-Source baseline: actual main **`aa49ce1e99475d07d63c6b0d23fa94bdb30bab74`**
-(2026-11-14 audit), not the local branch named main or unpublished diagnostics.
-This is executable acceptance preparation, **not an acceptance pass**. M2 is
-incomplete; real-Runner PA6 is OPEN. Installed and dedicated paths remain
-**unverified on real hardware**. No owner steps are requested now.
+Refreshed 2026-11-27 for the launchd parser (ADR 0014 launchd profile
+addendum); the rest of the audit baseline is main
+**`aa49ce1e99475d07d63c6b0d23fa94bdb30bab74`** (2026-11-14). This is executable
+acceptance preparation, **not an acceptance pass**. M2 is incomplete;
+real-Runner PA6 is OPEN. Installed and dedicated paths remain **unverified on
+real hardware**.
 
 **Stop before installation or acceptance at this baseline on every OS.**
 `Execution::configured` selects the inert `Native` executor: successful config
 preflight still returns `MechanismUnavailable`, `run` never launches, and
 `capability` always reports `available: false` with null hardening. Linux's
 standard bridge is test-constructible only. Windows S4U/shim/Job and macOS
-UID-sweep production execution remain absent. macOS additionally has a launchd
-parser stub returning `Query::Unknown`; owner lifecycle refuses `service-manager`.
-Accounts, tools or owner provisioning cannot repair these engineering gaps.
+UID-sweep production execution remain absent. The macOS launchd parser is now
+implemented and unit tested: absence is pinned to the whole native tuple seen
+on hosted macOS, while the loaded-job grammar is synthetic and fails closed to
+`service-manager` if real output differs. Accounts, tools or owner
+provisioning cannot repair the executor gaps.
 
 Claim sources at that main pin (repository links locate the files; read their
 Git objects at the pin, not candidate worktree source):
@@ -261,17 +266,22 @@ The following lifecycle plans describe Linux/macOS; Windows SCM details follow.
   that old binary to run `service uninstall`. Then use the new binary to run
   `service install`, then `service configure` again if you use admin rights on
   Linux, then `service start`. Your config and activity history are kept.
-- On macOS, install currently always refuses with `service-manager`, because
-  `owner_query::launchd` still returns `Query::Unknown`. Historical observations
-  have not become an accepted production parser.
+- On macOS, `owner_query::launchd` accepts absence only as exit 113, empty
+  stdout and the exact `Could not find service "com.arxcovo.arxd" in domain for
+  system` stderr, pinned from hosted macOS CI evidence and rechecked by a
+  native test on every hosted macOS run. A loaded job must match the fixed
+  plist path, program and arguments; any other output is `service-manager`.
+  The loaded grammar and a root capture on a real Mac remain **unverified on
+  real hardware**. A job that is loaded but idle reports `stopped`; recover it
+  with `service stop` and then `service start`.
 - You do not create `/run/arxcovo` or `/private/var/run/arxcovo` yourself.
   systemd creates the Linux directory at each start, and the service creates
   macOS `.../Arxcovo/run`. If either directory has the wrong owner or mode,
   start is refused. Nothing repairs it for you.
 - ADR 0015's macOS ancestor policy, runtime placement and new-directory
   ownership handling exist in source. Historical hosted observations do not
-  establish an installed service or implement the launchd parser. Its stub
-  still blocks owner lifecycle; provisioning is not the missing parser.
+  establish an installed service. The launchd parser is implemented (see
+  above); its installed behaviour still needs a real Mac.
 - Windows implements the same boot intent: register/install leaves demand
   start; start selects automatic delayed start; stop waits for stopped before
   selecting demand start. A partial start can leave automatic intent, and a
@@ -282,7 +292,8 @@ The following lifecycle plans describe Linux/macOS; Windows SCM details follow.
 
 1. Pin independently reviewed source and binary, target OS and time. Check
    readiness **before install**: at the baseline above, stop on every OS for
-   missing dedicated execution; macOS also stops for missing launchd parsing.
+   missing dedicated execution. macOS lifecycle can now be exercised; its
+   loaded-job grammar needs that first real run.
    Linux still needs ADR 0019/0020 Stage F evidence and Stage G production
    wiring, including open real-Runner PA6 and panic/release-profile gates.
    Preserve existing Stage F scope and no-retry restrictions. Windows and

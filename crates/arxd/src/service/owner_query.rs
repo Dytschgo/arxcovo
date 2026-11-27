@@ -1,5 +1,6 @@
 //! Bounded, output-free manager observations for ADR 0014.
-//! Native launchd absence/state fixtures are deliberately not pinned here.
+//! The launchd absence tuple is pinned from hosted native evidence; the loaded
+//! profile is synthetic until an installed capture exists (ADR 0014 addendum).
 use super::layout::{Error, Platform};
 pub const DROPIN_PATH: &str = "/etc/systemd/system/arxd.service.d/50-arxcovo-standard-rights.conf";
 pub const SYSTEMD_QUERY: &[&str] = &[
@@ -130,6 +131,10 @@ impl Query {
             (Artifact::Absent, Self::Absent) => Ok(Status::NotInstalled),
             (Artifact::Identical, Self::Absent) => Ok(Status::Stopped),
             (Artifact::Identical, Self::Ours(State::Running)) => Ok(Status::Running),
+            (Artifact::Identical, Self::Ours(State::Starting)) => Ok(Status::Starting),
+            // Loaded but idle after a clean exit. `start` skips bootstrap for a
+            // loaded job, so recovery is `stop` (bootout) followed by `start`.
+            (Artifact::Identical, Self::Ours(State::Stopped)) => Ok(Status::Stopped),
             _ => Err(Error::Manager),
         }
     }
@@ -204,8 +209,16 @@ pub fn systemd(success: bool, stdout: &[u8]) -> Query {
         _ => Query::Unknown,
     }
 }
-/// No native fixture currently establishes launchd's output grammar, absence
-/// exit status or state vocabulary. Do not infer any of them from an exit code.
+/// Fixed launchd label of the arxd system daemon.
+pub const LAUNCHD_LABEL: &str = "com.arxcovo.arxd";
+/// `launchctl print` exit status for a label missing from the system domain.
+/// Pinned together with the complete stream tuple, never on its own (ADR 0014
+/// launchd profile addendum, 2026-11-27).
+pub const LAUNCHD_ABSENT_EXIT: i32 = 113;
+const LAUNCHD_PROGRAM: &str = "/Library/Application Support/Arxcovo/libexec/arxd";
+const LAUNCHD_ARGUMENTS: &[&str] = &[LAUNCHD_PROGRAM, "service", "run"];
+const LAUNCHD_STDOUT_CAP: usize = 65_536;
+const LAUNCHD_STDERR_CAP: usize = 4_096;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LaunchdTermination {
     Exited(i32),
@@ -222,9 +235,158 @@ pub struct LaunchdObservation<'a> {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
 }
-/// Empty accept-set: no output grammar or absence tuple has been reviewed.
-pub fn launchd(_observation: LaunchdObservation<'_>) -> Query {
-    Query::Unknown
+/// Identity a loaded registration must show to count as ours: system domain
+/// and label (header), plist path, program and the complete argument vector.
+struct LaunchdProfile<'a> {
+    label: &'a str,
+    plist: &'a str,
+    program: &'a str,
+    arguments: &'a [&'a str],
+}
+const ARXD_PROFILE: LaunchdProfile<'static> = LaunchdProfile {
+    label: LAUNCHD_LABEL,
+    plist: PLIST_PATH,
+    program: LAUNCHD_PROGRAM,
+    arguments: LAUNCHD_ARGUMENTS,
+};
+/// Bounded, fail-closed reading of `launchctl print system/com.arxcovo.arxd`.
+/// Raw bytes never escape this parser. launchctl(1) calls `print` output
+/// unstable, so anything outside the reviewed tuples is Unknown.
+pub fn launchd(observation: LaunchdObservation<'_>) -> Query {
+    launchd_with(&observation, &ARXD_PROFILE)
+}
+/// Test-only absence check of a deliberately unregistered probe label.
+#[cfg(test)]
+pub(super) fn launchd_probe(observation: &LaunchdObservation<'_>, label: &str) -> Query {
+    launchd_with(
+        observation,
+        &LaunchdProfile {
+            label,
+            ..ARXD_PROFILE
+        },
+    )
+}
+fn launchd_with(o: &LaunchdObservation<'_>, profile: &LaunchdProfile<'_>) -> Query {
+    if !(o.stdout_complete && o.stderr_complete)
+        || o.stdout_truncated
+        || o.stderr_truncated
+        || o.stdout.len() > LAUNCHD_STDOUT_CAP
+        || o.stderr.len() > LAUNCHD_STDERR_CAP
+    {
+        return Query::Unknown;
+    }
+    let (Ok(stdout), Ok(stderr)) = (std::str::from_utf8(o.stdout), std::str::from_utf8(o.stderr))
+    else {
+        return Query::Unknown;
+    };
+    match o.termination {
+        LaunchdTermination::Exited(LAUNCHD_ABSENT_EXIT)
+            if stdout.is_empty() && stderr == absent_stderr(profile.label) =>
+        {
+            Query::Absent
+        }
+        LaunchdTermination::Exited(0) if stderr.is_empty() => loaded(stdout, profile),
+        _ => Query::Unknown,
+    }
+}
+/// The complete native stderr for a label missing from the system domain.
+fn absent_stderr(label: &str) -> String {
+    format!("Bad request.\nCould not find service \"{label}\" in domain for system\n")
+}
+/// Top-level fields of exactly one `system/<label> = { ... }` block. Nested
+/// blocks must balance by tab depth and are ignored, except the top-level
+/// argument vector, whose entries are compared in order.
+fn loaded(text: &str, profile: &LaunchdProfile<'_>) -> Query {
+    if text.contains(['\r', '\0']) {
+        return Query::Unknown;
+    }
+    let mut lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
+    if lines.next() != Some(format!("system/{} = {{", profile.label).as_str()) {
+        return Query::Unknown;
+    }
+    let (mut path, mut state, mut program) = (None, None, None);
+    let mut arguments: Option<Vec<&str>> = None;
+    let mut collecting = false;
+    let mut depth = 1usize;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if depth == 0 {
+            return Query::Unknown;
+        }
+        let tabs = line.bytes().take_while(|b| *b == b'\t').count();
+        let body = &line[tabs..];
+        if body.starts_with(' ') {
+            return Query::Unknown;
+        }
+        if body == "}" {
+            if tabs + 1 != depth {
+                return Query::Unknown;
+            }
+            depth -= 1;
+            if depth == 1 {
+                collecting = false;
+            }
+            continue;
+        }
+        if tabs != depth {
+            return Query::Unknown;
+        }
+        if depth > 1 {
+            if collecting {
+                // The argument vector is flat; a nested block there is ambiguous.
+                if body.ends_with('{') {
+                    return Query::Unknown;
+                }
+                if let Some(list) = arguments.as_mut() {
+                    list.push(body);
+                }
+            } else if body.ends_with('{') {
+                depth += 1;
+            }
+            continue;
+        }
+        let Some((key, value)) = body.split_once(" = ") else {
+            return Query::Unknown;
+        };
+        if value == "{" {
+            if key == "arguments" {
+                if arguments.replace(Vec::new()).is_some() {
+                    return Query::Unknown;
+                }
+                collecting = true;
+            }
+            depth += 1;
+            continue;
+        }
+        let slot = match key {
+            "path" => &mut path,
+            "state" => &mut state,
+            "program" => &mut program,
+            _ => continue,
+        };
+        if slot.replace(value).is_some() {
+            return Query::Unknown;
+        }
+    }
+    if depth != 0 {
+        return Query::Unknown;
+    }
+    let (Some(path), Some(state), Some(program), Some(arguments)) =
+        (path, state, program, arguments)
+    else {
+        return Query::Unknown;
+    };
+    if path != profile.plist || program != profile.program || arguments != profile.arguments {
+        return Query::Foreign;
+    }
+    match state {
+        "running" => Query::Ours(State::Running),
+        "spawn scheduled" | "starting" => Query::Ours(State::Starting),
+        "not running" | "waiting" => Query::Ours(State::Stopped),
+        _ => Query::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -431,7 +593,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod empty_profile_tests {
+mod launchd_profile_tests {
     use super::*;
     const STATES: [State; 7] = [
         State::Running,
@@ -442,8 +604,258 @@ mod empty_profile_tests {
         State::Failed,
         State::Loaded,
     ];
+    const ABSENT_STDERR: &[u8] =
+        b"Bad request.\nCould not find service \"com.arxcovo.arxd\" in domain for system\n";
+    fn observe(termination: LaunchdTermination, stdout: &[u8], stderr: &[u8]) -> Query {
+        launchd(LaunchdObservation {
+            termination,
+            stdout,
+            stderr,
+            stdout_complete: true,
+            stderr_complete: true,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        })
+    }
+    /// Synthetic loaded shape (tab-indented, nested blocks); not a native capture.
+    fn print(path: &str, state: &str, program: &str, args: &[&str], extra: &str) -> Vec<u8> {
+        let args: String = args.iter().map(|a| format!("\t\t{a}\n")).collect();
+        format!(
+            "system/com.arxcovo.arxd = {{\n\tactive count = 1\n\tpath = {path}\n\ttype = LaunchDaemon\n\tstate = {state}\n\n\tprogram = {program}\n\targuments = {{\n{args}\t}}\n\n\tdefault environment = {{\n\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin\n\t}}\n\n\tevent triggers = {{\n\t\tsynthetic => {{\n\t\t\tstate = 1\n\t\t\tpath = /nested\n\t\t}}\n\t}}\n\n\tdomain = system\n\tlast exit code = (never exited)\n{extra}}}\n"
+        )
+        .into_bytes()
+    }
+    fn ours(state: &str, extra: &str) -> Vec<u8> {
+        print(PLIST_PATH, state, LAUNCHD_PROGRAM, LAUNCHD_ARGUMENTS, extra)
+    }
     #[test]
-    fn pure_empty_profile_every_observation_unknown() {
+    fn pinned_absence_requires_the_whole_native_tuple() {
+        let exited = LaunchdTermination::Exited;
+        assert_eq!(observe(exited(113), b"", ABSENT_STDERR), Query::Absent);
+        for (code, stdout, stderr) in [
+            (1, b"".as_slice(), ABSENT_STDERR),
+            (0, b"", ABSENT_STDERR),
+            (3, b"", ABSENT_STDERR),
+            (113, b"x", ABSENT_STDERR),
+            (113, b"", b""),
+            (113, b"", b"Bad request.\n"),
+            (
+                113,
+                b"",
+                b"Bad request.\nCould not find service \"com.arxcovo.arxd\" in domain for system",
+            ),
+            (
+                113,
+                b"",
+                b"Bad request.\nCould not find service \"com.arxcovo.other\" in domain for system\n",
+            ),
+            (
+                113,
+                b"",
+                b"Bad request.\nCould not find service \"com.arxcovo.arxd\" in domain for user gui: 501\n",
+            ),
+            (
+                113,
+                b"",
+                b"Bad request.\r\nCould not find service \"com.arxcovo.arxd\" in domain for system\r\n",
+            ),
+            (113, ABSENT_STDERR, b""),
+        ] {
+            assert_eq!(observe(exited(code), stdout, stderr), Query::Unknown);
+        }
+        for termination in [
+            LaunchdTermination::Signalled,
+            LaunchdTermination::Incomplete,
+        ] {
+            assert_eq!(observe(termination, b"", ABSENT_STDERR), Query::Unknown);
+        }
+    }
+    #[test]
+    fn incomplete_truncated_or_invalid_streams_fail_closed() {
+        let loaded = ours("running", "");
+        for (stdout, stderr, exit) in [
+            (b"".as_slice(), ABSENT_STDERR, 113),
+            (loaded.as_slice(), b"".as_slice(), 0),
+        ] {
+            let full = observe(LaunchdTermination::Exited(exit), stdout, stderr);
+            assert_ne!(full, Query::Unknown);
+            for flags in 0..16u8 {
+                if flags == 0b0011 {
+                    continue;
+                }
+                let q = launchd(LaunchdObservation {
+                    termination: LaunchdTermination::Exited(exit),
+                    stdout,
+                    stderr,
+                    stdout_complete: flags & 1 != 0,
+                    stderr_complete: flags & 2 != 0,
+                    stdout_truncated: flags & 4 != 0,
+                    stderr_truncated: flags & 8 != 0,
+                });
+                assert_eq!(q, Query::Unknown, "flags {flags:04b}");
+            }
+        }
+        let mut bad = loaded.clone();
+        bad[3] = 0xff;
+        assert_eq!(
+            observe(LaunchdTermination::Exited(0), &bad, b""),
+            Query::Unknown
+        );
+        let mut stderr = ABSENT_STDERR.to_vec();
+        stderr[0] = 0xff;
+        assert_eq!(
+            observe(LaunchdTermination::Exited(113), b"", &stderr),
+            Query::Unknown
+        );
+        let flood = [b'x'; LAUNCHD_STDOUT_CAP + 1];
+        assert_eq!(
+            observe(LaunchdTermination::Exited(0), &flood, b""),
+            Query::Unknown
+        );
+        let flood = [b'x'; LAUNCHD_STDERR_CAP + 1];
+        assert_eq!(
+            observe(LaunchdTermination::Exited(113), b"", &flood),
+            Query::Unknown
+        );
+    }
+    #[test]
+    fn loaded_states_map_and_unknown_vocabulary_refuses() {
+        let exit0 = LaunchdTermination::Exited(0);
+        for (state, want) in [
+            ("running", Query::Ours(State::Running)),
+            ("spawn scheduled", Query::Ours(State::Starting)),
+            ("starting", Query::Ours(State::Starting)),
+            ("not running", Query::Ours(State::Stopped)),
+            ("waiting", Query::Ours(State::Stopped)),
+            ("exited", Query::Unknown),
+            ("Running", Query::Unknown),
+            ("running ", Query::Unknown),
+            ("", Query::Unknown),
+        ] {
+            assert_eq!(observe(exit0, &ours(state, ""), b""), want, "{state:?}");
+        }
+        // Loaded output with any stderr, or under another exit status, is Unknown.
+        assert_eq!(
+            observe(exit0, &ours("running", ""), b"warning\n"),
+            Query::Unknown
+        );
+        for code in [1, 113] {
+            assert_eq!(
+                observe(LaunchdTermination::Exited(code), &ours("running", ""), b""),
+                Query::Unknown
+            );
+        }
+        // Nested `state =`/`path =` lines never stand in for top-level fields.
+        assert_eq!(
+            observe(exit0, &ours("running", ""), b""),
+            Query::Ours(State::Running)
+        );
+    }
+    #[test]
+    fn foreign_identity_and_ambiguous_structure() {
+        let exit0 = LaunchdTermination::Exited(0);
+        let q = |bytes: Vec<u8>| observe(exit0, &bytes, b"");
+        let args = LAUNCHD_ARGUMENTS;
+        let program = LAUNCHD_PROGRAM;
+        for foreign in [
+            print(
+                "/Library/LaunchDaemons/other.plist",
+                "running",
+                program,
+                args,
+                "",
+            ),
+            print(
+                "/System/Library/LaunchDaemons/com.arxcovo.arxd.plist",
+                "not running",
+                program,
+                args,
+                "",
+            ),
+            print(PLIST_PATH, "running", "/usr/local/bin/arxd", args, ""),
+            print(PLIST_PATH, "running", program, &[program, "service"], ""),
+            print(
+                PLIST_PATH,
+                "running",
+                program,
+                &[program, "service", "run", "--x"],
+                "",
+            ),
+            print(
+                PLIST_PATH,
+                "running",
+                program,
+                &["/tmp/arxd", "service", "run"],
+                "",
+            ),
+        ] {
+            assert_eq!(q(foreign), Query::Foreign);
+        }
+        for extra in [
+            format!("\tpath = {PLIST_PATH}\n"),
+            "\tstate = running\n".into(),
+            format!("\tprogram = {program}\n"),
+            "\targuments = {\n\t}\n".into(),
+            "\tno separator\n".into(),
+            "\t\tbad depth = 1\n".into(),
+            "  spaced = 1\n".into(),
+            "\tunclosed = {\n".into(),
+            "}\n".into(),
+        ] {
+            assert_eq!(q(ours("running", &extra)), Query::Unknown, "{extra:?}");
+        }
+        let good = ours("running", "");
+        let text = String::from_utf8(good.clone()).unwrap();
+        for broken in [
+            text.replacen(
+                "system/com.arxcovo.arxd = {",
+                "system/com.arxcovo.other = {",
+                1,
+            ),
+            text.replacen(
+                "system/com.arxcovo.arxd = {",
+                "gui/501/com.arxcovo.arxd = {",
+                1,
+            ),
+            text.replacen(&format!("\tpath = {PLIST_PATH}\n"), "", 1),
+            text.replacen("\tstate = running\n", "", 1),
+            text.replacen(&format!("\tprogram = {program}\n"), "", 1),
+            text.replacen("\targuments = {\n", "\targs = {\n", 1),
+            text.replacen("\t\tservice\n", "\t\tservice = {\n\t\t}\n", 1),
+            text.replace('\n', "\r\n"),
+            format!("{text}trailing\n"),
+            format!("{text}system/com.arxcovo.arxd = {{\n}}\n"),
+            text.trim_end_matches("}\n").to_owned(),
+        ] {
+            assert_eq!(q(broken.into_bytes()), Query::Unknown);
+        }
+        // A trailing newline is optional; blank lines between blocks are ignored.
+        assert_eq!(
+            q(good[..good.len() - 1].to_vec()),
+            Query::Ours(State::Running)
+        );
+    }
+    #[test]
+    fn probe_label_only_changes_the_expected_absence_label() {
+        let stderr =
+            b"Bad request.\nCould not find service \"com.arxcovo.nonexistent-probe\" in domain for system\n";
+        let o = LaunchdObservation {
+            termination: LaunchdTermination::Exited(113),
+            stdout: b"",
+            stderr,
+            stdout_complete: true,
+            stderr_complete: true,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        assert_eq!(
+            launchd_probe(&o, "com.arxcovo.nonexistent-probe"),
+            Query::Absent
+        );
+        assert_eq!(launchd(o), Query::Unknown);
+    }
+    #[test]
+    fn arbitrary_observations_stay_unknown() {
         for termination in [
             LaunchdTermination::Exited(0),
             LaunchdTermination::Exited(1),
@@ -469,10 +881,7 @@ mod empty_profile_tests {
                             stdout_truncated: flags & 4 != 0,
                             stderr_truncated: flags & 8 != 0,
                         });
-                        assert!(
-                            q == Query::Unknown,
-                            "empty-profile-refuses-every-observation"
-                        );
+                        assert!(q == Query::Unknown, "arbitrary-observation-refused");
                     }
                 }
             }
@@ -488,6 +897,8 @@ mod empty_profile_tests {
                     (Artifact::Absent, Query::Absent) => Ok(Status::NotInstalled),
                     (Artifact::Identical, Query::Absent) => Ok(Status::Stopped),
                     (Artifact::Identical, Query::Ours(State::Running)) => Ok(Status::Running),
+                    (Artifact::Identical, Query::Ours(State::Starting)) => Ok(Status::Starting),
+                    (Artifact::Identical, Query::Ours(State::Stopped)) => Ok(Status::Stopped),
                     _ => Err(Error::Manager),
                 };
                 assert_eq!(q.macos_status(a), expected, "exhaustive-macos-status");

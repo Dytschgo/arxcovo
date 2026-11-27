@@ -602,3 +602,57 @@ all existing behavior and environment, including SYSTEMD_PAGER=cat and
 SYSTEMD_COLORS=0. Plan operations are unchanged. Native capture, compatibility,
 installed lifecycle and dedicated execution remain separate gates, **unverified
 on real hardware**. No owner step or production executor activation is granted.
+
+## Launchd profile addendum (2026-11-27)
+
+Coordinator-authorized host-onboarding slice. It supersedes the empty-profile
+addendum's empty accept-set. Every other rule there stays: the bounded capture,
+the per-stream caps, completeness and truncation rules, and the macOS
+predicates in which every `Ours` state is Active.
+
+**Absence (pinned from hosted native evidence).** `Absent` requires the whole
+tuple: exit `113`, both streams complete and untruncated, empty stdout, and
+stderr exactly
+`Bad request.\nCould not find service "com.arxcovo.arxd" in domain for system\n`.
+Any other code, any stdout byte, any other stderr byte, a signal, an incomplete
+capture or invalid UTF-8 is `Unknown`. Exit 113 alone still proves nothing.
+Evidence: the existing read-only CI observer `tools/ci/observe_launchd_absence.py`
+reported `tuple: synthetic-candidate-1` (an exact whole-tuple match) with
+`status: completed`, `exit_code: 113` and both EOFs on main run 45953220781
+(source pin `7b7a44af`, hosted runner image `macos26` 20261117.0516.1, macOS
+26.7.2 build 25G332). The runner query ran as the unprivileged runner account.
+The new `native_macos_tests::real_launchctl_absence_matches_pinned_tuple` test
+repeats the check through the production Rust capture for the unregistered
+probe label `com.arxcovo.nonexistent-probe` on every hosted macOS run. A root
+capture on the owner's Mac mini remains **unverified on real hardware**.
+
+**Loaded profile (synthetic, fail-closed).** `Ours` or `Foreign` requires exit
+0, empty stderr and exactly one block whose header is
+`system/com.arxcovo.arxd = {`. Nested blocks must balance by tab depth and only
+top-level lines are read, so a nested `state =` or `path =` line never counts.
+Every top-level line must be `key = value` or `key = {`. The block must contain
+exactly one `path`, `state` and `program` line and one `arguments` block.
+
+- `Foreign`: the path is not `/Library/LaunchDaemons/com.arxcovo.arxd.plist`,
+  the program is not `/Library/Application Support/Arxcovo/libexec/arxd`, or
+  the argument vector is not exactly that program, `service`, `run`. This
+  meets the empty-profile requirement for domain, label, plist path and
+  program/argv identity.
+- `Ours(Running)` for `running`; `Ours(Starting)` for `spawn scheduled` or
+  `starting`; `Ours(Stopped)` for `not running` or `waiting`.
+- `Unknown`: a missing, duplicated or malformed field, an unbalanced block,
+  trailing content, CR or NUL, or any other state string.
+
+This grammar has no native fixture of an installed arxd job. Until one is
+captured on the Mac mini, a real loaded job may fail closed as `Unknown`, which
+halts stop and uninstall with `service-manager`. It is never misreported as
+absent.
+
+**Status.** macOS status now also maps (identical plist, `Ours(Starting)`) to
+`starting`, and (identical plist, `Ours(Stopped)`) to `stopped`. Every other
+pair outside the three earlier ones still returns `Manager`. A loaded idle job
+can only arise after a clean exit outside the owner lifecycle, because
+`service stop` boots the job out. `service start` skips `bootstrap` for a
+loaded job, so the owner recovers with `service stop` and then `service
+start`. Plans, gates and the allowlist are unchanged; no `kickstart` vector is
+added.
