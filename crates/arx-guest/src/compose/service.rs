@@ -812,10 +812,15 @@ impl ComposeService {
                         }
                         return reject(id, RejectCode::UnknownProject);
                     };
+                    // Private routing is installed before the session can
+                    // recover persisted operations. Public ingress requires a
+                    // settled, started project.
+                    let public_unready = !private
+                        && (project.recovery_required
+                            || project.pending.is_some()
+                            || project.desired != Desired::Started);
                     if project.slot != route.project_slot
-                        || project.recovery_required
-                        || project.pending.is_some()
-                        || (!private && project.desired != Desired::Started)
+                        || public_unready
                         || !project.committed.as_ref().map_or(private, |revision| {
                             route_service_matches(route, &revision.manifest)
                         })

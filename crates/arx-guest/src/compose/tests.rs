@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::codec::decode_base64;
+use super::routing::RouteTarget;
 use super::*;
 
 const CHALLENGE: &str = "0123456789abcdef0123456789abcdef";
@@ -1652,34 +1653,63 @@ fn staging_enforces_order_size_digest_and_session_reset() {
     );
 }
 
+fn site_route(project_slot: u8) -> RouteTarget {
+    RouteTarget {
+        hostname: "site.example.invalid".into(),
+        project_id: PROJECT.into(),
+        service: "web".into(),
+        project_slot,
+        service_index: 0,
+        route_slot: 0,
+    }
+}
+
+fn install_routes(generation: u64, private: bool, route: RouteTarget) -> ComposeRequest {
+    ComposeRequest::ComposeInstallRoutes {
+        id: 10,
+        generation,
+        readiness_host: "arx-boot.invalid".into(),
+        zone: "example.invalid".into(),
+        routes: vec![route],
+        private,
+    }
+}
+
+fn assert_private_routes_during_recovery(h: &Harness, generation: u64) {
+    h.hello_gen(generation);
+    let mut wrong_service = site_route(0);
+    wrong_service.service = "other".into();
+    for (private, route) in [
+        (true, site_route(1)),
+        (true, wrong_service),
+        (false, site_route(0)),
+    ] {
+        assert_eq!(
+            rejected(&h.svc.handle(install_routes(generation, private, route))),
+            Some(RejectCode::ProjectMismatch)
+        );
+    }
+    assert_eq!(
+        h.svc
+            .handle(install_routes(generation, true, site_route(0))),
+        ComposeResponse::ComposeRoutesInstalled { id: 10, generation }
+    );
+}
+
 #[test]
 fn private_routes_reserve_an_undeployed_project_slot_and_validate_its_release() {
     let h = Harness::new();
     h.hello();
-    let request = |private| ComposeRequest::ComposeInstallRoutes {
-        id: 10,
-        generation: GENERATION,
-        readiness_host: "arx-boot.invalid".into(),
-        zone: "example.invalid".into(),
-        routes: vec![super::routing::RouteTarget {
-            hostname: "site.example.invalid".into(),
-            project_id: PROJECT.into(),
-            service: "web".into(),
-            project_slot: 3,
-            service_index: 0,
-            route_slot: 0,
-        }],
-        private,
-    };
+    let route = site_route(3);
+    assert_eq!(
+        rejected(
+            &h.svc
+                .handle(install_routes(GENERATION, false, route.clone()))
+        ),
+        Some(RejectCode::UnknownProject)
+    );
     assert!(matches!(
-        h.svc.handle(request(false)),
-        ComposeResponse::ComposeRejected {
-            code: RejectCode::UnknownProject,
-            ..
-        }
-    ));
-    assert!(matches!(
-        h.svc.handle(request(true)),
+        h.svc.handle(install_routes(GENERATION, true, route)),
         ComposeResponse::ComposeRoutesInstalled { .. }
     ));
     let mismatch = h.stage(&bytes(&plain(PROJECT, &[])));
@@ -1700,6 +1730,98 @@ fn private_routes_reserve_an_undeployed_project_slot_and_validate_its_release() 
     let disk = h.disk.lock().unwrap();
     let state: Value = serde_json::from_slice(disk.state.as_ref().unwrap()).unwrap();
     assert_eq!(state["projects"][PROJECT]["slot"], 3);
+}
+
+#[test]
+fn private_routes_allow_a_project_with_persisted_recovery_required() {
+    let h = Harness::new();
+    h.deployed();
+    {
+        let mut disk = h.disk.lock().unwrap();
+        let mut state: Value = serde_json::from_slice(disk.state.as_ref().unwrap()).unwrap();
+        assert!(state["projects"][PROJECT]["pending"].is_null());
+        state["projects"][PROJECT]["recovery_required"] = json!(true);
+        disk.state = Some(bytes(&state));
+    }
+
+    let restarted = Harness::on(Arc::clone(&h.disk));
+    assert_private_routes_during_recovery(&restarted, GENERATION + 1);
+    assert!(restarted.status(PROJECT).recovery_required);
+    restarted.lifecycle(2, PROJECT, OperationKind::Start);
+    restarted.settle();
+    assert_eq!(restarted.operation(2).state, OperationState::Succeeded);
+    assert!(!restarted.status(PROJECT).recovery_required);
+}
+
+#[test]
+fn private_routes_allow_a_project_with_a_crash_persisted_pending_deploy() {
+    let h = Harness::new();
+    let digest = h.deployed();
+    h.deploy(2, PROJECT, 2, &digest);
+    h.settle();
+    let pending = h
+        .disk
+        .lock()
+        .unwrap()
+        .save_snapshots
+        .iter()
+        .find_map(|snapshot| {
+            let state: Value = serde_json::from_slice(snapshot).unwrap();
+            let project = &state["projects"][PROJECT];
+            (project["pending"]["revision"] == 2).then(|| {
+                assert_eq!(project["recovery_required"], false);
+                snapshot.clone()
+            })
+        })
+        .expect("deploy persisted its intent before effects");
+
+    let restarted = Harness::on(Arc::new(Mutex::new(Disk {
+        state: Some(pending),
+        ..Disk::default()
+    })));
+    assert_eq!(restarted.operation(2).state, OperationState::Ambiguous);
+    assert_private_routes_during_recovery(&restarted, GENERATION + 1);
+    assert!(matches!(
+        restarted.reconcile(2),
+        ComposeResponse::ComposeOperationState {
+            operation: OperationView {
+                state: OperationState::Failed,
+                failure: Some(FailureCode::NotApplied),
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        restarted
+            .svc
+            .handle(install_routes(GENERATION + 1, false, site_route(0))),
+        ComposeResponse::ComposeRoutesInstalled { .. }
+    ));
+}
+
+#[test]
+fn public_and_private_routes_require_identical_bindings_for_shared_hostnames() {
+    let h = Harness::new();
+    h.deployed();
+    for private in [true, false] {
+        assert!(matches!(
+            h.svc
+                .handle(install_routes(GENERATION, private, site_route(0))),
+            ComposeResponse::ComposeRoutesInstalled { .. }
+        ));
+    }
+
+    let mut conflicting = site_route(0);
+    conflicting.route_slot = 1;
+    let mut slot_collision = site_route(0);
+    slot_collision.hostname = "other.example.invalid".into();
+    for route in [conflicting, slot_collision] {
+        assert_eq!(
+            rejected(&h.svc.handle(install_routes(GENERATION, false, route))),
+            Some(RejectCode::ProjectMismatch)
+        );
+    }
 }
 
 #[test]
