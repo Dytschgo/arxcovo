@@ -208,6 +208,18 @@ impl Settings {
         ordinary: &[&Path],
         expected: Option<ConfigStamp>,
     ) -> anyhow::Result<(Self, ConfigStamp)> {
+        Self::vetted_pass(path, uid, ordinary, expected)
+            .map(|(settings, stamp, _)| (settings, stamp))
+    }
+
+    /// `vetted`, also returning the pinned component handles so a caller can
+    /// bind the observed file and directory identities to its own descriptors.
+    fn vetted_pass(
+        path: &Path,
+        uid: u32,
+        ordinary: &[&Path],
+        expected: Option<ConfigStamp>,
+    ) -> anyhow::Result<(Self, ConfigStamp, LayoutPass)> {
         let mut pass = LayoutPass::new()?;
         if !pass.open(path, true)? {
             return Err(refusal());
@@ -311,7 +323,21 @@ impl Settings {
         for root in ordinary {
             pass.ordinary_disjoint(root, &paths)?;
         }
-        Ok((settings, stamp))
+        Ok((settings, stamp, pass))
+    }
+
+    /// Static installation role and launch intent pairing (ADR 0047), shared
+    /// by the worker and by owner `service configure`.
+    fn compatible(&self, intent: Intent) -> bool {
+        let founder = matches!(intent, Intent::CreateFounder | Intent::RecoverFounder);
+        self.founder_cluster.is_some() == founder
+            && self.founder_cluster != Some([0; 16])
+            && match intent {
+                Intent::Join => self.issuer_peer.is_some(),
+                Intent::CreateFounder | Intent::RecoverFounder => self.issuer_peer.is_none(),
+                // The immutable join installation keeps its route. Recovery never uses it.
+                Intent::RecoverJoiner => true,
+            }
     }
 
     fn checked(
@@ -339,9 +365,12 @@ impl Settings {
             .filter(|(address, _)| *address == peer.ip())
             .map(|(_, route)| route)
             .collect::<Vec<_>>();
-        let issuer = match (intent, settings.issuer_peer) {
+        if !settings.compatible(intent) {
+            return Err(refusal());
+        }
+        let issuer = match (intent, settings.issuer_peer.as_deref()) {
             (Intent::Join, Some(issuer)) => {
-                let address = activation::peer_endpoint(&issuer).ok_or_else(refusal)?;
+                let address = activation::peer_endpoint(issuer).ok_or_else(refusal)?;
                 if address == peer
                     || address == enrollment
                     || !routes.iter().any(|route| covers(*route, address.ip()))
@@ -350,18 +379,9 @@ impl Settings {
                 }
                 Some(address)
             }
-            (Intent::Join, None) | (Intent::CreateFounder | Intent::RecoverFounder, Some(_)) => {
-                return Err(refusal());
-            }
-            // The immutable join installation keeps its route. Recovery never uses it.
+            // `compatible` refused every other Join or founder pairing.
             _ => None,
         };
-        if settings.founder_cluster.is_some()
-            != matches!(intent, Intent::CreateFounder | Intent::RecoverFounder)
-            || settings.founder_cluster == Some([0; 16])
-        {
-            return Err(refusal());
-        }
         if let Some(build) = &settings.delegated_build
             && (!build.valid(peer, enrollment)
                 || build.agent_group == settings.owner_gid
@@ -1549,6 +1569,13 @@ pub(super) async fn broker_refusal_close_control(
     .unwrap();
 }
 
+/// A vetted installation fits a launch only with the same daemon group and a
+/// compatible role and intent; `Settings::checked` repeats both in the worker.
+fn launch_matches(settings: &Settings, launch: &ServiceLaunch) -> bool {
+    settings.daemon_gid == launch.daemon_gid
+        && Intent::parse(&launch.intent).is_some_and(|intent| settings.compatible(intent))
+}
+
 #[derive(Clone, Copy)]
 enum WorkerIdentity {
     Dedicated(u32, u32),
@@ -1666,7 +1693,7 @@ impl Child {
         let (settings, stamp) =
             Settings::vetted(&launch.config, launch.daemon_uid, &ordinary, None)
                 .map_err(|_| ExitCode::Config)?;
-        if settings.daemon_gid != launch.daemon_gid {
+        if !launch_matches(&settings, launch) {
             return Err(ExitCode::Config);
         }
         Ok(stamp)

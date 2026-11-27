@@ -354,6 +354,12 @@ fn no_acl(path: &Path) -> Result<(), BindError> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Object(u64, u64);
 
+/// Read-only ADR 0046 owner-route qualification (owners, modes and POSIX
+/// ACLs of every socket ancestor) for owner publication before any bind.
+pub(super) fn route_qualified(path: &Path, owner: u32, daemon: u32, group: u32) -> bool {
+    route(path, owner, daemon, Some(group)).is_ok()
+}
+
 fn route(
     path: &Path,
     owner: u32,

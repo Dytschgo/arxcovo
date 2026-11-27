@@ -23,7 +23,7 @@ local values; do not commit them.
 | Local MCP (`arxd mcp-stdio`) to the installed service | Implemented | Implemented | `main.rs` |
 | Agent commands as the dedicated build account (installed service) | Not available: the installed executor is inert and reports `execution.available: false` | Not available: no macOS UID-sweep executor; post-v1 | `service/executor.rs` (`Execution::configured`) |
 | Cluster join (join code, cluster CA, mutual TLS, Raft) | Implemented in source for Linux; foreground and supervised worker; container-tested only | **Not available**: the cluster runtime is Linux-only, and macOS refuses a `cluster` service setting | `service/cluster_runtime.rs`, `cluster/consensus/bound_start.rs`, `service/config.rs` |
-| Owner CLI that writes the cluster installation file and the service `cluster` setting | Implemented and unit tested (`service cluster-config`, `service configure --cluster-config --cluster-intent`); the installed start is expected to hit the drop-in capability blocker in Linux step 6d | Refused (`cluster-config-unsupported`, `service-config`) | `service/cluster_install.rs`, `cluster_runtime/install.rs`, `config.rs` |
+| Owner CLI that writes the cluster installation file and the service `cluster` setting | Implemented and unit tested (`service cluster-config`, `service configure --cluster-config --cluster-intent`); run the daemon in the foreground until a follow-up ADR resolves the drop-in capability boundary (Linux step 6d) | Refused (`cluster-config-unsupported`, `service-config`) | `service/cluster_install.rs`, `cluster_runtime/install.rs`, `config.rs` |
 | Test VMs (QEMU/KVM on Linux, HVF on Mac) | M4 is Windows/WHPX first; Linux KVM path unverified | QEMU HVF and Apple Virtualization.framework guests: post-v1 | KICKOFF, ROADMAP |
 | Installed boot behaviour, real launchd/systemd output on these machines | **unverified on real hardware** | **unverified on real hardware** | ADR 0014 |
 
@@ -205,45 +205,46 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`):
       macOS and Windows. A malformed command line prints `arxd: usage`
       (exit 2).
 
-   d. **(admin)** Add the cluster launch setting. Repeat your step 5
-      `service configure` command with two more options, then start:
-
-      ```sh
-      sudo /usr/local/libexec/arxcovo/arxd service configure <your step 5 options> \
-        --cluster-config /etc/arxcovo-cluster/cluster.json --cluster-intent create-founder
-      sudo /usr/local/libexec/arxcovo/arxd service start
-      ```
-
-      On a joiner, use `--cluster-intent join`. `configure` resolves
-      `arxd-cluster` itself. Before it changes anything, it repeats the checks
-      the service runs at every start: account, file, layout and separation
-      from the service workspace. A refusal prints `service-config`. A later
-      `configure` without the two options removes the setting. After the
-      first successful start (founder) or join (joiner), reconfigure with
-      `--cluster-intent recover-founder` or `recover-joiner` for every later
-      restart. The create and join intents are for the first start only
-      (`m3_activation_linux.rs` restarts with the recover intents).
-
-      **Expected blocker, found by source reading and not yet run:** the
-      standard-rights drop-in limits the root service to
-      `CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN`. Without
-      `CAP_DAC_READ_SEARCH` the root parent can neither read the `0600` file
-      owned by `arxd-cluster` nor search the `0700` custody parent. `service
-      start` would then exit with `service-config` from `Child::spawn`.
-      `configure` runs under `sudo` with full capabilities, so it does not
-      detect this. The CI acceptance never started the cluster through the
-      installed service. It runs the foreground daemon directly as the daemon
-      account. Until a reviewed fix lands, use that foreground form on the
-      host, in a terminal or `tmux`:
+   d. **Run the cluster daemon in the foreground.** On a standard-rights
+      host this is the supported route today. Run it as the daemon account in
+      a terminal or `tmux` session that stays open:
 
       ```sh
       sudo -u arxd-cluster /usr/local/libexec/arxcovo/arxd \
         --cluster-config /etc/arxcovo-cluster/cluster.json --cluster-intent create-founder
       ```
 
-      Use the same intent rules. Stop it with Ctrl-C (SIGINT); ADR 0047
-      covers the graceful close. Leave the service `cluster` setting out
-      while you run the foreground form.
+      On a joiner, use `--cluster-intent join`. The create and join intents
+      are for the first start only. After the founder's first successful
+      start, or the joiner's join, restart with `recover-founder` or
+      `recover-joiner` (`m3_activation_linux.rs` restarts with the recover
+      intents). The daemon refuses an intent that does not fit the file's
+      role. Stop it with Ctrl-C (SIGINT); ADR 0047 covers the graceful close.
+      This is the form the CI acceptance exercises: the daemon runs directly
+      as the daemon account.
+
+      **Do not add the service `cluster` setting on a standard-rights host
+      yet.** `service configure --cluster-config FILE --cluster-intent
+      INTENT` is implemented for the time a follow-up ADR resolves the
+      capability boundary. The standard-rights drop-in limits the root
+      service to `CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN`.
+      Without `CAP_DAC_READ_SEARCH` the root parent can neither read the
+      `0600` file owned by `arxd-cluster` nor search the `0700` custody
+      parent. This was found by reading the source; nobody has run it. A
+      `service start` with that setting would enable start at boot first and
+      then fail. The daemon would log `arxd: service-config` and exit 3, which
+      `journalctl -u arxd` shows. The owner command would print
+      `arxd: service-manager` and exit 1 because the systemd start failed. If
+      that happens, run `sudo /usr/local/libexec/arxcovo/arxd service stop`,
+      which also turns off start at boot. Then repeat your step 5 `configure`
+      without the two cluster options, which removes the setting.
+
+      What `configure` with the cluster options does, once the boundary is
+      resolved: it resolves `arxd-cluster` itself. Before it changes anything,
+      it repeats the checks the service runs at every start: account, file,
+      layout, role and intent pairing, and separation from the service
+      workspace. A refusal prints `service-config` (exit 3) and changes
+      nothing.
 
    e. **Mint and join.** On the founder, log in as the operator (for example
       `sudo -iu arxd-operator`) and run:
@@ -253,8 +254,12 @@ Fixed paths (`service/layout.rs`, `owner_query.rs`):
       ```
 
       The join envelope appears only on that controlling terminal. On the
-      joiner, with its daemon started with intent `join`, the operator runs
-      `arxd service cluster-control join --socket /var/lib/arxcovo-cluster/control/owner.sock --daemon-uid <joiner-daemon-uid>`.
+      joiner, with its daemon started with intent `join`, the operator runs:
+
+      ```sh
+      /usr/local/libexec/arxcovo/arxd service cluster-control join --socket /var/lib/arxcovo-cluster/control/owner.sock --daemon-uid <joiner-daemon-uid>
+      ```
+
       Paste the envelope at the hidden prompt, then press Enter. The envelope
       carries the cluster CA pin and checksum. The new node gets its
       mutual-TLS identity and enters Raft through admission (ADR 0040, 0042,

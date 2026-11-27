@@ -214,10 +214,12 @@ token into chat, an issue, a command line or a log.
    `INTENT` is one of `create-founder`, `join`, `recover-founder` or
    `recover-joiner`. Both options are given together or not at all; without
    them `configure` writes no `cluster` setting, as before. macOS and Windows
-   refuse both commands. Follow
+   refuse both commands. On a standard-rights host, run the cluster daemon in
+   the foreground and leave the service setting out until a follow-up ADR
+   resolves the drop-in capability boundary. Follow
    [host-onboarding.md](host-onboarding.md) Linux step 6 for the accounts,
-   layout, exact commands, refusal tokens and the known drop-in capability
-   blocker. Installed cluster activation is **unverified on real hardware**.
+   layout, exact commands and refusal tokens. Installed cluster activation is
+   **unverified on real hardware**.
 
 ## macOS
 

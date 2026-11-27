@@ -1230,3 +1230,73 @@ fn unix_configure_vets_cluster_launch_before_reading_or_mutating() {
         Err(Error::Config)
     );
 }
+
+#[test]
+fn flag_free_configure_replaces_a_legacy_stored_launch() {
+    let l = Layout::for_test(Platform::Linux);
+    let ctx = OwnerContext {
+        admin: true,
+        running_binary: l.binary(),
+    };
+    let mut legacy = config_args();
+    legacy.cluster = Some(("/etc/arxcovo-cluster/cluster.json".into(), "join".into()));
+    let previous = ServiceConfig::from_request(&legacy.request(), &l, &ClusterAccounts)
+        .unwrap()
+        .serialized(false)
+        .unwrap();
+    // A stored path with a redundant internal slash, which the start-time
+    // component walk accepts but the strict owner spelling rule refuses.
+    let mut value: serde_json::Value = serde_json::from_slice(&previous).unwrap();
+    value["cluster"]["config"] = "/etc//arxcovo-cluster/cluster.json".into();
+    let previous = serde_json::to_vec(&value).unwrap();
+    assert!(ServiceConfig::parse(&previous, &l, &ClusterAccounts).is_ok());
+    let mut replaced = None;
+    unix_configure(
+        || Ok(Some(previous.clone())),
+        &ClusterAccounts,
+        &l,
+        &ctx,
+        &config_args(),
+        |_| Ok(()),
+        |p| {
+            replaced = p.operations().iter().find_map(|o| match o {
+                Operation::AtomicConfig {
+                    bytes, expected, ..
+                } => Some((bytes.clone(), expected.clone())),
+                _ => None,
+            });
+            Ok(())
+        },
+    )
+    .unwrap();
+    let (bytes, expected) = replaced.unwrap();
+    // The plan expects the previous file exactly as the reader parsed it,
+    // including the legacy spelling.
+    let canonical = ServiceConfig::parse(&previous, &l, &ClusterAccounts)
+        .unwrap()
+        .serialized(false)
+        .unwrap();
+    assert_eq!(expected.as_ref(), Some(&canonical));
+    let old: serde_json::Value = serde_json::from_slice(&expected.unwrap()).unwrap();
+    assert_eq!(
+        old["cluster"]["config"],
+        "/etc//arxcovo-cluster/cluster.json"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(v.get("cluster").is_none());
+    // New owner input keeps the strict canonical spelling.
+    let mut strict = config_args();
+    strict.cluster = Some(("/etc//arxcovo-cluster/cluster.json".into(), "join".into()));
+    assert_eq!(
+        unix_configure(
+            || panic!("no previous read"),
+            &ClusterAccounts,
+            &l,
+            &ctx,
+            &strict,
+            |_| panic!("no preflight"),
+            |_| panic!("no mutation"),
+        ),
+        Err(Error::Config)
+    );
+}

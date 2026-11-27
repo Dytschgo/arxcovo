@@ -155,10 +155,14 @@ impl ServiceConfig {
                     .identity
                     .parse::<u32>()
                     .map_err(|_| Error::Identity)?;
+                let daemon_gid = daemon.gid.ok_or(Error::Identity)?;
                 if daemon.kind != AccountKind::User
                     || daemon.administrative
                     || daemon.identity == build.identity
                     || daemon.identity == client.identity
+                    || [daemon_uid, daemon_gid]
+                        .iter()
+                        .any(|id| *id == 0 || *id == u32::MAX)
                 {
                     return Err(Error::Identity);
                 }
@@ -166,7 +170,7 @@ impl ServiceConfig {
                     config: cluster.config.into(),
                     intent: cluster.intent.into(),
                     daemon_uid,
-                    daemon_gid: daemon.gid.ok_or(Error::Identity)?,
+                    daemon_gid,
                 })
             })
             .transpose()?;
@@ -296,24 +300,13 @@ impl ServiceConfig {
         {
             return Err(Error::Identity);
         }
-        if let Some(launch) = &w.cluster {
-            let daemon = launch.daemon_uid.to_string();
-            if self.platform != Platform::Linux
-                || !launch
-                    .config
-                    .to_str()
-                    .is_some_and(|config| launch_static(config, &launch.intent))
-            {
-                return Err(Error::Config);
-            }
-            if [launch.daemon_uid, launch.daemon_gid]
-                .iter()
-                .any(|id| *id == 0 || *id == u32::MAX)
-                || daemon == w.client.identity
-                || daemon == w.build_account.identity
-            {
-                return Err(Error::Identity);
-            }
+        // Stored `arxd-service/1` launch values keep the reader's existing
+        // acceptance, so a flag-free configure can always replace them.
+        // New owner input is strict (`from_request`), and `Child::spawn` and
+        // the worker vet every launch at start. Only the platform refusal
+        // applies here: macOS and Windows never accept a cluster setting.
+        if w.cluster.is_some() && self.platform != Platform::Linux {
+            return Err(Error::Config);
         }
         let client = resolver
             .account(&w.client.identity)
@@ -467,8 +460,8 @@ impl ServiceConfig {
         Ok(bytes)
     }
 }
-/// Static launch facts checked before any observation; `Child::spawn` and the
-/// worker still vet the file, layout and accounts at every start.
+/// Strict static facts for new owner input, checked before any observation.
+/// `Child::spawn` and the worker still vet the file, layout and accounts.
 fn launch_static(config: &str, intent: &str) -> bool {
     posix_path(config) && INTENTS.contains(&intent)
 }
@@ -1600,65 +1593,40 @@ mod cluster_launch_tests {
     }
 
     #[test]
-    fn stored_launch_values_are_revalidated_on_every_parse() {
+    fn stored_launch_values_keep_the_existing_reader_acceptance() {
         let layout = Layout::for_test(Platform::Linux);
         let r = tests::FakeResolver::default();
-        let base = || {
+        let stored = |config: &str, intent: &str, uid: u32, gid: u32| {
             let mut value = tests::fixture();
             value["cluster"] = serde_json::json!({
-                "config": "/etc/arxcovo-cluster/cluster.json",
-                "intent": "recover-joiner",
-                "daemon_uid": 1100,
-                "daemon_gid": 1100,
+                "config": config,
+                "intent": intent,
+                "daemon_uid": uid,
+                "daemon_gid": gid,
             });
-            value
+            serde_json::to_vec(&value).unwrap()
         };
-        assert!(tests::parse(base(), &r).is_ok());
-        for (pointer, value, expected) in [
-            (
-                "/cluster/config",
-                serde_json::json!("relative"),
-                Error::Config,
-            ),
-            (
-                "/cluster/config",
-                serde_json::json!("/a/../b"),
-                Error::Config,
-            ),
-            (
-                "/cluster/intent",
-                serde_json::json!("recover"),
-                Error::Config,
-            ),
-            ("/cluster/daemon_uid", serde_json::json!(0), Error::Identity),
-            (
-                "/cluster/daemon_uid",
-                serde_json::json!(u32::MAX),
-                Error::Identity,
-            ),
-            (
-                "/cluster/daemon_uid",
-                serde_json::json!(1001),
-                Error::Identity,
-            ),
-            (
-                "/cluster/daemon_uid",
-                serde_json::json!(1002),
-                Error::Identity,
-            ),
-            ("/cluster/daemon_gid", serde_json::json!(0), Error::Identity),
+        // Forms the start-time component walk handles, or refuses only when
+        // the service starts, still parse so configure can replace them.
+        for bytes in [
+            stored("/etc//arxcovo-cluster/cluster.json", "join", 1100, 1100),
+            stored("/etc/arxcovo-cluster/./cluster.json", "join", 1100, 1100),
+            stored("/etc/arxcovo-cluster/cluster.json", "recover", 1100, 1100),
+            stored("/etc/arxcovo-cluster/cluster.json", "join", 0, 1100),
+            stored("/etc/arxcovo-cluster/cluster.json", "join", 1001, 1100),
         ] {
-            let mut v = base();
-            *v.pointer_mut(pointer).unwrap() = value;
-            let bytes = serde_json::to_vec(&v).unwrap();
-            assert!(tests::parse(v, &r).err() == Some(expected), "{pointer}");
-            assert!(
-                ServiceConfig::parse_inventory(&bytes, &layout, &r).err() == Some(expected),
-                "{pointer}"
-            );
+            assert!(ServiceConfig::parse(&bytes, &layout, &r).is_ok());
+            assert!(ServiceConfig::parse_inventory(&bytes, &layout, &r).is_ok());
         }
-        let mut v = base();
-        v["cluster"]["extra"] = 1.into();
-        assert!(tests::parse(v, &r).err() == Some(Error::Config));
+        // The schema itself stays closed.
+        let mut value = tests::fixture();
+        value["cluster"] = serde_json::json!({
+            "config": "/etc/arxcovo-cluster/cluster.json",
+            "intent": "join",
+            "daemon_uid": 1100,
+            "daemon_gid": 1100,
+            "extra": 1,
+        });
+        assert!(tests::parse(value, &r).err() == Some(Error::Config));
     }
 }

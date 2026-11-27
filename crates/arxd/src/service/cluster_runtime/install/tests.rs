@@ -1,9 +1,9 @@
-use super::super::Child;
+use super::super::{Child, launch_matches};
 use super::*;
 use crate::cluster::consensus::activation::Intent;
 use crate::service::{
     cluster_install::{INTENTS, tests::IDS, tests::request},
-    config::Account,
+    config::{Account, ServiceLaunch},
     layout::{Error, Platform},
 };
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -90,8 +90,8 @@ impl Fixture {
         }
     }
 
-    fn vet(&self) -> impl Fn(&Path) -> bool + '_ {
-        move |path: &Path| Settings::vetted(path, self.uid, &[], None).is_ok()
+    fn vet(&self) -> impl Fn(&Path) -> Option<Vetted> + '_ {
+        move |path: &Path| vetted_objects(path, self.uid, &[])
     }
 
     fn entries(&self, name: &str) -> Vec<String> {
@@ -178,7 +178,7 @@ fn refused_layouts_publish_nothing() {
         assert_eq!(metadata.mode() & 0o7777, 0o600);
         assert_eq!(std::fs::read(path).unwrap(), bytes);
         seen.push(path.to_path_buf());
-        false
+        None
     });
     assert_eq!(refused, Err(InstallError::Layout));
     assert_eq!(seen.len(), 1);
@@ -245,11 +245,222 @@ fn a_published_file_that_fails_its_final_vet_is_removed() {
     let calls = std::cell::Cell::new(0);
     let result = write_private(&out, &bytes, (fixture.uid, fixture.gid), |path: &Path| {
         calls.set(calls.get() + 1);
-        path != out
+        if path == out {
+            None
+        } else {
+            vetted_objects(path, fixture.uid, &[])
+        }
     });
     assert_eq!(result, Err(InstallError::Layout));
     assert_eq!(calls.get(), 2);
     assert!(fixture.entries("config").is_empty());
+}
+
+#[test]
+fn layout_checks_must_observe_the_created_file_and_qualified_directory() {
+    let fixture = Fixture::new();
+    let r = fixture.request(Role::Founder);
+    let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
+    let out = fixture.path("config/cluster.json");
+    // A check that observed different objects authorizes nothing, even when
+    // it reports success for the same pathname.
+    let forgeries: [fn(Vetted) -> Vetted; 2] = [
+        |v: Vetted| Vetted {
+            file: (v.file.0, v.file.1 ^ 1),
+            parent: v.parent,
+        },
+        |v: Vetted| Vetted {
+            file: v.file,
+            parent: (v.parent.0, v.parent.1 ^ 1),
+        },
+    ];
+    for forged in forgeries {
+        let result = write_private(&out, &bytes, (fixture.uid, fixture.gid), |path: &Path| {
+            vetted_objects(path, fixture.uid, &[]).map(forged)
+        });
+        assert_eq!(result, Err(InstallError::Layout));
+        assert!(fixture.entries("config").is_empty());
+    }
+    // The genuine identities are exactly the created file and its directory.
+    let mut observed = Vec::new();
+    write_private(&out, &bytes, (fixture.uid, fixture.gid), |path: &Path| {
+        let vetted = vetted_objects(path, fixture.uid, &[]);
+        observed.push(vetted);
+        vetted
+    })
+    .unwrap();
+    let file = std::fs::symlink_metadata(&out).unwrap();
+    let dir = std::fs::symlink_metadata(fixture.path("config")).unwrap();
+    let expected = Vetted {
+        file: (file.dev(), file.ino()),
+        parent: (dir.dev(), dir.ino()),
+    };
+    assert_eq!(observed, [Some(expected), Some(expected)]);
+}
+
+#[test]
+fn every_ancestor_is_qualified_before_anything_is_created() {
+    let fixture = Fixture::new();
+    let r = fixture.request(Role::Founder);
+    let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
+    let never = |_: &Path| -> Option<Vetted> { panic!("nothing is created or vetted") };
+    // A symlink above the immediate parent is refused during the walk.
+    std::fs::create_dir(fixture.path("real")).unwrap();
+    fixture.qualify(&fixture.path("real"), 0o700);
+    std::fs::create_dir(fixture.path("real/sub")).unwrap();
+    fixture.qualify(&fixture.path("real/sub"), 0o700);
+    std::os::unix::fs::symlink(fixture.path("real"), fixture.path("up")).unwrap();
+    assert_eq!(
+        write_private(
+            &fixture.path("up/sub/cluster.json"),
+            &bytes,
+            (fixture.uid, fixture.gid),
+            never
+        ),
+        Err(InstallError::Layout)
+    );
+    assert!(fixture.entries("real/sub").is_empty());
+    // A group- or world-writable ancestor is refused before creation.
+    for mode in [0o770, 0o707] {
+        fixture.qualify(fixture.root.path(), mode);
+        assert_eq!(
+            write_private(
+                &fixture.path("config/cluster.json"),
+                &bytes,
+                (fixture.uid, fixture.gid),
+                never
+            ),
+            Err(InstallError::Layout)
+        );
+        fixture.qualify(fixture.root.path(), 0o700);
+        assert!(fixture.entries("config").is_empty());
+    }
+    // An ancestor owned by another account is refused.
+    assert_eq!(
+        write_private(
+            &fixture.path("config/cluster.json"),
+            &bytes,
+            (fixture.uid.wrapping_add(1), fixture.gid),
+            never
+        ),
+        Err(InstallError::Layout)
+    );
+    assert!(fixture.entries("config").is_empty());
+    // A non-directory parent and a relative path are refused.
+    std::fs::write(fixture.path("plain"), b"").unwrap();
+    assert_eq!(
+        write_private(
+            &fixture.path("plain/cluster.json"),
+            &bytes,
+            (fixture.uid, fixture.gid),
+            never
+        ),
+        Err(InstallError::Layout)
+    );
+    assert_eq!(
+        write_private(
+            Path::new("relative/cluster.json"),
+            &bytes,
+            (fixture.uid, fixture.gid),
+            never
+        ),
+        Err(InstallError::Argument)
+    );
+}
+
+/// A minimal POSIX ACL xattr: version 2 with user, group and other entries.
+fn minimal_acl() -> Vec<u8> {
+    let mut value = 2u32.to_le_bytes().to_vec();
+    for (tag, perm) in [(0x01u16, 7u16), (0x04, 5), (0x20, 0)] {
+        value.extend(tag.to_le_bytes());
+        value.extend(perm.to_le_bytes());
+        value.extend(u32::MAX.to_le_bytes());
+    }
+    value
+}
+
+#[test]
+fn owner_socket_route_refuses_posix_acls_before_publication() {
+    let fixture = Fixture::new();
+    let r = fixture.request(Role::Founder);
+    let bytes = install::document(&r, &fixture.ids(), Some([9; 16])).unwrap();
+    let settings = parity(&bytes).unwrap();
+    assert_eq!(socket_route(&settings), Ok(()));
+    let control = std::ffi::CString::new(fixture.text("control")).unwrap();
+    let acl = minimal_acl();
+    // SAFETY: the path and attribute name are NUL terminated and the value
+    // buffer is live for the call.
+    let rc = unsafe {
+        libc::setxattr(
+            control.as_ptr(),
+            c"system.posix_acl_default".as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    };
+    if rc != 0 {
+        // The test filesystem has no POSIX ACL support; nothing to observe.
+        let error = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(error, Some(libc::EOPNOTSUPP), "setxattr");
+        return;
+    }
+    assert_eq!(socket_route(&settings), Err(InstallError::Layout));
+    // A wrong control group or mode is refused too.
+    // SAFETY: as above; removing the attribute restores the clean layout.
+    assert_eq!(
+        unsafe { libc::removexattr(control.as_ptr(), c"system.posix_acl_default".as_ptr()) },
+        0
+    );
+    assert_eq!(socket_route(&settings), Ok(()));
+    fixture.qualify(&fixture.path("control"), 0o2750);
+    assert_eq!(socket_route(&settings), Err(InstallError::Layout));
+}
+
+#[test]
+fn role_and_intent_pairs_match_the_worker_rule() {
+    let founder =
+        parity(&install::document(&request(Role::Founder), &IDS, Some([1; 16])).unwrap()).unwrap();
+    let joiner = parity(&install::document(&request(Role::Joiner), &IDS, None).unwrap()).unwrap();
+    for (intent, founder_ok, joiner_ok) in [
+        ("create-founder", true, false),
+        ("recover-founder", true, false),
+        ("join", false, true),
+        ("recover-joiner", false, true),
+    ] {
+        let parsed = Intent::parse(intent).unwrap();
+        assert_eq!(founder.compatible(parsed), founder_ok, "{intent}");
+        assert_eq!(joiner.compatible(parsed), joiner_ok, "{intent}");
+        // `service configure` uses the same rule through `Child::qualify`.
+        let launch = |gid| ServiceLaunch {
+            config: "/etc/arxcovo-cluster/cluster.json".into(),
+            intent: intent.into(),
+            daemon_uid: IDS.daemon_uid,
+            daemon_gid: gid,
+        };
+        assert_eq!(
+            launch_matches(&founder, &launch(IDS.daemon_gid)),
+            founder_ok
+        );
+        assert_eq!(launch_matches(&joiner, &launch(IDS.daemon_gid)), joiner_ok);
+        assert!(!launch_matches(&founder, &launch(IDS.daemon_gid + 1)));
+        assert!(!launch_matches(&joiner, &launch(IDS.daemon_gid + 1)));
+    }
+    let mut unknown = ServiceLaunch {
+        config: "/etc/arxcovo-cluster/cluster.json".into(),
+        intent: "founder".into(),
+        daemon_uid: IDS.daemon_uid,
+        daemon_gid: IDS.daemon_gid,
+    };
+    assert!(!launch_matches(&founder, &unknown));
+    unknown.intent = "create-founder".into();
+    assert!(launch_matches(&founder, &unknown));
+    // A zero founder cluster ID never fits any intent.
+    let mut zero = founder;
+    zero.founder_cluster = Some([0; 16]);
+    for intent in INTENTS {
+        assert!(!zero.compatible(Intent::parse(intent).unwrap()));
+    }
 }
 
 #[test]
