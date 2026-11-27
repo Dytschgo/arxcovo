@@ -10,6 +10,8 @@ use records::{DockerDependencies, Hash, Observation, Record, Stage, StageResult,
 use std::cell::{Cell, RefCell};
 use std::io::Read;
 use std::os::windows::fs::OpenOptionsExt;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use trial::witness::{
     self, Case, Counts, Drift, FlowEvent, Listener, ReceiverEnrollment, Receivers, RouteChange,
     RouteSample, Target, Transport,
@@ -37,7 +39,7 @@ enum Fault {
     ForeignGuest,
     WrongCompose,
     WrongOrigin,
-    WrongTrustProfile,
+    WrongOriginCertificate,
     WrongFixture,
     WrongReceiverBoot,
     WrongReceiverGeneration,
@@ -70,11 +72,12 @@ enum Fault {
     ForeignRoute,
     MalformedPolicy,
     ChangedRoute,
+    EndpointRouteDrift,
     ChangedTopology,
     ReplacedPolicy,
     ForeignListener,
     MissingListener,
-    WrongOriginBoot,
+    WrongOriginName,
     WrongOriginGeneration,
     ReplayedBoot,
     Sink,
@@ -220,7 +223,13 @@ impl<'a> trial::Host for Host<'a> {
         if peer.is_some() {
             assert_eq!(trace.launched.last(), Some(&ticket.phase));
         }
-        assert!(!trace.continued.contains(&ticket.phase));
+        if trace.continued.contains(&ticket.phase) {
+            assert_eq!(ticket.phase, trial::Phase::Endpoint);
+            assert_eq!(trace.listener_checks, 2);
+            if self.fault == Fault::EndpointRouteDrift {
+                return Err(NativeRefusal::NetworkFenceUnverified);
+            }
+        }
         let mut sample = RouteSample {
             ticket,
             peer,
@@ -448,12 +457,14 @@ fn peer(phase: trial::Phase, fault: Fault) -> trial::PeerId {
     }
 }
 
-struct Guest {
+struct Guest<'a> {
     fault: Fault,
     challenge: Option<Challenge>,
+    runtime: &'a tokio::runtime::Runtime,
+    port: &'a OriginPortLease,
 }
 
-impl trial::Guest for Guest {
+impl trial::Guest for Guest<'_> {
     fn exchange(
         &mut self,
         mut peer: trial::PeerId,
@@ -480,9 +491,17 @@ impl trial::Guest for Guest {
             }
             Ok(Some(TrialRequest::DockerTrialProvision { challenge })) => {
                 assert_eq!(self.challenge, Some(challenge));
+                let certificate_der = origin_peer(self.runtime, self.port, challenge, self.fault);
+                let mut echoed = challenge;
+                if self.fault == Fault::WrongOriginGeneration {
+                    echoed.generation += 1;
+                }
                 arx_guest::write_frame(
                     &mut reply,
-                    &TrialResponse::DockerTrialProvisioned { challenge },
+                    &TrialResponse::DockerTrialProvisioned {
+                        challenge: echoed,
+                        certificate_der,
+                    },
                 )
                 .unwrap();
             }
@@ -528,7 +547,6 @@ impl trial::Guest for Guest {
 
 struct Capture<'a> {
     fault: Fault,
-    profile: Hash,
     trace: &'a RefCell<Trace>,
 }
 
@@ -696,38 +714,75 @@ impl trial::Capture for Capture<'_> {
         }
         Ok(json.into_bytes())
     }
+}
 
-    fn origin(
-        &mut self,
-        peer: trial::PeerId,
-        challenge: Challenge,
-        port: u16,
-        _: u64,
-    ) -> Result<trial::OriginProof, NativeRefusal> {
-        assert_eq!(self.trace.borrow().listener_checks, 1);
-        let mut observed = peer;
-        let mut binding = challenge;
-        if self.fault == Fault::WrongOriginBoot {
-            observed.boot[0] ^= 1;
+// The fixture supplies a TLS server, not an origin verdict. The collector
+// makes the same certificate, SNI and HTTP checks for the emitted dossier.
+fn origin_peer(
+    runtime: &tokio::runtime::Runtime,
+    port: &OriginPortLease,
+    challenge: Challenge,
+    fault: Fault,
+) -> Vec<u8> {
+    let mut other = challenge;
+    other.nonce[0] ^= 1;
+    let name = if fault == Fault::WrongOriginName {
+        other.origin_name()
+    } else {
+        challenge.origin_name()
+    };
+    let leaf = rcgen::generate_simple_self_signed(vec![name]).unwrap();
+    let der = if fault == Fault::WrongOriginCertificate {
+        rcgen::generate_simple_self_signed(vec![challenge.origin_name()])
+            .unwrap()
+            .cert
+            .der()
+            .to_vec()
+    } else {
+        leaf.cert.der().to_vec()
+    };
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![leaf.cert.der().clone()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(leaf.signing_key.serialize_der()).into(),
+    )
+    .unwrap();
+    let body = if fault == Fault::WrongOrigin {
+        other.origin_health()
+    } else {
+        challenge.origin_health()
+    };
+    let listener = port.fixture_listener().unwrap();
+    runtime.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let tls = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let Ok(mut stream) = tls.accept(socket).await else {
+            return;
+        };
+        let mut request = Vec::new();
+        while request.len() < 1024 && !request.ends_with(b"\r\n\r\n") {
+            request.push(stream.read_u8().await.unwrap());
         }
-        if self.fault == Fault::WrongOriginGeneration {
-            binding.generation += 1;
-        }
-        Ok(trial::OriginProof {
-            peer: observed,
-            challenge: binding,
-            port: if self.fault == Fault::WrongOrigin {
-                port ^ 1
-            } else {
-                port
-            },
-            tls_profile: if self.fault == Fault::WrongTrustProfile {
-                [99; 32]
-            } else {
-                self.profile
-            },
-        })
-    }
+        let expected = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            wire::ORIGIN_HEALTH_PATH,
+            challenge.origin_name(),
+        );
+        assert_eq!(request, expected.as_bytes());
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    der
 }
 
 fn fixture_route() -> RouteObservation {
@@ -763,6 +818,7 @@ fn collect(fault: Fault) {
     let custody = trial::Custody::claim(pin, &evidence, sid(&owner)).unwrap();
     let (mut dependencies, baseline, _) = docker_fixture(&evidence);
     dependencies.policy = digest(&policy_bytes());
+    dependencies.origin_profile = trial::origin_profile_pin();
     let manifest = serde_json::to_vec(&witness::fixture_targets()).unwrap();
     let receiver_enrollment =
         ReceiverEnrollment::from_manifest(&manifest, [[51; 32], [52; 32], [53; 32]]).unwrap();
@@ -952,6 +1008,10 @@ fn collect(fault: Fault) {
             .is_err()
     );
 
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let trace = RefCell::new(Trace::default());
     let journal = root.join("docker-trial.charge").unwrap();
     let orphan = root.join("staged-partial.qcow2").unwrap();
@@ -970,10 +1030,11 @@ fn collect(fault: Fault) {
         guest: Guest {
             fault,
             challenge: None,
+            runtime: &runtime,
+            port: &ports[1],
         },
         capture: Capture {
             fault,
-            profile: dependencies.origin_profile,
             trace: &trace,
         },
         packages: PACKAGES,
@@ -983,6 +1044,7 @@ fn collect(fault: Fault) {
         custody,
         evidence: &evidence,
         cancel: &Shutdown::default(),
+        runtime: &runtime,
     };
     if fault == Fault::Sink {
         FAULT.set(Some((COMPLETE, Step::Flush)));
@@ -1170,7 +1232,7 @@ fn docker_collector_retains_staged_crashes_and_refuses_bad_proofs() {
         Fault::ForeignGuest,
         Fault::WrongCompose,
         Fault::WrongOrigin,
-        Fault::WrongTrustProfile,
+        Fault::WrongOriginCertificate,
         Fault::WrongFixture,
         Fault::ReplayedBoot,
     ] {
@@ -1242,6 +1304,11 @@ fn docker_collector_rechecks_live_policy_route_before_cont() {
 }
 
 #[test]
+fn docker_collector_refuses_endpoint_route_drift_after_https() {
+    collect(Fault::EndpointRouteDrift);
+}
+
+#[test]
 fn docker_collector_refuses_foreign_listener_after_https() {
     collect(Fault::ForeignListener);
 }
@@ -1264,7 +1331,7 @@ fn docker_collector_refuses_missing_foreign_and_malformed_witnesses() {
         Fault::ChangedTopology,
         Fault::ReplacedPolicy,
         Fault::MissingListener,
-        Fault::WrongOriginBoot,
+        Fault::WrongOriginName,
         Fault::WrongOriginGeneration,
     ] {
         collect(fault);
