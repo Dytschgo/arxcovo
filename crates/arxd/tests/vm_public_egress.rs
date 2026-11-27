@@ -5,7 +5,7 @@
 use arxd::{
     config::VmRuntimeProfile,
     vm::{
-        paths::{Artifact, ArtifactPin, ArtifactRole, FileIdentity, LocalPath},
+        paths::{Artifact, ArtifactPin, ArtifactRole, FileIdentity, InvalidPath, LocalPath},
         public_egress::{
             CustodiedPolicy, EGRESS_MANIFEST, EgressBinaryPin, EgressEvidence, EgressRefusal,
             FROZEN_DENY, FlowRefusal, GuestFlow, HeldExecutable, Ipv4Cidr, LocalForward,
@@ -80,13 +80,20 @@ fn digest_pin(body: &[u8]) -> ArtifactPin {
     }
 }
 
-fn qcow2_header() -> Vec<u8> {
+/// The Compose resource envelope every public-egress plan must match: two
+/// vCPUs, 4096 MiB RAM and a 32 GiB unbacked QCOW2 (header bytes only).
+const COMPOSE_VCPUS: u32 = 2;
+const COMPOSE_RAM_MIB: u32 = 4096;
+const COMPOSE_DISK_BYTES: u64 = 32 << 30;
+
+/// One in-memory QCOW2 v3 header cluster; no image file is created.
+fn qcow2_header(virtual_size: u64) -> Vec<u8> {
     let mut header = vec![0; 65_536];
     header[..4].copy_from_slice(&[b'Q', b'F', b'I', 0xfb]);
     for (at, val) in [(4, 3u32), (20, 16), (96, 4), (100, 112)] {
         header[at..at + 4].copy_from_slice(&val.to_be_bytes());
     }
-    header[24..32].copy_from_slice(&1_048_576u64.to_be_bytes());
+    header[24..32].copy_from_slice(&virtual_size.to_be_bytes());
     header
 }
 
@@ -123,7 +130,7 @@ impl Inputs {
             static_disk: artifact(StaticDisk, "D:/vm/disk.qcow2"),
             vars: artifact(Vars, "D:/test/vars.fd"),
             disk: artifact(GuestDisk, "D:/test/disk.qcow2"),
-            header: qcow2_header(),
+            header: qcow2_header(COMPOSE_DISK_BYTES),
             serial: SerialName::generate().unwrap(),
         }
     }
@@ -141,8 +148,10 @@ impl Inputs {
             backing_header: None,
             serial: &self.serial,
             boot,
-            ram_mib: 256,
-            vcpus: 1,
+            // Both static recipes share the Compose envelope so their argv
+            // stays comparable; the TEST boot keeps the minimal shape.
+            ram_mib: if test { 256 } else { COMPOSE_RAM_MIB },
+            vcpus: if test { 1 } else { COMPOSE_VCPUS },
         }
     }
 }
@@ -267,6 +276,65 @@ fn public_egress_requires_the_patched_image_and_a_custodied_bounded_policy() {
     backed.backing = Some(&golden);
     backed.backing_header = Some(&inputs.header);
     assert!(backed.plan().is_err(), "static disks are unbacked");
+}
+
+#[test]
+fn public_egress_refuses_any_shape_outside_the_compose_envelope() {
+    let inputs = Inputs::new();
+    let lease = OriginPortLease::acquire().unwrap();
+    let policy = policy_artifact(digest_pin(policy_text().as_bytes()));
+    let egress = || {
+        inputs.recipe(
+            &inputs.patched,
+            BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::PublicEgress(&policy)),
+        )
+    };
+    let fitted = egress();
+    let plan = fitted.plan().unwrap();
+    assert_eq!(after(plan.args(), "-smp"), vec!["2"]);
+    assert_eq!(after(plan.args(), "-m"), vec!["4096"]);
+    for (vcpus, ram_mib) in [
+        (1, COMPOSE_RAM_MIB),
+        (3, COMPOSE_RAM_MIB),
+        (2, 256),
+        (2, 8192),
+    ] {
+        let mut recipe = egress();
+        recipe.vcpus = vcpus;
+        recipe.ram_mib = ram_mib;
+        assert_eq!(
+            recipe.plan().err(),
+            Some(InvalidPath),
+            "{vcpus} vCPU / {ram_mib} MiB is outside the envelope"
+        );
+    }
+    let mut small = egress();
+    small.vcpus = 1;
+    small.ram_mib = 256;
+    assert_eq!(
+        small.plan().err(),
+        Some(InvalidPath),
+        "the old fixture shape"
+    );
+    for size in [
+        1_048_576,
+        COMPOSE_DISK_BYTES - 65_536,
+        COMPOSE_DISK_BYTES * 2,
+    ] {
+        let header = qcow2_header(size);
+        let mut recipe = egress();
+        recipe.disk_header = &header;
+        assert_eq!(
+            recipe.plan().err(),
+            Some(InvalidPath),
+            "a {size}-byte disk is outside the envelope"
+        );
+    }
+    let mut unreadable = egress();
+    let mut bad = qcow2_header(COMPOSE_DISK_BYTES);
+    bad[0] = 0;
+    unreadable.disk_header = &bad;
+    assert_eq!(unreadable.plan().err(), Some(InvalidPath));
 }
 
 #[test]

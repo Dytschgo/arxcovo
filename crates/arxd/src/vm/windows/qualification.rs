@@ -827,6 +827,8 @@ enum CollectMode<'a> {
     /// Standalone qualifier claiming a fresh writable evidence directory and
     /// reading the stopped production store without a daemon lock.
     Qualifier,
+    /// Qualifier holds a stopped store and reads an existing TEST dossier.
+    QualifierReview,
     /// Daemon foreground reader borrowing its already-locked `VmStore` and
     /// opening an existing evidence dossier read-only.
     Foreground(&'a crate::store::vm::VmStore),

@@ -379,6 +379,14 @@ pub(crate) struct Supervisor {
     /// Blocks the next sweep.
     #[cfg(test)]
     stall_sweep: Mutex<Option<tests::StallHook>>,
+    /// Retires the fixture static network once, after the next Compose or
+    /// backup dispatch looked up its session and before its transaction.
+    #[cfg(test)]
+    retire_static_after_lookup: AtomicBool,
+    /// Retires the fixture static network once inside the next fresh Compose
+    /// or backup admission, after its first in-transaction fence.
+    #[cfg(test)]
+    retire_static_in_admission: AtomicBool,
     /// Blocks the next early owner revocation after its transition recorded
     /// the stop obligations and before their runners are spawned.
     #[cfg(test)]
@@ -573,6 +581,10 @@ impl Supervisor {
             stall_admission: Mutex::new(None),
             #[cfg(test)]
             stall_sweep: Mutex::new(None),
+            #[cfg(test)]
+            retire_static_after_lookup: AtomicBool::new(false),
+            #[cfg(test)]
+            retire_static_in_admission: AtomicBool::new(false),
             #[cfg(test)]
             stall_revoked: Mutex::new(None),
             #[cfg(test)]
@@ -941,6 +953,47 @@ impl Supervisor {
             Ok(selected) => selected.refusal(),
             Err(reason) => Some(*reason),
         }
+    }
+
+    /// Re-samples the static selection at a fresh-intent boundary. A session
+    /// looked up earlier may outlive a route watch that has since retired.
+    fn fence_fresh_intent(&self, fenced: &std::cell::Cell<Option<NativeRefusal>>) -> bool {
+        let refusal = self.static_refusal();
+        fenced.set(refusal);
+        refusal.is_some()
+    }
+
+    /// The rollback check of a fresh admission: an `Err` from the store
+    /// closure rolls back any fresh rows and bookkeeping writes in the same
+    /// transaction.
+    fn commit_fresh_intent(
+        &self,
+        fenced: &std::cell::Cell<Option<NativeRefusal>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.fence_fresh_intent(fenced),
+            "static selection retired during admission"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn retire_static_if(&self, armed: &AtomicBool) {
+        if armed.swap(false, Ordering::AcqRel) {
+            self.static_selection()
+                .expect("fixture static selection")
+                .retire_fixture_network();
+        }
+    }
+
+    #[cfg(test)]
+    fn after_static_lookup(&self) {
+        self.retire_static_if(&self.retire_static_after_lookup);
+    }
+
+    #[cfg(test)]
+    fn during_static_admission(&self) {
+        self.retire_static_if(&self.retire_static_in_admission);
     }
 
     fn capability(&self, gate: &Gate) -> Value {
@@ -2198,8 +2251,10 @@ impl VmInventory {
         let mut capability = self.supervisor.capability(gate);
         let mut recipes = self.supervisor.recipes.map(|entry| entry.map(|(id, _)| id));
         let mut static_available = false;
+        let mut static_blocked = false;
         if tool == ToolName::Catalog {
             if let Some(reason) = self.supervisor.static_refusal() {
+                static_blocked = true;
                 capability["static_compose"] =
                     json!({"available":false,"reason":native_reason(reason)});
                 recipes[3] = None;
@@ -2226,6 +2281,7 @@ impl VmInventory {
                             static_available
                         } else {
                             available
+                                && (entry.id != WEB_RECIPE_ID || !static_blocked)
                                 && self
                                     .supervisor
                                     .recipes
@@ -2655,6 +2711,14 @@ fn cleanup_wire(label: &str) -> Option<&'static str> {
     }
 }
 
+/// A store error after the fresh-admission check rolled back names the
+/// static refusal; any other store error stays `state_unavailable`.
+fn fresh_fault(fenced: &std::cell::Cell<Option<NativeRefusal>>, error: anyhow::Error) -> Fault {
+    fenced
+        .get()
+        .map_or_else(|| error.into(), |reason| Fault::new(native_reason(reason)))
+}
+
 impl VmInventory {
     fn compose_target(args: &mut Args) -> Outcome<compose::Target> {
         let vm = args.id("vm_id")?;
@@ -2669,7 +2733,15 @@ impl VmInventory {
         use crate::store::vm::compose as db;
         let target = Self::compose_target(&mut args)?;
         let store = self.supervisor.controller.compose_store();
-        let session = self.supervisor.compose.session(target.vm);
+        let static_refusal = self.supervisor.static_refusal();
+        let session = if static_refusal.is_none() {
+            self.supervisor.compose.session(target.vm)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        self.supervisor.after_static_lookup();
+        let fenced = std::cell::Cell::new(None);
         if tool == ToolName::ComposeStatus {
             args.end()?;
             let mut status = store
@@ -2752,15 +2824,23 @@ impl VmInventory {
             if !compose::deployment_preserves_routes(tx, &request)? {
                 return Ok(Err(compose::Fault::Busy));
             }
-            db::admit(
+            if self.supervisor.fence_fresh_intent(&fenced) {
+                return Ok(Err(compose::Fault::NotReady));
+            }
+            let admitted = db::admit(
                 tx,
                 &self.principal,
                 &request,
                 session.generation,
                 session.wire_boot,
                 self.supervisor.controller.compose_now()?,
-            )
-        })?;
+            )?;
+            #[cfg(test)]
+            self.supervisor.during_static_admission();
+            self.supervisor.commit_fresh_intent(&fenced)?;
+            Ok(admitted)
+        });
+        let admission = admission.map_err(|error| fresh_fault(&fenced, error))?;
         let (intent, drive_key, repair) = match admission {
             Ok(intent) => (intent, key, false),
             Err(compose::Fault::RecoveryRequired(old_key)) => {
@@ -2770,7 +2850,12 @@ impl VmInventory {
                 (prior, old_key, true)
             }
             Err(compose::Fault::NotFound) => return Err(NOT_FOUND),
-            Err(compose::Fault::NotReady) => return Err(NOT_READY),
+            Err(compose::Fault::NotReady) => {
+                return Err(fenced
+                    .get()
+                    .or(static_refusal)
+                    .map_or(NOT_READY, |r| Fault::new(native_reason(r))));
+            }
             Err(compose::Fault::Busy) => return Err(Refusal::Busy.into()),
             Err(compose::Fault::StaleKey) => return Err(Refusal::StaleKey.into()),
             Err(compose::Fault::ReplayFull) => return Err(Refusal::ReplayFull.into()),
@@ -2785,6 +2870,8 @@ impl VmInventory {
             .filter(|s| s.generation == intent.generation && (repair || s.wire_boot == intent.boot))
             && (repair || intent.receipt.is_none())
             && (repair || intent.closed.is_none())
+            // A replay never drives guest I/O through a retired selection.
+            && self.supervisor.static_refusal().is_none()
         {
             let active = gate.compose_active.clone();
             let id = intent.id;
@@ -2881,7 +2968,15 @@ impl VmInventory {
 
         let store = self.supervisor.controller.compose_store();
         let _ = self.supervisor.compose_backup.reconcile_partials(store);
-        let session = self.supervisor.compose_backup.session(target.vm);
+        let static_refusal = self.supervisor.static_refusal();
+        let session = if static_refusal.is_none() {
+            self.supervisor.compose_backup.session(target.vm)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        self.supervisor.after_static_lookup();
+        let fenced = std::cell::Cell::new(None);
         let custody_present = self.supervisor.compose_backup.custody().is_some();
 
         let admission = store.transact(|tx| {
@@ -2906,7 +3001,10 @@ impl VmInventory {
             {
                 return Ok(Err(BackupFault::NotReady));
             }
-            db::admit_backup(
+            if self.supervisor.fence_fresh_intent(&fenced) {
+                return Ok(Err(BackupFault::NotReady));
+            }
+            let admitted = db::admit_backup(
                 tx,
                 &self.principal,
                 &target,
@@ -2915,19 +3013,29 @@ impl VmInventory {
                 session.wire_boot,
                 self.supervisor.controller.compose_now()?,
                 |tx, staging_bytes| {
+                    #[cfg(test)]
+                    self.supervisor.during_static_admission();
                     self.supervisor.controller.validate_compose_backup_disk(
                         tx,
                         self.supervisor.compose_backup.capacity(),
                         staging_bytes,
                     )
                 },
-            )
-        })?;
+            )?;
+            self.supervisor.commit_fresh_intent(&fenced)?;
+            Ok(admitted)
+        });
+        let admission = admission.map_err(|error| fresh_fault(&fenced, error))?;
 
         let intent = match admission {
             Ok(intent) => intent,
             Err(BackupFault::NotFound) => return Err(NOT_FOUND),
-            Err(BackupFault::NotReady) => return Err(NOT_READY),
+            Err(BackupFault::NotReady) => {
+                return Err(fenced
+                    .get()
+                    .or(static_refusal)
+                    .map_or(NOT_READY, |r| Fault::new(native_reason(r))));
+            }
             Err(BackupFault::Busy) => return Err(Refusal::Busy.into()),
             Err(BackupFault::BackupLimit) => return Err(Refusal::BackupLimit.into()),
             Err(BackupFault::Disk) => return Err(Refusal::Disk.into()),
@@ -2945,6 +3053,7 @@ impl VmInventory {
             }
         }
         if intent.status == BackupOpStatus::Pending
+            && self.supervisor.static_refusal().is_none()
             && let Some(session) =
                 session.filter(|s| s.generation == intent.generation && s.wire_boot == intent.boot)
         {
@@ -13716,6 +13825,7 @@ pub(crate) mod tests {
                  VALUES(?1,'web-site','alice',?2,?3,zeroblob(16),?4,zeroblob(32),zeroblob(32),1,4096,0)",
                 params![vm, supervisor.host_id, template, WEB_DIGEST],
             )?;
+            db.execute("INSERT INTO vm_compose_projects(vm,project) VALUES(?1,'fixture')", [vm])?;
             Ok(())
         }).unwrap();
         {
@@ -13826,8 +13936,20 @@ pub(crate) mod tests {
                 .iter()
                 .all(|entry| { entry["recipe_id"] != compose_id })
         );
+        assert!(catalog["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["recipe_id"] == hex::encode(WEB_RECIPE_ID) && entry["state"] == "unqualified"
+        }));
         refused(&supervisor, "vm_template_build", build(7));
         refused(&supervisor, "publish_site", args(8));
+        let compose_args =
+            |n| json!({"vm_id":hex::encode(vm),"project_id":"fixture","request_id":key(n)});
+        refused(&supervisor, "compose_start", compose_args(9));
+        refused(&supervisor, "compose_backup", compose_args(10));
+        let foreign = supervisor
+            .connection("bob".into())
+            .inventory()
+            .dispatch(request("compose_start", compose_args(11)), || false);
+        assert_eq!(foreign.unwrap_err().0, "not_found");
         supervisor
             .controller
             .store_for_test()
@@ -16960,6 +17082,483 @@ pub(crate) mod tests {
             })
             .unwrap()
             .unwrap()
+    }
+
+    /// Spec P2 (PR #402 review 1): a route watch that retires after the
+    /// dispatcher looked up its session still closes fresh Compose and backup
+    /// admission inside the store transaction, while replay of an existing
+    /// receipt keeps answering without driving guest I/O.
+    #[tokio::test]
+    async fn static_retirement_after_session_lookup_refuses_fresh_compose_and_backup_intents() {
+        use crate::store::vm::compose as db;
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.static_compose = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let (vm, vm_id, generation, target, _root, _managed) =
+            setup_compose_backup_project(&h, &a, 6100, 64 * 1024).await;
+        let (second, _) = enroll_backup_project(&h, vm_id, "calm-two", [0x62; 16], 64 * 1024);
+        let boot = 6101;
+        let supervisor = h.supervisor();
+        let mut backup_peer = backup_test_peer(&h, vm_id, generation, boot).await;
+        let (host_io, mut compose_peer) = tokio::io::duplex(64 * 1024);
+        let (channel, ()) = tokio::join!(
+            crate::vm::guest::ComposeChannel::negotiate(host_io, boot, &supervisor.cancel),
+            fake_compose_hello(&mut compose_peer, boot)
+        );
+        let store = supervisor.controller.compose_store();
+        supervisor
+            .compose
+            .attach(
+                store,
+                vm_id,
+                compose::Session::new(generation, channel.unwrap()),
+            )
+            .unwrap();
+        let selection = supervisor.static_selection().unwrap();
+        assert!(supervisor.static_refusal().is_none());
+        let rows = || {
+            store
+                .read_only(|db| {
+                    Ok([
+                        "vm_operations",
+                        "vm_compose_operations",
+                        "vm_compose_backup_ops",
+                    ]
+                    .map(|table| {
+                        crate::store::vm::count(db, &format!("SELECT count(*) FROM {table}"), [])
+                            .unwrap()
+                    }))
+                })
+                .unwrap()
+        };
+        let before = rows();
+        let args = |project: &str, n| json!({"vm_id":vm,"project_id":project,"request_id":key(n)});
+
+        // Both sessions are live and admissible; the watch retires only after
+        // each dispatcher sampled the selection and looked up its session.
+        for (tool, n) in [("compose_start", 6120), ("compose_backup", 6121)] {
+            selection.revive_fixture_network();
+            supervisor
+                .retire_static_after_lookup
+                .store(true, Ordering::Release);
+            let refused = call(&a, tool, args("calm-life", n)).await;
+            assert_eq!(
+                refused["reason"], "network_fence_unverified",
+                "{tool}: {refused}"
+            );
+            assert!(
+                !supervisor
+                    .retire_static_after_lookup
+                    .load(Ordering::Acquire),
+                "{tool} reached the hook"
+            );
+            assert_eq!(rows(), before, "{tool} wrote a fresh intent row");
+        }
+
+        // The watch retires inside fresh admission, after the first in-store
+        // fence passed: inside the backup capacity callback, and once the
+        // Compose admission wrote its fresh rows. The transaction rolls back.
+        for (tool, n) in [("compose_start", 6122), ("compose_backup", 6123)] {
+            selection.revive_fixture_network();
+            supervisor
+                .retire_static_in_admission
+                .store(true, Ordering::Release);
+            let refused = call(&a, tool, args("calm-life", n)).await;
+            assert_eq!(
+                refused["reason"], "network_fence_unverified",
+                "{tool}: {refused}"
+            );
+            assert!(
+                !supervisor
+                    .retire_static_in_admission
+                    .load(Ordering::Acquire),
+                "{tool} reached fresh admission"
+            );
+            assert_eq!(rows(), before, "{tool} committed a fresh intent row");
+        }
+
+        // Existing receipts on two projects, admitted while the selection is live.
+        selection.revive_fixture_network();
+        let session = supervisor.compose.session(vm_id).unwrap();
+        let start = compose::Mutation {
+            target: target.clone(),
+            kind: compose::Kind::Start,
+            key: RequestId::parse(&key(6130)).unwrap(),
+            release: None,
+        };
+        let now = supervisor.controller.compose_now().unwrap();
+        let prior = store
+            .transact(|tx| {
+                Ok(db::admit(
+                    tx,
+                    "alpha",
+                    &start,
+                    session.generation,
+                    session.wire_boot,
+                    now,
+                )?
+                .unwrap())
+            })
+            .unwrap();
+        let backup = admit_test_backup(&h, &second, 6131);
+        let admitted = rows();
+
+        // Replays answer from their receipts even when the watch retires
+        // after the session lookup, and never drive the cached session.
+        for (tool, project, n, id) in [
+            ("compose_start", "calm-life", 6130, prior.id),
+            ("compose_backup", "calm-two", 6131, backup.id),
+        ] {
+            selection.revive_fixture_network();
+            supervisor
+                .retire_static_after_lookup
+                .store(true, Ordering::Release);
+            supervisor
+                .retire_static_in_admission
+                .store(true, Ordering::Release);
+            let replay = call(&a, tool, args(project, n)).await;
+            assert_eq!(replay["operation_id"], hex::encode(id), "{tool}: {replay}");
+            assert_eq!(replay["state"], "pending", "{tool}: {replay}");
+            assert!(
+                supervisor.static_refusal().is_some(),
+                "{tool} reached the hook"
+            );
+            // Replay answers before the fresh admission path.
+            assert!(
+                supervisor
+                    .retire_static_in_admission
+                    .swap(false, Ordering::AcqRel),
+                "{tool} replay entered fresh admission"
+            );
+        }
+        assert_eq!(rows(), admitted);
+        // Neither replay drove guest I/O through the retired selection: a
+        // spawned drive registers its intent before the dispatch returns.
+        assert!(
+            supervisor
+                .lock()
+                .unwrap()
+                .compose_active
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_no_queued_frame(&mut compose_peer).await;
+        assert_no_queued_frame(&mut backup_peer).await;
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    /// Spec P2 (PR #402 review 3): when the route watch retires inside the
+    /// backup capacity callback and capacity returns `None` (matching
+    /// `selected_static.rs`), retirement must win (`network_fence_unverified`)
+    /// and roll back preceding retry-clock advancement and orphan pruning.
+    /// When the watch stays live with `None` capacity, `not_ready` commits
+    /// normally.
+    #[tokio::test]
+    async fn static_retirement_backup_none_capacity_rolls_back_bookkeeping() {
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.static_compose = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let (vm, vm_id, generation, _target, _root, _managed) =
+            setup_compose_backup_project(&h, &a, 6200, 64 * 1024).await;
+        let boot = 6201;
+        let supervisor = h.supervisor();
+        let mut backup_peer = backup_test_peer(&h, vm_id, generation, boot).await;
+        let store = supervisor.controller.compose_store();
+        let selection = supervisor.static_selection().unwrap();
+        assert!(supervisor.static_refusal().is_none());
+
+        let high_water = || -> i64 {
+            store
+                .read_only(|db| {
+                    Ok(db.query_row(
+                        "SELECT high_water_ms FROM vm_retry_clock WHERE singleton=1",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        let op_rows = || {
+            store
+                .read_only(|db| {
+                    Ok([
+                        "vm_operations",
+                        "vm_compose_operations",
+                        "vm_compose_backup_ops",
+                    ]
+                    .map(|table| {
+                        crate::store::vm::count(db, &format!("SELECT count(*) FROM {table}"), [])
+                            .unwrap()
+                    }))
+                })
+                .unwrap()
+        };
+
+        let orphan_backup_id: Id = [0xC1; 16];
+        let orphan_op_id: Id = [0xC2; 16];
+        store
+            .transact(|tx| {
+                tx.execute(
+                    "INSERT INTO vm_compose_backups(
+                        id,operation_id,principal,vm,project,generation,boot,revision,
+                        volume,database,state,host_staging_charge,guest_staging_charge,
+                        retained_charge,created_ms,namespace_tracked
+                     ) VALUES(?1,?2,'alpha',?3,'calm-life',?4,?5,1,
+                        'data','calm-life.sqlite3','cleaned',0,0,0,?6,1)",
+                    rusqlite::params![orphan_backup_id, orphan_op_id, vm_id, generation, boot, UTC],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let orphan_count = || {
+            store
+                .read_only(|db| {
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_compose_backups WHERE id=?1",
+                        [orphan_backup_id],
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(orphan_count(), 1);
+        let clock_before = high_water();
+        let advanced_now = clock_before + 60_000;
+        h.now.store(advanced_now, Ordering::Relaxed);
+        *supervisor.compose_backup.capacity.lock().unwrap() = None;
+        let rows_before = op_rows();
+
+        // Watch retires inside the capacity callback while capacity is `None`:
+        // wire response must be `network_fence_unverified` and both the
+        // retry-clock advance and orphan pruning must roll back.
+        selection.revive_fixture_network();
+        supervisor
+            .retire_static_in_admission
+            .store(true, Ordering::Release);
+        let retired = call(
+            &a,
+            "compose_backup",
+            json!({"vm_id":vm,"project_id":"calm-life","request_id":key(6210)}),
+        )
+        .await;
+        assert_eq!(
+            retired["reason"], "network_fence_unverified",
+            "retired backup with None capacity: {retired}"
+        );
+        assert!(
+            !supervisor
+                .retire_static_in_admission
+                .load(Ordering::Acquire),
+            "compose_backup did not reach capacity callback hook"
+        );
+        assert_eq!(
+            high_water(),
+            clock_before,
+            "retired backup committed retry-clock advance"
+        );
+        assert_eq!(
+            orphan_count(),
+            1,
+            "retired backup committed orphaned cleaned backup pruning"
+        );
+        assert_eq!(op_rows(), rows_before);
+
+        // Live control: watch stays live with `capacity == None`. Must return
+        // `not_ready` and commit the preceding retry-clock advance and pruning
+        // (proving those mutations genuinely ran before `check_disk`).
+        selection.revive_fixture_network();
+        let live = call(
+            &a,
+            "compose_backup",
+            json!({"vm_id":vm,"project_id":"calm-life","request_id":key(6211)}),
+        )
+        .await;
+        assert_eq!(
+            live["reason"], "not_ready",
+            "live backup with None capacity: {live}"
+        );
+        assert_eq!(
+            high_water(),
+            advanced_now,
+            "live backup control did not advance retry clock"
+        );
+        assert_eq!(
+            orphan_count(),
+            0,
+            "live backup control did not prune orphaned cleaned backup"
+        );
+        assert_eq!(op_rows(), rows_before);
+
+        assert_no_queued_frame(&mut backup_peer).await;
+        drop(a);
+        h.shutdown().await.unwrap();
+    }
+
+    /// Spec P2 (PR #402 review 3): concurrent route-watch retirement during
+    /// fresh Compose admission must still win and roll back preceding
+    /// retry-clock advancement and expired-operation pruning even when
+    /// `db::admit` returns a typed refusal (`NotFound`).
+    #[tokio::test]
+    async fn static_retirement_compose_typed_refusal_rolls_back_bookkeeping() {
+        let mut h = Harness::start_configured(false, false, true, |fixture| {
+            fixture.static_compose = true;
+        })
+        .await;
+        let a = h.client(0).await;
+        let (vm, vm_id, generation, _target, _root, _managed) =
+            setup_compose_backup_project(&h, &a, 6250, 64 * 1024).await;
+        let boot = 6251;
+        let supervisor = h.supervisor();
+        let (host_io, mut compose_peer) = tokio::io::duplex(64 * 1024);
+        let (channel, ()) = tokio::join!(
+            crate::vm::guest::ComposeChannel::negotiate(host_io, boot, &supervisor.cancel),
+            fake_compose_hello(&mut compose_peer, boot)
+        );
+        let store = supervisor.controller.compose_store();
+        store
+            .transact(|tx| crate::store::vm::compose::register_boot(tx, vm_id, generation, boot))
+            .unwrap();
+        supervisor
+            .compose
+            .attach(
+                store,
+                vm_id,
+                compose::Session::new(generation, channel.unwrap()),
+            )
+            .unwrap();
+        let selection = supervisor.static_selection().unwrap();
+        assert!(supervisor.static_refusal().is_none());
+
+        let high_water = || -> i64 {
+            store
+                .read_only(|db| {
+                    Ok(db.query_row(
+                        "SELECT high_water_ms FROM vm_retry_clock WHERE singleton=1",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+
+        let expired_op_id: Id = [0xD1; 16];
+        let expired_req_key: Id = [0xD2; 16];
+        store
+            .transact(|tx| {
+                tx.execute(
+                    "INSERT INTO vm_compose_operations(
+                        id,principal,request,vm,project,generation,boot,kind,release,
+                        revision,valid_through_ms,emergency,activity_id,sent,receipt,
+                        closed,secret_refs,secret_sent
+                     ) VALUES(?1,'alpha',?2,?3,'calm-life',?4,?5,'start',?6,
+                        1,?7,0,NULL,0,NULL,'refused','[]',0)",
+                    rusqlite::params![
+                        expired_op_id,
+                        expired_req_key,
+                        vm_id,
+                        generation,
+                        boot,
+                        [0x61u8; 16],
+                        UTC
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let expired_op_count = || {
+            store
+                .read_only(|db| {
+                    crate::store::vm::count(
+                        db,
+                        "SELECT count(*) FROM vm_compose_operations WHERE id=?1",
+                        [expired_op_id],
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(expired_op_count(), 1);
+        let clock_before = high_water();
+        let advanced_now = clock_before + 60_000;
+        h.now.store(advanced_now, Ordering::Relaxed);
+        let unknown_release = hex::encode([0xEEu8; 16]);
+
+        // Watch retires inside fresh Compose admission on a typed refusal:
+        // wire response must be `network_fence_unverified` and both the
+        // retry-clock advance and expired-op pruning must roll back.
+        selection.revive_fixture_network();
+        supervisor
+            .retire_static_in_admission
+            .store(true, Ordering::Release);
+        let retired = call(
+            &a,
+            "compose_deploy",
+            json!({
+                "vm_id": vm,
+                "project_id": "calm-life",
+                "release_id": unknown_release,
+                "request_id": key(6260),
+            }),
+        )
+        .await;
+        assert_eq!(
+            retired["reason"], "network_fence_unverified",
+            "retired compose_deploy typed refusal: {retired}"
+        );
+        assert!(
+            !supervisor
+                .retire_static_in_admission
+                .load(Ordering::Acquire),
+            "compose_deploy did not reach admission hook"
+        );
+        assert_eq!(
+            high_water(),
+            clock_before,
+            "retired compose_deploy committed retry-clock advance"
+        );
+        assert_eq!(
+            expired_op_count(),
+            1,
+            "retired compose_deploy committed expired operation pruning"
+        );
+
+        // Live control: watch stays live with the same unknown `release_id`.
+        // Must return `not_found` and commit both bookkeeping mutations.
+        selection.revive_fixture_network();
+        let live = call(
+            &a,
+            "compose_deploy",
+            json!({
+                "vm_id": vm,
+                "project_id": "calm-life",
+                "release_id": unknown_release,
+                "request_id": key(6261),
+            }),
+        )
+        .await;
+        assert_eq!(
+            live["reason"], "not_found",
+            "live compose_deploy unknown release: {live}"
+        );
+        assert_eq!(
+            high_water(),
+            advanced_now,
+            "live compose_deploy control did not advance retry clock"
+        );
+        assert_eq!(
+            expired_op_count(),
+            0,
+            "live compose_deploy control did not prune expired operation"
+        );
+
+        assert_no_queued_frame(&mut compose_peer).await;
+        drop(a);
+        h.shutdown().await.unwrap();
     }
 
     async fn drive_test_backup(

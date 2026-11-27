@@ -47,6 +47,7 @@ pub(in crate::vm::windows::qualification) enum Case {
     Public,
     RecursiveDns,
     Host,
+    HostLoopback,
     SlirpHostAlias,
     SlirpDnsAlias,
     Private,
@@ -67,10 +68,11 @@ pub(in crate::vm::windows::qualification) enum Case {
     LanInbound,
 }
 
-const REQUIRED: [Case; 21] = [
+const REQUIRED: [Case; 22] = [
     Case::Public,
     Case::RecursiveDns,
     Case::Host,
+    Case::HostLoopback,
     Case::SlirpHostAlias,
     Case::SlirpDnsAlias,
     Case::Private,

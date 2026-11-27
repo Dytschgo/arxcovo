@@ -1404,8 +1404,8 @@ mod tests {
             backing_header: None,
             serial: &serial,
             boot: BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::PublicEgress(policy)),
-            ram_mib: 256,
-            vcpus: 1,
+            ram_mib: 4096,
+            vcpus: 2,
         };
         let sealed = recipe(&image, &policy);
         let plan = sealed.plan().unwrap();
@@ -1830,7 +1830,7 @@ mod tests {
             for (at, val) in [(4, 3u32), (20, 16), (96, 4), (100, 112)] {
                 header[at..at + 4].copy_from_slice(&val.to_be_bytes());
             }
-            header[24..32].copy_from_slice(&1_048_576u64.to_be_bytes());
+            header[24..32].copy_from_slice(&(32_u64 << 30).to_be_bytes());
             header
         }
     }

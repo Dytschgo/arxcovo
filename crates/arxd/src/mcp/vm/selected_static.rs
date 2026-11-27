@@ -119,12 +119,8 @@ impl SelectedStatic {
                 "recipe_id":hex::encode(recipe.recipe_id),
                 "recipe_sha256":hex::encode(recipe.recipe_sha256),
             },
-            "live_available":self.buildable(),
+            "live_available":true,
         })
-    }
-
-    pub(super) fn buildable(&self) -> bool {
-        self.refusal().is_none()
     }
 
     #[cfg(test)]
@@ -133,6 +129,15 @@ impl SelectedStatic {
             #[cfg(all(windows, target_arch = "x86_64"))]
             Source::Native(_) => panic!("expected fixture selection"),
             Source::Fixture(fixture) => fixture.network_live.store(false, Ordering::Release),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn revive_fixture_network(&self) {
+        match &self.0 {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            Source::Native(_) => panic!("expected fixture selection"),
+            Source::Fixture(fixture) => fixture.network_live.store(true, Ordering::Release),
         }
     }
 

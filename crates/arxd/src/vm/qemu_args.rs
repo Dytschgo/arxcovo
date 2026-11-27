@@ -570,9 +570,7 @@ impl BootRecipe<'_> {
                     BootMode::Endpoint,
                     BootPurpose::InstalledStaticWeb(_, StaticNetwork::PublicEgress(_))
                 )
-        ) || (self.vcpus, self.ram_mib) != (2, 4096)
-            || inspect_header(self.disk_header, None).ok() != Some(32 << 30)
-        {
+        ) {
             return Err(InvalidPath);
         }
         let mut plan = self.plan()?;
@@ -594,7 +592,12 @@ impl BootRecipe<'_> {
         let phase = self.boot.phase();
         let detached_compose = matches!(self.boot, BootPurpose::DetachedStaticCompose);
         let compose = medium.is_some() || detached_compose;
-        if compose
+        let compose_resources = compose
+            || matches!(
+                self.boot,
+                BootPurpose::InstalledStaticWeb(_, StaticNetwork::PublicEgress(_))
+            );
+        if compose_resources
             && ((self.vcpus, self.ram_mib) != (2, 4096)
                 || inspect_header(self.disk_header, None).ok() != Some(32 << 30))
         {
@@ -1061,6 +1064,29 @@ mod tests {
         assert!(recipe.static_compose_installer(&medium).is_err());
         recipe.vcpus = 1;
         assert!(recipe.plan().is_err());
+
+        let lease = OriginPortLease::acquire().unwrap();
+        let policy = pinned(PublicEgressPolicy, "policy.txt", 11);
+        let patched = pinned(PublicEgressQemu, "qemu-patched.exe", 12);
+        recipe.boot = BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::PublicEgress(&policy));
+        recipe.image = &patched;
+        assert!(recipe.plan().is_err());
+        recipe.vcpus = 2;
+        recipe.ram_mib = 8192;
+        assert!(recipe.plan().is_err());
+        recipe.ram_mib = 4096;
+        let undersized = self::header(None);
+        let qualified_header = recipe.disk_header;
+        recipe.disk_header = &undersized;
+        assert!(recipe.plan().is_err());
+        recipe.disk_header = qualified_header;
+        assert_eq!(recipe.plan().unwrap().kind(), PlanKind::PublicEgressBoot);
+
+        recipe.boot = BootPurpose::InstalledStaticWeb(&lease, StaticNetwork::RestrictedOrigin);
+        recipe.image = &image;
+        recipe.ram_mib = 1024;
+        recipe.disk_header = &undersized;
+        assert_eq!(recipe.plan().unwrap().kind(), PlanKind::StaticWebBoot);
     }
 
     /// An 11.1.x `QCowHeader` (112 bytes, `block/qcow2.h`) with the optional
