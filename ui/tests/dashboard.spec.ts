@@ -95,8 +95,10 @@ test('activity: filters and paging', async ({ page }) => {
   // forge rows in the fixtures) and check every row with retrying locators
   // instead of a one-time items.all() snapshot.
   await expect(items).toHaveCount(6);
+  await expect(items.first()).toBeVisible();
   await expect(list.locator('li:not([data-outcome="failed"])')).toHaveCount(0);
-  await expect(items.filter({ hasNotText: 'forge' })).toHaveCount(0);
+  // String form is case-sensitive, like the per-row toContainText it replaces.
+  await expect(items).toContainText(Array<string>(6).fill('forge'));
 });
 
 test('terminal: run, stream, exit, history and a refused tool', async ({ page }) => {
