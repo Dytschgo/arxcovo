@@ -471,6 +471,9 @@ async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() 
         )
         .unwrap();
     session.succeeded(restore).await;
+    // Retire the displaced Ubuntu generation before admitting another snapshot
+    // or vault job.
+    supervisor.sweep().unwrap();
     // Deletion has no copy worker; the reaper disposes the point.
     let delete = session
         .mutate(
@@ -547,8 +550,6 @@ async fn closed_and_opted_in_foreground_use_the_same_native_two_golden_ledger() 
     assert!(stopped["native_boot_witness"].is_null(), "{stopped}");
     set_busy(&supervisor, false);
 
-    // Retire the displaced Ubuntu generation before admitting the vault job.
-    supervisor.sweep().unwrap();
     let wall = crate::vault::utc_ms().unwrap();
     let version = session
         .call(
