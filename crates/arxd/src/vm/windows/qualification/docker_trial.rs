@@ -53,7 +53,7 @@ pub(super) fn preflight(
     }
     let bytes = read_bounded(&source.leaf, MAX_ENROLLMENT_BYTES)
         .map_err(|_| NativeRefusal::QualificationMissing)?;
-    require_enrollment(&bytes)?;
+    static_compose::enrollment::Enrollment::parse(&bytes)?;
     // Checked native creation, live route enforcement and independently reviewed
     // capture/HTTPS adapters are required even for an owner opt-in.
     // Stop before claiming an evidence directory or admitting any effect.
@@ -77,6 +77,7 @@ fn only_docker_enrollment_reaches_the_docker_gate() {
     }
     let docker = br#"{"class":"docker","owner_sid":"example"}"#;
     assert!(require_enrollment(docker).is_ok());
+    assert!(static_compose::enrollment::Enrollment::parse(docker).is_err());
     assert!(serde_json::from_slice::<Enrollment>(docker).is_err());
 }
 

@@ -480,6 +480,54 @@ impl<C: Clock> VmController<C> {
         self.finish_with_cause(operation, completion, None)
     }
 
+    /// Settle the start and register the serial witness in one transaction.
+    /// The boot owner still holds the process, media and verified origin.
+    #[allow(dead_code, reason = "native static boot owner is pending")]
+    pub(super) fn finish_compose_start(
+        &self,
+        worker: &PendingOperation,
+        vm: Id,
+        origin: &super::runtime::publication::Origin,
+        wire_boot: u64,
+        current: impl Fn() -> bool,
+    ) -> Result<()> {
+        self.check_worker(worker)?;
+        self.store.transact(|db| {
+            let now = self.clock.now();
+            let live = || {
+                current()
+                    && !origin.retired.is_retired()
+                    && self.clock.now().monotonic < worker.deadline
+            };
+            ensure!(live(), "static boot retired");
+            ensure!(
+                store::count(
+                    db,
+                    "SELECT count(*) FROM vm_operations o
+                     JOIN vm_static_instances s ON s.id=o.vm AND s.principal=o.principal
+                     JOIN vm_generations g ON g.static_id=s.id AND g.active=1
+                     WHERE o.activity_id=?1 AND o.status=0 AND o.action=3 AND s.id=?2
+                       AND s.state=1 AND g.id=?3 AND s.origin_generation=?4",
+                    params![
+                        worker.activity_id,
+                        vm,
+                        origin.generation,
+                        origin.origin_generation
+                    ],
+                )? == 1,
+                "static start witness mismatch"
+            );
+            ensure!(
+                store::settle_operation(db, worker.activity_id, utc(now)?, Completion::Succeeded)?
+                    == Status::Succeeded,
+                "static start settlement unavailable"
+            );
+            store::compose::register_boot(db, vm, origin.generation, wire_boot)?;
+            ensure!(live(), "static boot retired");
+            Ok(())
+        })
+    }
+
     /// As [`VmController::finish`], recording the worker's proven, closed
     /// failure cause independently of release proof.
     pub(crate) fn finish_with_cause(

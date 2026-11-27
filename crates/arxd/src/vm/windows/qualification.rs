@@ -80,6 +80,28 @@ const LOGON_SKEW_TICKS: i64 = 1_200_000_000;
 /// Matches the interactive-only rule in `token_identity`.
 const LOGON_INTERACTIVE: u32 = 2;
 
+/// Samples the held state and backup volumes. The ledger separately counts
+/// every reservation, including pending writes to the backup volume.
+pub(crate) fn backup_capacity(
+    state: &File,
+    backup: &File,
+) -> Result<crate::vm::Capacity, NativeRefusal> {
+    let state = capacity::held_free(state)?;
+    let backup = capacity::held_free(backup)?;
+    let managed_bytes = state
+        .total
+        .checked_sub(state.total_free)
+        .filter(|_| state.total > 0 && state.total <= DISK_CEILING)
+        .ok_or(NativeRefusal::DiskCeilingUnverified)?;
+    if backup.total == 0 || backup.total_free > backup.total || backup.caller > backup.total_free {
+        return Err(NativeRefusal::DiskCeilingUnverified);
+    }
+    Ok(crate::vm::Capacity {
+        free_bytes: backup.caller,
+        managed_bytes,
+    })
+}
+
 /// Raw local enrollment. It never leaves this module: no field is copied
 /// into an observation, error or output.
 #[derive(Deserialize)]

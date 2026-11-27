@@ -1267,16 +1267,20 @@ impl BackupSession {
 /// Host backup coordinator owned by `Supervisor`.
 pub(crate) struct BackupHost {
     pub custody: Mutex<Option<Arc<dyn BackupCustody>>>,
+    #[cfg(test)]
     pub capacity: Mutex<Option<Capacity>>,
+    live_capacity: Option<Box<dyn Fn() -> Option<Capacity> + Send + Sync>>,
     pub timeouts: Mutex<BackupTimeouts>,
-    sessions: Mutex<HashMap<Id, Arc<BackupSession>>>,
+    pub(super) sessions: Mutex<HashMap<Id, Arc<BackupSession>>>,
 }
 
 impl Default for BackupHost {
     fn default() -> Self {
         Self {
             custody: Mutex::new(None),
+            #[cfg(test)]
             capacity: Mutex::new(None),
+            live_capacity: None,
             timeouts: Mutex::new(BackupTimeouts::default()),
             sessions: Mutex::new(HashMap::new()),
         }
@@ -1302,7 +1306,25 @@ impl BackupHost {
     }
 
     pub(crate) fn capacity(&self) -> Option<Capacity> {
-        self.capacity.lock().ok().and_then(|c| *c)
+        if let Some(sample) = &self.live_capacity {
+            return sample();
+        }
+        #[cfg(test)]
+        return self.capacity.lock().ok().and_then(|capacity| *capacity);
+        #[cfg(not(test))]
+        None
+    }
+
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
+    pub(crate) fn install_native(
+        &mut self,
+        db: &crate::store::vm::VmStore,
+        custody: Arc<dyn BackupCustody>,
+        sample: impl Fn() -> Option<Capacity> + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.set_custody(db, custody)?;
+        self.live_capacity = Some(Box::new(sample));
+        Ok(())
     }
 
     pub(crate) fn custody(&self) -> Option<Arc<dyn BackupCustody>> {
@@ -1399,6 +1421,16 @@ impl BackupHost {
         let Some(custody) = self.custody() else {
             return settle_fail("backup_custody_unavailable", false, true);
         };
+        let refresh_capacity = || {
+            db.transact(|tx| {
+                // The admitted intent already contributes its full charge.
+                controller.validate_compose_backup_disk(tx, self.capacity(), 0)
+            })
+            .is_ok_and(|checked| checked.is_ok())
+        };
+        if self.live_capacity.is_some() && !refresh_capacity() {
+            return settle_fail("backup_capacity_unavailable", false, true);
+        }
         let boot_live = db.transact(|tx| {
             Ok(
                 store::live_boot(tx, target.vm, intent.generation, intent.boot)?
@@ -1465,6 +1497,9 @@ impl BackupHost {
                 code: RejectCode::UnknownOperation,
                 ..
             } if !intent.sent => {
+                if self.live_capacity.is_some() && !refresh_capacity() {
+                    return settle_fail("backup_capacity_unavailable", false, true);
+                }
                 // Persist submission boundary BEFORE transmitting ComposeBackupBegin.
                 if db
                     .transact(|tx| {
@@ -1697,8 +1732,11 @@ impl BackupHost {
             return settle_fail("invalid_backup_digest", false, true);
         }
 
-        // 4. Create exclusive host staging leaf and record its file identity
-        // BEFORE streaming any chunk bytes.
+        // 4. Recheck capacity after the guest work, before any host write.
+        if self.live_capacity.is_some() && !refresh_capacity() {
+            let _ = best_effort_release(&mut channel, &op_hex, timeouts.idle).await;
+            return settle_fail("backup_capacity_unavailable", false, true);
+        }
         let mut writer = match custody.begin_staging(intent.id) {
             Ok(w) => w,
             Err(_) => {

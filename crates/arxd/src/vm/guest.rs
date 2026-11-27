@@ -311,7 +311,7 @@ fn read_error(error: std::io::Error) -> ChannelError {
 pub struct ComposeChannel {
     inner: std::sync::Arc<tokio::sync::Mutex<ComposeChannelInner>>,
     open: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    retired: Shutdown,
+    retired: crate::vm::runtime::publication::Retirement,
     generation: u64,
 }
 
@@ -326,15 +326,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ComposeTransport for T {}
 
 impl ComposeChannel {
     pub async fn negotiate(
+        transport: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        generation: u64,
+        cancel: &Shutdown,
+    ) -> Result<Self, ChannelError> {
+        Self::negotiate_bound(transport, generation, cancel, Default::default()).await
+    }
+
+    pub(crate) async fn negotiate_bound(
         mut transport: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
         generation: u64,
         cancel: &Shutdown,
+        retired: crate::vm::runtime::publication::Retirement,
     ) -> Result<Self, ChannelError> {
         use arx_guest::compose::{
             COMPOSE_CAPABILITIES, COMPOSE_PROTOCOL_VERSION, ComposeRequest, ComposeResponse,
         };
         if generation == 0 {
             return Err(ChannelError::Invalid);
+        }
+        if retired.is_retired() {
+            return Err(ChannelError::Closed);
         }
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(|_| ChannelError::Io)?;
@@ -368,7 +380,7 @@ impl ComposeChannel {
                 next_id: 1,
             })),
             open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            retired: Shutdown::default(),
+            retired,
             generation,
         })
     }
@@ -392,12 +404,12 @@ impl ComposeChannel {
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        !self.retired.is_cancelled() && self.open.load(std::sync::atomic::Ordering::Acquire)
+        !self.retired.is_retired() && self.open.load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[allow(dead_code, reason = "called by the Part B exact-boot teardown")]
     pub(crate) async fn retire(&self) {
-        self.retired.cancel();
+        self.retired.retire();
         self.inner.lock().await.transport.take();
     }
 
@@ -419,7 +431,7 @@ impl ComposeChannel {
     ) -> Result<arx_guest::compose::ComposeResponse, ChannelError> {
         tokio::select! {
             biased;
-            _ = self.retired.cancelled() => Err(ChannelError::Closed),
+            _ = self.retired.token().cancelled() => Err(ChannelError::Closed),
             result = self.exchange_open(cancel, deadline, request) => result,
         }
     }
@@ -473,7 +485,7 @@ impl ComposeChannel {
         if echo != id {
             return Err(ChannelError::Unexpected);
         }
-        if self.retired.is_cancelled() {
+        if self.retired.is_retired() {
             return Err(ChannelError::Closed);
         }
         state.transport = Some(transport);
