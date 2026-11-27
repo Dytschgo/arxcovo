@@ -735,6 +735,19 @@ impl VmStore {
         Ok(result)
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn read_only<T>(
+        &self,
+        read: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VM state unavailable"))?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        read(&tx)
+    }
+
     pub(crate) fn transact<T>(&self, run: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut db = self
             .db
@@ -1315,7 +1328,7 @@ pub(crate) fn finish(
     finish_with_script(db, id, status, now, cleanup, None, None)
 }
 
-fn finish_with_script(
+pub(crate) fn finish_with_script(
     db: &Connection,
     id: i64,
     status: Status,
@@ -1381,6 +1394,15 @@ pub(crate) fn retry_time(db: &Connection, now: i64) -> Result<i64> {
     )?)
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn retry_time_readonly(db: &Connection, now: i64) -> Result<i64> {
+    Ok(db.query_row(
+        "SELECT max(high_water_ms,?1) FROM vm_retry_clock",
+        [now],
+        |row| row.get(0),
+    )?)
+}
+
 pub(crate) struct Binding<'a> {
     pub principal: &'a str,
     pub key: RequestId,
@@ -1394,13 +1416,12 @@ pub(crate) struct Replay {
 }
 
 impl Binding<'_> {
-    pub(crate) fn replay(
+    fn lookup_replay(
         &self,
         db: &Connection,
         now: i64,
-        closed: bool,
+        retry_now: i64,
     ) -> Result<Result<Option<Replay>, Refusal>> {
-        let retry_now = retry_time(db, now)?;
         if self.valid_through() < retry_now {
             return Ok(Err(Refusal::StaleKey));
         }
@@ -1458,6 +1479,40 @@ impl Binding<'_> {
         {
             return Ok(Err(Refusal::StaleKey));
         }
+        Ok(Ok(None))
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn replay_readonly(
+        &self,
+        db: &Connection,
+        now: i64,
+        closed: bool,
+    ) -> Result<Result<Option<Replay>, Refusal>> {
+        let retry_now = retry_time_readonly(db, now)?;
+        match self.lookup_replay(db, now, retry_now)? {
+            Ok(Some(prior)) => return Ok(Ok(Some(prior))),
+            Err(reason) => return Ok(Err(reason)),
+            Ok(None) => {}
+        }
+        if closed {
+            return Ok(Err(Refusal::Shutdown));
+        }
+        Ok(Ok(None))
+    }
+
+    pub(crate) fn replay(
+        &self,
+        db: &Connection,
+        now: i64,
+        closed: bool,
+    ) -> Result<Result<Option<Replay>, Refusal>> {
+        let retry_now = retry_time(db, now)?;
+        match self.lookup_replay(db, now, retry_now)? {
+            Ok(Some(prior)) => return Ok(Ok(Some(prior))),
+            Err(reason) => return Ok(Err(reason)),
+            Ok(None) => {}
+        }
         if closed {
             return Ok(Err(Refusal::Shutdown));
         }
@@ -1485,9 +1540,46 @@ impl Binding<'_> {
         vm: Option<Id>,
         lease_end: Option<i64>,
     ) -> Result<OperationRef> {
+        self.record_with_status(db, now, vm, lease_end, Status::Pending)
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    pub(crate) fn record_interrupted_stop(
+        &self,
+        db: &Connection,
+        now: i64,
+        vm: Id,
+    ) -> Result<OperationRef> {
+        ensure!(
+            self.action == Action::Stop as i64,
+            "invalid TEST stop action"
+        );
+        self.record_with_status(db, now, Some(vm), None, Status::Interrupted)
+    }
+
+    fn record_with_status(
+        &self,
+        db: &Connection,
+        now: i64,
+        vm: Option<Id>,
+        lease_end: Option<i64>,
+        status: Status,
+    ) -> Result<OperationRef> {
+        let terminal = status != Status::Pending;
         db.execute(
-            "INSERT INTO activity(principal,vm,action,started_ms,actor) VALUES(?1,?2,?3,?4,'agent')",
-            params![self.principal, vm, self.action, now],
+            "INSERT INTO activity(principal,vm,action,started_ms,actor,status,finished_ms,
+                 terminal_order,cleanup_confirmed)
+             VALUES(?1,?2,?3,?4,'agent',?5,CASE WHEN ?6 THEN ?4 END,
+                 CASE WHEN ?6 THEN (SELECT coalesce(max(terminal_order),0)+1 FROM activity) END,
+                 CASE WHEN ?6 THEN 0 END)",
+            params![
+                self.principal,
+                vm,
+                self.action,
+                now,
+                status.code(),
+                terminal
+            ],
         )?;
         let activity_id = db.last_insert_rowid();
         let (kind, subject, request, recipe, digest) = match self.subject {
@@ -1507,18 +1599,21 @@ impl Binding<'_> {
         };
         let id = db.query_row(
             "INSERT INTO vm_operations(principal,request_key,vm,action,activity_id,valid_through_ms,
-                lease_end_ms,binding_kind,subject_id,request_digest,recipe_id,recipe_digest,script_result)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,CASE WHEN ?4=2 THEN 'legacy' END)
+                lease_end_ms,binding_kind,subject_id,request_digest,recipe_id,recipe_digest,script_result,
+                status,cleanup_confirmed,failure_reason)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,CASE WHEN ?4=2 THEN 'legacy' END,
+                ?13,CASE WHEN ?14 THEN 0 END,?15)
              RETURNING operation_id",
             params![self.principal, self.key.key, vm, self.action, activity_id, self.valid_through(),
-                lease_end, kind, subject, request, recipe, digest],
+                lease_end, kind, subject, request, recipe, digest, status.code(), terminal,
+                terminal.then_some(FailureReason::CleanupUnconfirmed as i64)],
             |row| row.get(0),
         )?;
         Ok(OperationRef {
             id,
             receipt: Receipt {
                 activity_id,
-                status: Status::Pending,
+                status,
             },
         })
     }
@@ -1833,6 +1928,56 @@ pub(crate) fn publish_build(
     proof: [ArtifactEvidence; 2],
     now: i64,
 ) -> Result<()> {
+    publish_build_inner(db, activity_id, slots, request, guest, proof, now, false)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one native build publication transaction"
+)]
+pub(crate) fn publish_native_build(
+    db: &Connection,
+    activity_id: i64,
+    slots: BuildSlots,
+    request: BuildRequest<'_>,
+    guest: Guest,
+    scope: native::Scope,
+    proof: [ArtifactEvidence; 2],
+    now: i64,
+) -> Result<()> {
+    ensure!(
+        native::bound(db, scope)?
+            && slots.pair.disk.generation == scope.generation
+            && slots.pair.vars.generation == scope.generation,
+        "invalid native build scope"
+    );
+    for (slot, evidence) in [slots.pair.disk, slots.pair.vars].into_iter().zip(proof) {
+        ensure!(
+            evidence.directory == scope.workspace.file
+                && evidence.identity.volume == scope.production.volume
+                && native::leaf(db, slot)?
+                    == native::Leaf::Verified(evidence.identity.file, evidence.pin),
+            "invalid native golden evidence"
+        );
+    }
+    publish_build_inner(db, activity_id, slots, request, guest, proof, now, true)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one build publication transaction"
+)]
+fn publish_build_inner(
+    db: &Connection,
+    activity_id: i64,
+    slots: BuildSlots,
+    request: BuildRequest<'_>,
+    guest: Guest,
+    proof: [ArtifactEvidence; 2],
+    now: i64,
+    native: bool,
+) -> Result<()> {
     let [disk, vars] = proof;
     let retained = request
         .retained
@@ -1860,6 +2005,16 @@ pub(crate) fn publish_build(
             && evidence_matches(db, slots.pair.vars, vars, "identified")?,
         "invalid sealed artifact evidence"
     );
+    let retained = if native {
+        disk.pin
+            .size
+            .checked_add(vars.pin.size)
+            .and_then(|bytes| bytes.checked_add(request.retained.metadata))
+            .filter(|bytes| *bytes <= retained)
+            .ok_or_else(|| anyhow::anyhow!("build exceeds admitted retained claim"))?
+    } else {
+        retained
+    };
     let template = slots.id;
     ensure!(db.execute(
         "INSERT INTO vm_templates
@@ -2303,7 +2458,7 @@ fn classify_abandoned_builds(db: &Connection, id: Option<Id>) -> Result<()> {
     Ok(())
 }
 
-fn begin_recovery(db: &Connection, vm: Id, now: i64) -> Result<()> {
+pub(crate) fn begin_recovery(db: &Connection, vm: Id, now: i64) -> Result<()> {
     let id = activity(db, "arxd", vm, Action::Recover, now)?;
     db.execute(
         "UPDATE vm_instances SET state=3,cleanup_id=?2 WHERE id=?1",

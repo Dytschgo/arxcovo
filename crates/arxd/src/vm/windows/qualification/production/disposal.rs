@@ -245,6 +245,27 @@ impl<'a> NativeDisposal<'a> {
         slots: BuildSlots,
         deadline: Instant,
     ) -> Result<(), Q> {
+        self.dispose_build_transient_inner(activity_id, slots, deadline, None)
+    }
+
+    /// Keep the primary lease and pair exclusions from release through seal.
+    pub(super) fn dispose_build_transient_held(
+        &self,
+        activity_id: i64,
+        slots: BuildSlots,
+        deadline: Instant,
+        primary: &ProductionWorkspace,
+    ) -> Result<(), Q> {
+        self.dispose_build_transient_inner(activity_id, slots, deadline, Some(primary))
+    }
+
+    fn dispose_build_transient_inner(
+        &self,
+        activity_id: i64,
+        slots: BuildSlots,
+        deadline: Instant,
+        held: Option<&ProductionWorkspace>,
+    ) -> Result<(), Q> {
         let auth = DisposalScope::build_transient(activity_id, slots);
         let primary = slots.pair.disk.generation;
         let verification = slots.verification.disk.generation;
@@ -287,6 +308,30 @@ impl<'a> NativeDisposal<'a> {
                 ],
             },
         ];
+        if let Some(ws) = held {
+            self.verify_production_root()?;
+            {
+                // The primary guard covers only the seed leaf on the held
+                // primary workspace, not the verification generation.
+                let _guard = self.guards.acquire(primary)?;
+                let scope = super::custody::scope(ws.binding());
+                if scope.generation != primary
+                    || scope.production != self.production.identity
+                    || self.ledger.generation_state(primary)?
+                        != (GenerationState::Bound {
+                            scope,
+                            disposal: GenerationDisposal::None,
+                        })
+                {
+                    return Err(PATH);
+                }
+                check_deadline(deadline)?;
+                self.dispose_slot(auth, ws, scope, &plan[0].slots[0])?;
+                WorkspaceCustody::production(&ws.root, &ws.lease)?;
+            }
+            check_deadline(deadline)?;
+            return self.dispose_generation(auth, &plan[1], deadline);
+        }
         self.execute_plan(auth, &plan, deadline)
     }
 

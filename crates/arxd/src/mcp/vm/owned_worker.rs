@@ -3,6 +3,7 @@
 use super::{Gate, Id, Outcome, Refusal, SHUTDOWN, STATE_UNAVAILABLE, Supervisor};
 use std::{
     collections::{HashMap, hash_map::Entry},
+    future::Future,
     io,
     sync::{Arc, Mutex, atomic::Ordering},
 };
@@ -168,6 +169,19 @@ impl TestWorkers {
     }
 }
 
+struct OnWorkerExit<F: FnOnce(&Supervisor)> {
+    supervisor: Arc<Supervisor>,
+    cleanup: Option<F>,
+}
+
+impl<F: FnOnce(&Supervisor)> Drop for OnWorkerExit<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup(&self.supervisor);
+        }
+    }
+}
+
 impl Gate {
     /// Drain finished workers. A failed one fences fresh TEST admission, and
     /// a closed or fenced supervisor refuses before any durable commit.
@@ -194,15 +208,50 @@ impl Gate {
         initialize: fn() -> io::Result<Runtime>,
         work: impl FnOnce(&Supervisor, &Runtime) -> anyhow::Result<()> + Send + 'static,
     ) -> Outcome<AbortHandle> {
+        self.enqueue_test_worker_with_cleanup(supervisor, registration, initialize, |_| {}, work)
+    }
+
+    /// Enqueue a tracked TEST worker whose `cleanup` runs on every post-enqueue
+    /// failure (pre-entry runtime initialization error, panic, abort before
+    /// entry, or worker error) before the registration is released.
+    #[allow(dead_code, reason = "TEST producers are installed in later chunks")]
+    pub(super) fn enqueue_test_worker_with_cleanup<T: Send + 'static>(
+        &mut self,
+        supervisor: &Arc<Supervisor>,
+        registration: Registration<T>,
+        initialize: fn() -> io::Result<Runtime>,
+        cleanup: impl FnOnce(&Supervisor) + Send + 'static,
+        work: impl FnOnce(&Supervisor, &Runtime) -> anyhow::Result<()> + Send + 'static,
+    ) -> Outcome<AbortHandle> {
         self.test_workers_open(supervisor)?;
+        let on_exit = OnWorkerExit {
+            supervisor: supervisor.clone(),
+            cleanup: Some(cleanup),
+        };
         let supervisor = supervisor.clone();
         Ok(self.test_workers.tasks.spawn_blocking(move || {
             let _registration = registration;
+            let mut on_exit = on_exit;
             let runtime = initialize()?;
             // The worker includes terminal settlement. A failure leaves its
             // durable intent for recovery and still drops the registration.
-            work(&supervisor, &runtime)
+            let result = work(&supervisor, &runtime);
+            if result.is_ok() {
+                on_exit.cleanup = None;
+            }
+            result
         }))
+    }
+
+    /// Track a bounded recovery task for an already-committed durable intent
+    /// after handoff refusal. Joined by `drain_workers` even when fresh
+    /// admission is fenced.
+    #[allow(dead_code, reason = "TEST producers are installed in later chunks")]
+    pub(super) fn spawn_test_recovery(
+        &mut self,
+        task: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) {
+        self.test_workers.tasks.spawn(task);
     }
 }
 

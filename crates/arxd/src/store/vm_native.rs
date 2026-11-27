@@ -480,6 +480,31 @@ pub(crate) fn verify_slot(
     Ok(())
 }
 
+/// A mutable build slot stays `identified` through every writable phase. Its
+/// single durable content digest is committed once, after the final writable
+/// release of its generation, while the released writer exclusions are held.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) fn verify_build_slot(
+    db: &Connection,
+    scope: Scope,
+    slot: ArtifactSlot,
+    evidence: ArtifactEvidence,
+) -> Result<()> {
+    require_scope(db, scope, slot)?;
+    ensure!(
+        matches!(slot.role, "disk" | "vars" | "verification_overlay")
+            && count(db,
+                "SELECT count(*) FROM vm_native_generations n JOIN vm_generations g ON g.id=n.generation
+                 JOIN vm_build_intents b ON b.id=g.build_id
+                 WHERE n.generation=?1 AND n.origin='build' AND g.active=0 AND b.state='pending'",
+                [scope.generation],
+            )? == 1,
+        "invalid released build slot"
+    );
+    verify_slot(db, scope, slot, evidence)?;
+    super::identify(db, slot, evidence)
+}
+
 /// Classifies an intended slot from an exact observation through the held
 /// workspace directory. Absence disproves the intent. A present object
 /// without a recorded identity is quarantined and never adopted.

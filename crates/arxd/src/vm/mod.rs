@@ -34,13 +34,13 @@ pub(crate) mod windows;
 pub use windows::qualification;
 
 pub(crate) use crate::store::vm::{DashboardCatalog, DashboardVm};
-#[cfg(all(windows, target_arch = "x86_64"))]
-pub(crate) use controller::AdmittedEffect;
 pub use controller::VmController;
 pub(crate) use controller::{
     ActivityReceipt, CatalogEntry, ForegroundSubject, Precheck, VaultSweepPriority,
     VaultTestCleanup,
 };
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use controller::{AdmittedEffect, OwnedStop};
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) use controller::{ClonePublication, SealedGolden};
 pub use model::*;
