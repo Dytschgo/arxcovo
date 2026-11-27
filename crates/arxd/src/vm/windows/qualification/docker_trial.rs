@@ -15,6 +15,8 @@ use arx_guest::compose::{COMPOSE_PROTOCOL_VERSION, ComposeResponse};
 use arx_guest::docker_trial::{BootMode, Challenge, TrialRequest, TrialResponse};
 use std::io::Write;
 
+mod origin;
+pub(super) use origin::profile_pin as origin_profile_pin;
 pub(in crate::vm::windows) mod witness;
 use witness::{Listener, ObservedRoute, ReceiverEnrollment, RouteSample, Target};
 
@@ -363,13 +365,6 @@ pub(super) struct Reply {
     pub(super) frame: Vec<u8>,
 }
 
-pub(super) struct OriginProof {
-    pub(super) peer: PeerId,
-    pub(super) challenge: Challenge,
-    pub(super) port: u16,
-    pub(super) tls_profile: Hash,
-}
-
 /// A stage returns the materials it actually prepared. The collector builds
 /// argv from those materials while the prepared object still owns the holds.
 pub(super) trait Prepared {
@@ -443,13 +438,6 @@ pub(super) trait Capture {
         targets: &[Target],
         window: std::ops::Range<u64>,
     ) -> Result<Vec<u8>, NativeRefusal>;
-    fn origin(
-        &mut self,
-        peer: PeerId,
-        challenge: Challenge,
-        port: u16,
-        cutoff: u64,
-    ) -> Result<OriginProof, NativeRefusal>;
 }
 
 pub(super) struct Run<'a, H, G, C> {
@@ -463,6 +451,7 @@ pub(super) struct Run<'a, H, G, C> {
     pub(super) custody: Custody,
     pub(super) evidence: &'a sink::EvidenceDir,
     pub(super) cancel: &'a Shutdown,
+    pub(super) runtime: &'a tokio::runtime::Runtime,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -556,7 +545,7 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                 return Err(NativeRefusal::QualificationMissing);
             }
             self.host.cont(peer, cutoff, self.cancel)?;
-            verify(
+            let proof = verify(
                 &mut self.host,
                 &mut self.guest,
                 &mut self.capture,
@@ -568,7 +557,18 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                     started_ms,
                     route,
                 },
-            )
+            )?;
+            // The fixture deliberately exercises drift. The installed endpoint
+            // must still match the enrolled route after its HTTPS exchange.
+            if phase == Phase::Endpoint {
+                witness::route(
+                    self.host.route(&boot, Some(peer), cutoff)?,
+                    &boot,
+                    Some(peer),
+                    &self.dependencies,
+                )?;
+            }
+            Ok(proof)
         })();
         let release_start = self.host.clock();
         let release_cutoff = release_start.mono_ms.saturating_add(RELEASE_BUDGET_MS);
@@ -644,7 +644,9 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                 })
             }
             Stage::InstalledGuestEndpoint => {
-                self.run_boot(Phase::Endpoint, cutoff, |host, guest, capture, boot| {
+                let runtime = self.runtime;
+                let cancel = self.cancel;
+                self.run_boot(Phase::Endpoint, cutoff, |host, guest, _, boot| {
                     let peer = boot.peer;
                     let challenge = boot.ticket.challenge;
                     if !fixture.is_some_and(|first| first.boot != peer.boot) {
@@ -663,22 +665,30 @@ impl<H: Host, G: Guest, C: Capture> Run<'_, H, G, C> {
                         &arx_guest::docker_trial::compose_hello(challenge),
                         cutoff,
                     )?;
-                    if provision != (TrialResponse::DockerTrialProvisioned { challenge })
+                    let TrialResponse::DockerTrialProvisioned {
+                        challenge: echoed,
+                        certificate_der,
+                    } = provision
+                    else {
+                        return Err(NativeRefusal::GuestEndpointUnverified);
+                    };
+                    if echoed != challenge
                         || !arx_guest::docker_trial::matches_compose_ack(challenge, &ack)
+                        || dependencies.origin_profile != origin::profile_pin()
                     {
                         return Err(NativeRefusal::GuestEndpointUnverified);
                     }
                     let port = boot.plan.static_origin_lease().ok_or(REFUSED)?.port();
                     host.listener(peer, port, cutoff)?.check(port, peer.pid)?;
-                    let proof = capture.origin(peer, challenge, port, cutoff)?;
+                    let remaining = cutoff.saturating_sub(host.clock().mono_ms);
+                    runtime.block_on(origin::probe(
+                        port,
+                        challenge,
+                        &certificate_der,
+                        Duration::from_millis(remaining),
+                        cancel,
+                    ))?;
                     host.listener(peer, port, cutoff)?.check(port, peer.pid)?;
-                    if proof.peer != peer
-                        || proof.challenge != challenge
-                        || proof.port != port
-                        || proof.tls_profile != dependencies.origin_profile
-                    {
-                        return Err(NativeRefusal::GuestEndpointUnverified);
-                    }
                     Ok(())
                 })?;
                 if !self.host.copies_independent_and_original_unchanged() {

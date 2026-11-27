@@ -797,6 +797,10 @@ impl<'a> HeldDockerInputs<'a> {
         let (stock_distribution, stock) = inventory::collect(enrollment.stock_bundle)?;
         stock.protected(token.account.0, Instant::now() + Duration::from_secs(2))?;
         let stock_inventory = recipe.stock_inventory(&stock_distribution)?;
+        let origin_profile = private_input(enrollment.origin_profile, MAX_ENROLLMENT_BYTES)?;
+        if measured(&origin_profile)? != super::docker_trial::origin_profile_pin() {
+            return Err(NativeRefusal::GuestEndpointUnverified);
+        }
         Ok(Self {
             release,
             scope,
@@ -819,7 +823,7 @@ impl<'a> HeldDockerInputs<'a> {
                 super::docker_trial::witness::MAX_INVENTORY_BYTES,
             )?,
             topology: private_input(enrollment.topology, MAX_METADATA)?,
-            origin_profile: private_input(enrollment.origin_profile, MAX_ENROLLMENT_BYTES)?,
+            origin_profile,
         })
     }
 
