@@ -1824,7 +1824,7 @@ impl VmInventory {
                 _ => false,
             };
             if static_effect {
-                return self.refuse(action, request.vm(), Fault(native_reason(reason)));
+                return self.refuse(action, request.vm(), Fault::new(native_reason(reason)));
             }
         }
         // A current TEST run owner serves its scripts on the owned channel.
@@ -1928,7 +1928,7 @@ impl VmInventory {
                 return refuse(Refusal::PublishTargetMismatch);
             }
             if let Some(reason) = supervisor.static_refusal() {
-                return self.refuse(action, Some(vm), Fault(native_reason(reason)));
+                return self.refuse(action, Some(vm), Fault::new(native_reason(reason)));
             }
             if row.state != StaticState::Running {
                 return refuse(Refusal::NotReady);
