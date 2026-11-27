@@ -40,6 +40,7 @@ pub(crate) use recipe::{
 mod schema;
 mod sink;
 mod static_compose;
+pub(crate) use static_compose::{PreparedStaticDossier, StaticDossier};
 mod test;
 
 pub use paused::{
@@ -1206,6 +1207,17 @@ pub(crate) fn require_held_private(file: &File) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other("private owner-only permissions required"))
+    }
+}
+
+pub(crate) fn require_held_private_protected(file: &File) -> io::Result<()> {
+    let user = current_user()?;
+    if sink::held_private_protected(file, user_sid(&user)) {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "protected private owner-only permissions required",
+        ))
     }
 }
 

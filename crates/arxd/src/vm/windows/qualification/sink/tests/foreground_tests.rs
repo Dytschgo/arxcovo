@@ -126,6 +126,9 @@ fn docker_fixture(
 #[test]
 fn docker_dossier_reads_only_its_own_class_and_exact_rows() {
     use records::*;
+
+    // Match service startup so the enrollment file is owned by TokenUser on elevated CI.
+    crate::service::windows::set_current_token_owner().expect("TokenOwner = TokenUser");
     let work = tempfile::tempdir().unwrap();
     let (path, dir) = claimed(work.path(), &[]);
     let (test_dependencies, _, test_bundle) = complete_test_fixture(&dir);
@@ -155,15 +158,29 @@ fn docker_dossier_reads_only_its_own_class_and_exact_rows() {
         boot_marker: TEST_BOOT.marker,
         dependencies: &dependencies,
     };
-    let (user, _) = user();
-    let dossier = crate::vm::windows::qualification::static_compose::StaticDossier::open(
-        &path,
-        sid(&user),
-        &selection,
-        &fresh,
-    )
-    .unwrap();
+    let (_, private) = private_dir(work.path(), "enrollment");
+    let enrollment = private.join("docker.json").unwrap();
+    std::fs::write(enrollment.as_str(), br#"{"class":"docker"}"#).unwrap();
+    let pin = PathPin::open(&path, true, false).unwrap();
+    let expected = crate::config::fixture_directory_pin(&pin.leaf);
+    let pending = PreparedStaticDossier::hold(&path, &expected, &enrollment, selection).unwrap();
+    assert_eq!(
+        pending
+            .select(Err(NativeRefusal::NetworkFenceUnverified))
+            .err(),
+        Some(NativeRefusal::NetworkFenceUnverified),
+    );
+    assert!(
+        pending
+            .select(Ok(DockerFresh {
+                boot_marker: [99; 32],
+                ..fresh
+            }))
+            .is_err()
+    );
+    let dossier = pending.select(Ok(DockerFresh { ..fresh })).unwrap();
     assert_eq!(dossier.evidence.recipe(), recipe);
+    assert_eq!(dossier.seal_sha256, selection.seal_sha256);
     assert!(
         std::fs::OpenOptions::new()
             .write(true)
