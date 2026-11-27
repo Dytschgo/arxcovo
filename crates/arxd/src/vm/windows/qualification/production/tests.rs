@@ -2031,7 +2031,7 @@ async fn inspection_stock_launch_and_release_bind_a_read_only_disk_with_zero_wri
             SnapshotInfo::checked(&disk, SnapshotDiskRole::Staging, &header, None, size).unwrap();
         let plan = offline_snapshot_info(&lease, &image, &info).unwrap();
         let pins = [PathPin::open(&image_path, false, false).unwrap(), disk_pin];
-        let writers = StockLaunch::verify_inputs(&bundle, &cwd, &plan, &pins, &custody)?;
+        let writers = StockLaunch::verify_inputs(&bundle, &cwd, &plan, &pins, &custody, false)?;
         Ok::<_, NativeRefusal>((pins, writers))
     };
 

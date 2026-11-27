@@ -2830,6 +2830,7 @@ impl StockLaunch<'_> {
         plan: &CommandPlan<'_>,
         pins: &[PathPin],
         workspace: &WorkspaceCustody<'_>,
+        docker: bool,
     ) -> Result<Vec<usize>, NativeRefusal> {
         use ArtifactRole::*;
         use qualification::inventory::binding;
@@ -2862,8 +2863,8 @@ impl StockLaunch<'_> {
             identities.push(pin.identity);
             binding(pin)?;
             match role {
-                Qemu | QemuImg => {
-                    let leaf = if role == Qemu {
+                Qemu | PublicEgressQemu | QemuImg if role != PublicEgressQemu || docker => {
+                    let leaf = if role != QemuImg {
                         "qemu-system-x86_64.exe"
                     } else {
                         "qemu-img.exe"
@@ -2873,17 +2874,27 @@ impl StockLaunch<'_> {
                         || path != plan.image()
                         || pin.identity != bundle.identity(leaf)?
                         || pin.mutable
+                        || (role == PublicEgressQemu
+                            && (artifact.identity() != Some(pin.identity)
+                                || artifact.pin().is_none()
+                                || artifact.pin() != pin.verified_content))
                     {
                         return Err(NativeRefusal::DistributionUnverified);
                     }
                 }
                 Data => {
                     let expected = bundle.root.path.join("share").map_err(|_| custody)?;
-                    if path != &expected || pin.mutable {
+                    if path != &expected
+                        || pin.identity != bundle.directory_identity("share")?
+                        || pin.mutable
+                    {
                         return Err(NativeRefusal::DistributionUnverified);
                     }
                 }
-                PublicEgressQemu | PublicEgressPolicy | StaticDisk | StaticVars | Scratch | Dll => {
+                PublicEgressQemu | PublicEgressPolicy | StaticDisk | StaticVars if !docker => {
+                    return Err(NativeRefusal::NetworkFenceUnverified);
+                }
+                Scratch | Dll => {
                     return Err(NativeRefusal::NetworkFenceUnverified);
                 }
                 _ => {
@@ -2906,9 +2917,8 @@ impl StockLaunch<'_> {
                     }
                     match role {
                         Golden => golden = Some(pin),
-                        GuestDisk | TestInstallDisk | SnapshotDisk | SnapshotStagingDisk => {
-                            images.push(pin)
-                        }
+                        GuestDisk | TestInstallDisk | StaticDisk | SnapshotDisk
+                        | SnapshotStagingDisk => images.push(pin),
                         Staging if !pin.leaf.metadata().is_ok_and(|m| m.len() == 0) => {
                             return Err(custody);
                         }
@@ -2928,7 +2938,8 @@ impl StockLaunch<'_> {
         let golden_size = golden.map(|pin| inspect(pin, None)).transpose()?;
         for disk in images {
             let size = inspect(disk, golden.map(|pin| &pin.path))?;
-            if golden_size.is_some_and(|expected| size != expected) {
+            if (docker && size != 32 << 30) || golden_size.is_some_and(|expected| size != expected)
+            {
                 return Err(custody);
             }
         }
@@ -2936,9 +2947,9 @@ impl StockLaunch<'_> {
     }
 }
 
-struct LaunchInputs<'a> {
-    plan: CommandPlan<'a>,
-    cwd: &'a LocalPath,
+struct LaunchInputs<'a, 'plan> {
+    plan: CommandPlan<'plan>,
+    cwd: &'plan LocalPath,
     workspace: WorkspaceCustody<'a>,
     bundle: &'a qualification::inventory::Bundle,
     memory: usize,
@@ -3064,20 +3075,31 @@ fn attach_checked_child(
 impl<'a> CheckedLaunchCore<'a> {
     fn hold_checked<T>(
         token: &'a VmToken,
-        inputs: LaunchInputs<'a>,
+        inputs: LaunchInputs<'a, '_>,
         refresh: impl FnOnce(&CommandPlan<'_>) -> Result<(std::time::Instant, T), NativeRefusal>,
         before_spawn: impl FnOnce() -> Result<(), NativeRefusal>,
+    ) -> Result<(Self, BootIo, T), HoldRefusal> {
+        Self::hold_checked_for(token, inputs, refresh, before_spawn, false)
+    }
+
+    fn hold_checked_for<T>(
+        token: &'a VmToken,
+        inputs: LaunchInputs<'a, '_>,
+        refresh: impl FnOnce(&CommandPlan<'_>) -> Result<(std::time::Instant, T), NativeRefusal>,
+        before_spawn: impl FnOnce() -> Result<(), NativeRefusal>,
+        docker: bool,
     ) -> Result<(Self, BootIo, T), HoldRefusal> {
         let kind = inputs.plan.kind();
         // ADR 0064: a public-egress plan also stays closed until its patched
         // build, policy custody and route evidence have native qualification.
-        if matches!(
-            kind,
-            PlanKind::StaticWebBoot
-                | PlanKind::PublicEgressBoot
-                | PlanKind::StaticComposeInstaller
-                | PlanKind::StaticComposeDetached
-        ) {
+        if kind == PlanKind::StaticWebBoot
+            || matches!(
+                kind,
+                PlanKind::PublicEgressBoot
+                    | PlanKind::StaticComposeInstaller
+                    | PlanKind::StaticComposeDetached
+            ) && !docker
+        {
             return Err(NativeRefusal::NetworkFenceUnverified.into());
         }
         match (kind, inputs.installer) {
@@ -3087,7 +3109,10 @@ impl<'a> CheckedLaunchCore<'a> {
                 return Err(NativeRefusal::InstallerDeadlineExpired.into());
             }
             (PlanKind::InstallerBoot(phase), Some(stage)) if phase == stage.phase() => {}
-            (PlanKind::InstallerBoot(_), _) | (_, Some(_)) => {
+            (PlanKind::StaticComposeInstaller, Some(stage))
+                if stage.phase() == super::runtime::InstallerPhase::UbuntuInstall
+                    && tokio::time::Instant::now() < stage.deadline() => {}
+            (PlanKind::InstallerBoot(_) | PlanKind::StaticComposeInstaller, _) | (_, Some(_)) => {
                 return Err(NativeRefusal::InstallerPhaseMismatch.into());
             }
             _ => {}
@@ -3103,6 +3128,7 @@ impl<'a> CheckedLaunchCore<'a> {
             &inputs.plan,
             &inputs.pins,
             &inputs.workspace,
+            docker,
         )?;
         use super::runtime::InstallerPhase;
         let finalization = match (kind, inputs.finalization_slots) {
@@ -3208,7 +3234,14 @@ impl<'a> CheckedLaunchCore<'a> {
                 child
                     .verify_live()
                     .map_err(|_| NativeRefusal::JobUnverified)?;
-                let program = if matches!(kind, PlanKind::Boot | PlanKind::InstallerBoot(_)) {
+                let program = if matches!(
+                    kind,
+                    PlanKind::Boot
+                        | PlanKind::InstallerBoot(_)
+                        | PlanKind::PublicEgressBoot
+                        | PlanKind::StaticComposeInstaller
+                        | PlanKind::StaticComposeDetached
+                ) {
                     "qemu-system-x86_64.exe"
                 } else {
                     "qemu-img.exe"

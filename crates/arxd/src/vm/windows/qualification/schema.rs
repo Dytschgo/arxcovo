@@ -232,6 +232,7 @@ const INCOMPLETE: &[(&str, Shape)] = &[
 
 /// Every observation kind and its fields, in declaration order.
 const OBSERVATIONS: &[(&str, &[(&str, Shape)])] = &[
+    ("docker_test_baseline", &[("test_seal", Shape::Bytes(32))]),
     (
         "docker_distribution",
         &[
@@ -554,6 +555,7 @@ fn rules(file: DiagnosticFile) -> Rules {
                 "capacity_trials",
             ],
             &[
+                "docker_test_baseline",
                 "capacity",
                 "paused_store",
                 "paused_trial",
@@ -563,7 +565,7 @@ fn rules(file: DiagnosticFile) -> Rules {
         ),
         F::ActivityReserves => records(
             &["activity_reserves_baseline", "reserve_activity_trials"],
-            &["activity", "reserve_activity"],
+            &["activity", "reserve_activity", "docker_test_baseline"],
         ),
         F::WhpxQmpEndpoint => records(
             &[
@@ -576,6 +578,7 @@ fn rules(file: DiagnosticFile) -> Rules {
                 "installed_guest_endpoint",
             ],
             &[
+                "docker_test_baseline",
                 "whpx",
                 "paused_trial",
                 "firmware_sec",

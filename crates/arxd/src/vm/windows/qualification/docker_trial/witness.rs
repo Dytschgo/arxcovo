@@ -127,6 +127,7 @@ pub(in crate::vm::windows::qualification) struct Target {
 /// The reviewed private enrollment is independent of the observer peers.
 /// Its exact file digest is included with the three held fixture input pins
 /// in the existing Docker dependency key.
+#[derive(Clone)]
 pub(in crate::vm::windows::qualification) struct ReceiverEnrollment {
     targets: Vec<Target>,
     fixture: Hash,
@@ -218,6 +219,10 @@ impl ReceiverEnrollment {
             .map_err(|_| NETWORK)
     }
 
+    pub(super) fn targets(&self) -> &[Target] {
+        &self.targets
+    }
+
     pub(super) fn check_targets(
         &self,
         mut observed: Vec<Target>,
@@ -245,6 +250,7 @@ pub(in crate::vm::windows::qualification) struct CaptureRequest<'a> {
     pub route: ObservedRoute,
     pub topology: Hash,
     pub policy: Hash,
+    pub origin_port: u16,
     pub targets: &'a [Target],
     pub issued_ms: u64,
     pub cutoff_ms: u64,

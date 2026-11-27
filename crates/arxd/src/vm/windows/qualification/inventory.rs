@@ -121,7 +121,10 @@ impl Bundle {
         Ok(file_identity(file, false).map_err(|_| REFUSAL)?.0)
     }
 
-    pub(super) fn directory_identity(&self, name: &str) -> Result<FileIdentity, NativeRefusal> {
+    pub(in crate::vm::windows) fn directory_identity(
+        &self,
+        name: &str,
+    ) -> Result<FileIdentity, NativeRefusal> {
         let dir = self.directories.get(name).ok_or(REFUSAL)?;
         Ok(file_identity(dir, true).map_err(|_| REFUSAL)?.0)
     }

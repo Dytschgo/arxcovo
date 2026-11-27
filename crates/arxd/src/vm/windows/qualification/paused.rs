@@ -3,6 +3,7 @@
 //! The reviewed stock bundle inventory remains held from admission through teardown.
 
 mod native;
+pub(super) use native::cpu_scope as qualifier_cpu_scope;
 
 pub use native::{
     CapacityProbe, CapacityProbePermit, FirmwareProbe, FirmwareProbePermit, NetworkProbe,

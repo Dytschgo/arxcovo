@@ -2216,7 +2216,7 @@ fn require_live(slot: &Slot) -> Result<(), NativeRefusal> {
         .map_err(|_| NativeRefusal::JobUnverified)
 }
 
-fn cpu_scope() -> Result<u32, ReserveCheck> {
+pub(in crate::vm::windows::qualification) fn cpu_scope() -> Result<u32, ReserveCheck> {
     let process = unsafe { GetCurrentProcess() };
     check_cpu_scope(
         || {

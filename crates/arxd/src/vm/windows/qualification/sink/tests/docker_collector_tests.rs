@@ -60,6 +60,7 @@ enum Fault {
     ExtraEnrolledReceiver,
     SubstitutedEnrolledReceiver,
     NoRouteChange,
+    RouteNotRestored,
     MissingDriftEvents,
     ForeignClosedFlow,
     NoEstablishedArrivals,
@@ -157,24 +158,15 @@ impl<'a> trial::Host for Host<'a> {
     }
 
     fn baseline(&mut self, stage: Stage) -> Result<Observation, NativeRefusal> {
+        if stage.docker_inherits_test() {
+            return Ok(Observation::DockerTestBaseline {
+                test_seal: self.dependencies.test_seal,
+            });
+        }
         let row = self.rows.iter().find(|row| row.stage == stage).unwrap();
-        let StageResult::Passed(mut observation) = row.result.clone() else {
+        let StageResult::Passed(observation) = row.result.clone() else {
             unreachable!()
         };
-        if let Observation::ReserveActivity {
-            controlled_faults,
-            console_transitions_ms,
-        } = &mut observation
-        {
-            let start = self.time.get() - 20;
-            for item in controlled_faults.iter_mut() {
-                item.sampled_ms = start + item.sampled_ms % 100;
-                item.settled_ms = start + item.settled_ms % 100;
-            }
-            for timestamp in console_transitions_ms.iter_mut() {
-                *timestamp = start + *timestamp % 100;
-            }
-        }
         Ok(observation)
     }
 
@@ -497,6 +489,17 @@ impl<'a> trial::Host for Host<'a> {
         })
     }
 
+    fn fixture_current(&mut self, _: trial::PeerId, _: u64) -> Result<(), NativeRefusal> {
+        Ok(())
+    }
+
+    fn after_fixture(&mut self, _: u64) -> Result<(), NativeRefusal> {
+        if self.fault == Fault::RouteNotRestored {
+            return Err(NativeRefusal::NetworkFenceUnverified);
+        }
+        Ok(())
+    }
+
     fn copies_independent_and_original_unchanged(&mut self) -> bool {
         true
     }
@@ -521,12 +524,13 @@ struct Guest<'a> {
     trace: &'a RefCell<Trace>,
 }
 
-impl trial::Guest for Guest<'_> {
+impl trial::Guest<Host<'_>> for Guest<'_> {
     fn exchange(
         &mut self,
         mut peer: trial::PeerId,
         frame: Vec<u8>,
         _: u64,
+        _: &mut Host<'_>,
     ) -> Result<trial::Reply, NativeRefusal> {
         let mut reply = Vec::new();
         let input = &mut frame.as_slice();
@@ -617,7 +621,12 @@ struct Capture<'a> {
 }
 
 impl trial::Capture for Capture<'_> {
-    fn arm(&mut self, request: &CaptureRequest<'_>) -> Result<Vec<u8>, NativeRefusal> {
+    fn arm(
+        &mut self,
+        request: &CaptureRequest<'_>,
+        current: &mut dyn FnMut() -> Result<(), NativeRefusal>,
+    ) -> Result<Vec<u8>, NativeRefusal> {
+        current()?;
         let mut trace = self.trace.borrow_mut();
         assert_eq!(trace.launched.last(), Some(&trial::Phase::PublicFixture));
         assert_eq!(trace.startup_listeners, 1);
@@ -639,7 +648,9 @@ impl trial::Capture for Capture<'_> {
         &mut self,
         request: &CaptureRequest<'_>,
         window: std::ops::Range<u64>,
+        current: &mut dyn FnMut() -> Result<(), NativeRefusal>,
     ) -> Result<Vec<u8>, NativeRefusal> {
+        current()?;
         assert_eq!(
             self.trace.borrow().continued.last(),
             Some(&trial::Phase::PublicFixture)
@@ -1147,7 +1158,7 @@ fn collect(fault: Fault) {
         },
         packages: PACKAGES,
         dependencies: dependencies.clone(),
-        stock: stock_inputs,
+        stock: &stock_inputs,
         receiver_enrollment,
         custody,
         evidence: &evidence,
@@ -1246,6 +1257,16 @@ fn collect(fault: Fault) {
             PreparedStaticDossier::hold(&output, &expected, &enrolled, selection).unwrap();
         let (selected, _rows) = dossier.read_measured(&fresh).unwrap();
         assert_eq!(selected.recipe(), dependencies.recipe);
+        let mut foreign_test = dependencies.clone();
+        foreign_test.test_seal[0] ^= 1;
+        assert!(
+            dossier
+                .read_measured(&records::DockerFresh {
+                    dependencies: &foreign_test,
+                    ..fresh
+                })
+                .is_err()
+        );
         let mut other_boot = fresh.boot_marker;
         other_boot[0] ^= 1;
         assert!(
@@ -1277,7 +1298,11 @@ fn collect(fault: Fault) {
     );
     if matches!(
         fault,
-        Fault::Stage | Fault::Scope | Fault::WrongStockExecutable | Fault::WrongStockData
+        Fault::Stage
+            | Fault::Scope
+            | Fault::WrongStockExecutable
+            | Fault::WrongStockData
+            | Fault::RouteNotRestored
     ) {
         assert_eq!(trace.launched, [PublicFixture]);
     }
@@ -1374,6 +1399,11 @@ fn docker_collector_refuses_omitted_or_extra_enrolled_receivers() {
 #[test]
 fn docker_collector_refuses_substituted_enrolled_receiver() {
     collect(Fault::SubstitutedEnrolledReceiver);
+}
+
+#[test]
+fn docker_collector_requires_route_watch_handoff_before_starting_installer() {
+    collect(Fault::RouteNotRestored);
 }
 
 #[test]
@@ -1503,6 +1533,7 @@ fn docker_receiver_mailbox_exchanges_private_bounded_frames() {
         route: fixture_route().into(),
         topology: [64; 32],
         policy: [65; 32],
+        origin_port: 43112,
         targets: &[],
         issued_ms: 0,
         cutoff_ms: 5000,
@@ -1538,10 +1569,18 @@ fn docker_receiver_mailbox_exchanges_private_bounded_frames() {
         }
         panic!("mailbox did not publish both frames");
     });
-    let reply = mailbox.arm(&request).unwrap();
+    let reply = mailbox.arm(&request, &mut || Ok(())).unwrap();
     assert_eq!(reply, request.fixture_sign(b"armed", &[], false));
-    assert!(mailbox.fixture(&request, 0..request.cutoff_ms).is_err());
+    assert!(
+        mailbox
+            .fixture(&request, 0..request.cutoff_ms, &mut || Ok(()))
+            .is_err()
+    );
     observer.join().unwrap();
-    assert!(mailbox.fixture(&request, 0..request.cutoff_ms).is_err());
+    assert!(
+        mailbox
+            .fixture(&request, 0..request.cutoff_ms, &mut || Ok(()))
+            .is_err()
+    );
     assert!(Mailbox::open(&path, sid(&owner), &[], boot::uptime(), cancel).is_err());
 }

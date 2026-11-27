@@ -46,6 +46,7 @@ pub(super) fn recipe_id_valid(identity: RecipeIdentity) -> bool {
 /// key is distinct from TEST even where individual measurements are shared.
 #[derive(Clone, Serialize)]
 pub struct DockerDependencies {
+    pub test_seal: Hash,
     pub supervisor_image: Hash,
     pub qualifier_image: Hash,
     pub host: HostDependency,
@@ -86,6 +87,7 @@ impl DockerDependencies {
             })
             && [
                 scope,
+                self.test_seal,
                 self.supervisor_image,
                 self.qualifier_image,
                 self.owner_logon,
@@ -206,6 +208,7 @@ pub fn read_native_docker<R: Read>(
         .checked_add(rows.last_finished_ms)
         .ok_or(RunError::Untrusted)?;
     if fresh.now.mono_ms <= finished
+        || rows.docker.test_seal != Some(dependencies.test_seal)
         || rows.docker.host_build != Some(dependencies.host.windows_build)
         || rows.docker.distribution
             != Some([
@@ -229,6 +232,7 @@ pub fn read_native_docker<R: Read>(
 
 #[derive(Default)]
 pub(super) struct Rows {
+    test_seal: Option<Hash>,
     host_build: Option<u32>,
     distribution: Option<[Hash; 4]>,
     recipe: Option<DockerRecipe>,
@@ -237,8 +241,26 @@ pub(super) struct Rows {
 }
 
 impl Rows {
-    pub(super) fn observe(&mut self, class: Class, result: &StageResult) -> Result<(), RunError> {
+    pub(super) fn observe(
+        &mut self,
+        class: Class,
+        stage: Stage,
+        result: &StageResult,
+    ) -> Result<(), RunError> {
         use Observation as O;
+        if class == Class::Docker && stage.docker_inherits_test() {
+            let StageResult::Passed(O::DockerTestBaseline { test_seal }) = result else {
+                return Err(RunError::Untrusted);
+            };
+            if self
+                .test_seal
+                .is_some_and(|previous| previous != *test_seal)
+            {
+                return Err(RunError::Untrusted);
+            }
+            self.test_seal = Some(*test_seal);
+            return Ok(());
+        }
         match result {
             StageResult::Passed(O::Host { windows_build, .. }) if class == Class::Docker => {
                 self.host_build = Some(*windows_build);
@@ -270,7 +292,8 @@ impl Rows {
             }
             StageResult::Passed(O::Distribution { .. }) if class != Class::Docker => {}
             StageResult::Passed(
-                O::DockerDistribution { .. }
+                O::DockerTestBaseline { .. }
+                | O::DockerDistribution { .. }
                 | O::DockerRecipeVerified { .. }
                 | O::DockerPublicIpv4 { .. }
                 | O::DockerInstalledEndpoint { .. }

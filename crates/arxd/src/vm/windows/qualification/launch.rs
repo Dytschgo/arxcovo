@@ -97,7 +97,7 @@ impl<'a> WorkspaceCustody<'a> {
         Ok(custody)
     }
 
-    fn new(
+    pub(super) fn new(
         run: [u8; 16],
         generation: u64,
         root: &'a PathPin,
@@ -228,8 +228,8 @@ impl<'a> QualifierLaunch<'a> {
     fn hold<T>(
         permit: QualifierPlanPermit,
         baseline: HeldRecipeScope<'a>,
-        inputs: LaunchInputs<'a>,
-        at_create: impl FnOnce(LaunchInputs<'a>) -> Result<T, NativeRefusal>,
+        inputs: LaunchInputs<'a, 'a>,
+        at_create: impl FnOnce(LaunchInputs<'a, 'a>) -> Result<T, NativeRefusal>,
     ) -> Result<T, NativeRefusal> {
         permit.check(
             inputs.workspace.run,
@@ -256,7 +256,7 @@ impl<'a> QualifierLaunch<'a> {
     fn prepare(
         permit: QualifierPlanPermit,
         baseline: &'a Baseline,
-        inputs: LaunchInputs<'a>,
+        inputs: LaunchInputs<'a, 'a>,
         refresh: impl FnOnce() -> Result<std::time::Instant, NativeRefusal>,
     ) -> Result<(Self, PipeOutput, tokio::io::DuplexStream), NativeRefusal> {
         Self::hold(
@@ -2485,8 +2485,9 @@ foreach ($case in @(
         let plan = golden_info(&image, &golden, &header).unwrap();
         let mut pins = [PathPin::open(&image_path, false, false).unwrap(), disk];
         let cwd = path.join("cwd").unwrap();
-        let check =
-            |cwd, pins: &[PathPin]| StockLaunch::verify_inputs(&bundle, cwd, &plan, pins, &custody);
+        let check = |cwd, pins: &[PathPin]| {
+            StockLaunch::verify_inputs(&bundle, cwd, &plan, pins, &custody, false)
+        };
         assert!(check(&cwd, &pins).is_err());
         pins[1].verify_content(digest, digest.size).unwrap();
         assert_eq!(check(&cwd, &pins), Ok(vec![]));

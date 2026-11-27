@@ -13,6 +13,7 @@ pub const GUEST_PORT: &str = "org.arxcovo.agent.0";
 pub const GUEST_PORT_ID: &str = "arxguestport";
 pub const NETWORK: &str = "user,id=arxnet0,restrict=on,ipv6=off";
 
+#[derive(Clone)]
 pub struct SerialName(String);
 
 impl SerialName {
@@ -120,6 +121,7 @@ pub enum PlanKind {
 }
 
 /// Expected custody for one artifact in a sealed installer plan.
+#[derive(Clone)]
 pub struct InstallerArtifact<'a> {
     pub path: &'a LocalPath,
     pub identity: FileIdentity,
@@ -127,6 +129,7 @@ pub struct InstallerArtifact<'a> {
     pub role: ArtifactRole,
 }
 
+#[derive(Clone)]
 enum Binding<'a> {
     Boot,
     StaticWeb(&'a OriginPortLease),
@@ -152,6 +155,7 @@ enum Binding<'a> {
 /// `golden_info`, `offline_info` and `create`. Each one checks roles, header
 /// and size before it returns a plan, so no crate-internal caller can mint an
 /// unvalidated plan or edit the argv the native launcher consumes.
+#[derive(Clone)]
 pub struct CommandPlan<'a> {
     image: &'a LocalPath,
     args: Vec<String>,
