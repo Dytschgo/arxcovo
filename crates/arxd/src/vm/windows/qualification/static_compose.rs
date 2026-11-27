@@ -5,6 +5,8 @@
     reason = "consumed by the Part B disposable collector and foreground adapter"
 )]
 
+mod route_watch;
+
 use super::*;
 use crate::vm::{
     Id,
@@ -696,6 +698,22 @@ impl<'a> HeldDockerInputs<'a> {
             &held_bytes(&self.receiver_inventory, MAX_INVENTORY_BYTES)?,
             [measured(image)?, measured(network)?, measured(probe)?],
         )
+    }
+
+    /// Arm notifications before the first observation. The returned watch
+    /// belongs to the same observation and remains closed after drift.
+    pub(super) fn measure_live(
+        &self,
+        public_targets: &[std::net::Ipv4Addr],
+    ) -> Result<(DockerDependencies, route_watch::RouteWatch), NativeRefusal> {
+        let watch = route_watch::RouteWatch::arm()?;
+        let (route, topology) = watch.observe(&self.parsed_policy, public_targets)?;
+        let dependencies = self.measure(&route, topology)?;
+        if watch.observe(&self.parsed_policy, public_targets)? != (route, topology) {
+            return Err(NativeRefusal::NetworkFenceUnverified);
+        }
+        watch.require_current()?;
+        Ok((dependencies, watch))
     }
 
     /// Recheck independent inputs before selecting or writing evidence. The
