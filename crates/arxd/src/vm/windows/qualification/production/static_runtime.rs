@@ -359,18 +359,25 @@ impl StaticMachine<'_> {
             Err(reason) => Err(anyhow::anyhow!("static copy refused: {reason:?}")),
         };
         if result.is_err() {
-            controller.finish_static(
-                worker,
-                slots,
-                Err(if touched {
-                    crate::vm::CopyFailure::unknown(FailureReason::CloneFailed)
-                } else {
-                    crate::vm::CopyFailure::untouched(FailureReason::CloneFailed)
-                }),
-            )?;
+            settle_copy_failure(controller, worker, slots, touched)?;
         }
         Ok(())
     }
+}
+
+fn settle_copy_failure<C: Clock>(
+    controller: &VmController<C>,
+    worker: &PendingOperation,
+    slots: PairSlots,
+    touched: bool,
+) -> anyhow::Result<()> {
+    let failure = if touched {
+        crate::vm::CopyFailure::unknown(FailureReason::CloneFailed)
+    } else {
+        crate::vm::CopyFailure::untouched(FailureReason::CloneFailed)
+    };
+    controller.finish_static(worker, slots, Err(failure))?;
+    Ok(())
 }
 
 impl StaticMachine<'_> {
@@ -903,6 +910,13 @@ impl StaticMachine<'_> {
     }
 }
 
+pub(crate) struct StartedStatic<'a> {
+    pub boot: StaticBoot<'a>,
+    pub pipe: NamedPipeClient,
+    pub origin: crate::vm::runtime::publication::Origin,
+    pub wire_boot: u64,
+}
+
 pub(crate) struct StaticBoot<'a> {
     core: CheckedLaunchCore<'a>,
     qmp: PipeQmp,
@@ -1008,15 +1022,7 @@ impl StaticMachine<'_> {
         origin_generation: Id,
         recipe: StaticRecipe,
         deadline: Instant,
-    ) -> Result<
-        (
-            StaticBoot<'a>,
-            NamedPipeClient,
-            crate::vm::runtime::publication::Origin,
-            u64,
-        ),
-        NativeRefusal,
-    > {
+    ) -> Result<StartedStatic<'a>, NativeRefusal> {
         use crate::vm::runtime::publication::Origin;
         use ArtifactRole::*;
         use arx_guest::static_origin::{self, Request, Response};
@@ -1113,7 +1119,10 @@ impl StaticMachine<'_> {
                 )
                 .await?;
                 witness::listener(&core.child, port)?.check(port, pid)?;
-                let (ca_path, ca_receipt) = self.pin_ca(workspace, &ca, deadline)?;
+                let (ca_path, ca_receipt) =
+                    pin_generation_ca(&workspace.root, self.m4.owner(), &ca, || {
+                        self.check(deadline).map(|_| ())
+                    })?;
                 let wire_boot = u64::from_be_bytes(boot[..8].try_into().expect("eight bytes"))
                     & (i64::MAX as u64);
                 if wire_boot == 0 {
@@ -1145,8 +1154,8 @@ impl StaticMachine<'_> {
                 return Err(reason);
             }
         };
-        Ok((
-            StaticBoot {
+        Ok(StartedStatic {
+            boot: StaticBoot {
                 core,
                 qmp,
                 pid,
@@ -1155,38 +1164,67 @@ impl StaticMachine<'_> {
             pipe,
             origin,
             wire_boot,
-        ))
+        })
     }
+}
 
-    fn pin_ca(
-        &self,
-        workspace: &ProductionWorkspace,
-        ca: &[u8],
-        deadline: Instant,
-    ) -> Result<(std::path::PathBuf, ArtifactPin), NativeRefusal> {
-        const CA: &str = "origin-ca.der";
-        let root = &workspace.root;
-        let pin = ArtifactPin {
-            size: ca.len() as u64,
-            sha256: crate::vm::qualification_record::digest(ca),
-        };
-        let path = root.path.join(CA).map_err(|_| PATH)?;
-        match open_relative(&root.leaf, CA, Node::File, false, false) {
+fn pin_generation_ca(
+    root: &PathPin,
+    owner: PSID,
+    ca: &[u8],
+    current: impl FnOnce() -> Result<(), NativeRefusal>,
+) -> Result<(std::path::PathBuf, ArtifactPin), NativeRefusal> {
+    const DIR: &str = "origin-ca";
+    const CA: &str = "origin-ca.der";
+    if !(1..=arx_guest::static_origin::MAX_CERT).contains(&ca.len()) {
+        return Err(PATH);
+    }
+    let pin = ArtifactPin {
+        size: ca.len() as u64,
+        sha256: crate::vm::qualification_record::digest(ca),
+    };
+    let path = root
+        .path
+        .join(DIR)
+        .and_then(|dir| dir.join(CA))
+        .map_err(|_| PATH)?;
+    {
+        // A rename opens its target directory for adding a file with shared
+        // write, which the workspace root's read-only share refuses. Publish
+        // in a dedicated subdirectory whose only held handle shares write.
+        let dir = match open_relative(&root.leaf, DIR, Node::Directory, true, false) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                drop(
+                    open_relative(&root.leaf, DIR, Node::Directory, false, true)
+                        .map_err(|_| PATH)?,
+                );
+                open_relative(&root.leaf, DIR, Node::Directory, true, false)
+            }
+            opened => opened,
+        }
+        .map_err(|_| PATH)?;
+        if file_identity(&dir, true).map_err(|_| PATH)?.0.volume != root.identity.volume
+            || !has_exact_leaf(&dir, DIR)
+            || !sink::held_private(&dir, owner)
+        {
+            return Err(PATH);
+        }
+        match open_relative(&dir, CA, Node::File, false, false) {
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let temp = format!(
                     ".origin-ca-{}",
                     hex::encode(store::new_id().map_err(|_| PATH)?)
                 );
-                let guard = sink::create_hidden(&root.leaf, &temp).map_err(|_| PATH)?;
+                let guard = sink::create_hidden(&dir, &temp).map_err(|_| PATH)?;
                 let result = (|| {
-                    if !sink::held_private(&guard, self.m4.owner()) {
+                    if !sink::held_private(&guard, owner) {
                         return Err(PATH);
                     }
                     (&guard).write_all(ca).map_err(|_| PATH)?;
                     guard.sync_all().map_err(|_| PATH)?;
-                    self.check(deadline)?;
-                    sink::rename_within(&guard, &root.leaf, CA).map_err(|_| PATH)
+                    current()?;
+                    sink::rename_within(&guard, &dir, CA).map_err(|_| PATH)
                 })();
                 if result.is_err() {
                     let _ = sink::discard(&guard);
@@ -1195,13 +1233,15 @@ impl StaticMachine<'_> {
             }
             Err(_) => return Err(PATH),
         }
-        let mut held = PathPin::open(&path, false, false)?;
-        if !has_exact_leaf(&held.leaf, CA) || !sink::held_private(&held.leaf, self.m4.owner()) {
-            return Err(PATH);
-        }
-        held.verify_content(pin, arx_guest::static_origin::MAX_CERT as u64)?;
-        Ok((std::path::PathBuf::from(path.as_str()), pin))
+        // The temporary entry and the shared-write directory handle close
+        // here, before the final file is pinned read-only.
     }
+    let mut held = PathPin::open(&path, false, false)?;
+    if !has_exact_leaf(&held.leaf, CA) || !sink::held_private(&held.leaf, owner) {
+        return Err(PATH);
+    }
+    held.verify_content(pin, arx_guest::static_origin::MAX_CERT as u64)?;
+    Ok((std::path::PathBuf::from(path.as_str()), pin))
 }
 
 async fn exchange<T: arx_guest::protocol::Message, R: arx_guest::protocol::Message>(
@@ -1226,3 +1266,6 @@ async fn exchange<T: arx_guest::protocol::Message, R: arx_guest::protocol::Messa
         .map_err(|_| ENDPOINT)?
         .ok_or(ENDPOINT)
 }
+
+#[cfg(test)]
+mod tests;

@@ -365,7 +365,7 @@ async fn run_static(
                 .map(|_| ());
         }
     };
-    let (boot, pipe, origin, wire_boot) = match machine
+    let started = match machine
         .start(&workspace, pair, generation, recipe, worker.deadline())
         .await
     {
@@ -376,6 +376,8 @@ async fn run_static(
                 .map(|_| ());
         }
     };
+    let boot = started.boot;
+    let origin = started.origin;
     let route = machine.dossier.retirement();
     let current = || {
         !supervisor.cancel.is_cancelled()
@@ -385,7 +387,7 @@ async fn run_static(
     };
     // Keep the attributed transport open for the web guest as well. EOF
     // can end its service and the nginx process in that service's cgroup.
-    let mut pipe = Some(pipe);
+    let mut pipe = Some(started.pipe);
     let activated: anyhow::Result<_> = async {
         if recipe == StaticRecipe::Compose {
             let pipe = pipe.take().expect("the boot owns one serial pipe");
@@ -393,7 +395,7 @@ async fn run_static(
                 biased;
                 () = route.cancelled() => anyhow::bail!("static route retired"),
                 () = supervisor.cancel.cancelled() => anyhow::bail!("static boot cancelled"),
-                sessions = tokio::time::timeout_at(worker.deadline().into(), compose::PreparedStaticSessions::negotiate(pipe, &origin, wire_boot)) => sessions??,
+                sessions = tokio::time::timeout_at(worker.deadline().into(), compose::PreparedStaticSessions::negotiate(pipe, &origin, started.wire_boot)) => sessions??,
             };
             let channel = sessions.activate(controller, worker, &supervisor.compose, &supervisor.compose_backup, vm, current)?;
             Ok(Some(channel))
@@ -435,18 +437,28 @@ async fn run_static(
     origin.retired.retire();
     stops.close();
     let stop = stop.or_else(|| stops.try_recv().ok());
-    boot.stop(|disposition| {
-        if let Some(stop) = stop {
-            let completion = match disposition {
-                StopDisposition::CleanRelease => Completion::Succeeded,
-                StopDisposition::DirtyRelease => Completion::Failed,
-                StopDisposition::ChargedQuarantine => Completion::CleanupUnconfirmed,
-            };
-            controller.finish(&stop, completion)?;
-        } else {
-            controller.static_run_lost(vm)?;
-        }
-        Ok(())
-    })
-    .await
+    boot.stop(|disposition| settle_static_stop(controller, vm, stop.as_ref(), disposition))
+        .await
 }
+
+fn settle_static_stop(
+    controller: &Controller,
+    vm: Id,
+    stop: Option<&PendingOperation>,
+    disposition: StopDisposition,
+) -> anyhow::Result<()> {
+    if let Some(stop) = stop {
+        let completion = match disposition {
+            StopDisposition::CleanRelease => Completion::Succeeded,
+            StopDisposition::DirtyRelease => Completion::Failed,
+            StopDisposition::ChargedQuarantine => Completion::CleanupUnconfirmed,
+        };
+        controller.finish(stop, completion)?;
+    } else {
+        controller.static_run_lost(vm)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

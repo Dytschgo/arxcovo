@@ -3021,6 +3021,42 @@ mod compose_tests {
         );
     }
 
+    #[test]
+    fn static_origin_requires_all_docker_boot_conditions_before_admission() -> io::Result<()> {
+        let scratch = Scratch::new();
+        let units = scratch.0.join("units");
+        let run = scratch.0.join("run");
+        fs::create_dir(&units)?;
+        fs::create_dir(&run)?;
+        let units_handle = File::open(&units)?;
+        let run_handle = File::open(&run)?;
+        let blocked = units.join("docker.socket.d");
+        fs::write(&blocked, b"not a directory")?;
+
+        let admit = || {
+            static_origin::install_docker_boot_gate(
+                &units_handle,
+                run_handle.as_fd(),
+                effective_uid(),
+            )
+        };
+        assert!(admit().is_err());
+        assert!(!run.join("docker-admitted").exists());
+        assert_eq!(fs::read(&blocked)?, b"not a directory");
+
+        fs::remove_file(&blocked)?;
+        admit()?;
+        for unit in ["containerd.service", "docker.socket", "docker.service"] {
+            let config = units.join(format!("{unit}.d/90-arx-static-origin.conf"));
+            assert_eq!(
+                fs::read(config)?,
+                b"[Unit]\nConditionPathExists=/run/arx-static-origin/docker-admitted\n"
+            );
+        }
+        assert_eq!(fs::read(run.join("docker-admitted"))?, b"admitted\n");
+        Ok(())
+    }
+
     struct Scratch(PathBuf);
 
     impl Scratch {

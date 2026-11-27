@@ -135,7 +135,7 @@ impl IsoPoolManifest<'_> {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(any(test, all(windows, target_arch = "x86_64")))]
 pub(crate) fn rebind_seed(seed: &[u8], generation: Id) -> Result<Vec<u8>, RecipeError> {
     if generation == [0; 16] {
         return Err(RecipeError::Unqualified);
@@ -335,9 +335,9 @@ impl<'a> UbuntuWebRecipe<'a> {
             .replace("{verify}", verify)
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(any(test, all(windows, target_arch = "x86_64")))]
     pub(crate) fn detached_checks(&self) -> Vec<String> {
-        let mut checks = vec![super::UBUNTU_DETACHED_HEALTH.to_owned()];
+        let mut checks = vec![super::ubuntu::DETACHED_HEALTH.to_owned()];
         checks.extend(self.manifest.packages.chunks(8).map(|packages| {
             let verify = packages
                 .iter()
@@ -715,4 +715,87 @@ fn cidata_reader_follows_relocated_root_and_rejects_differing_extent_copies() {
     assert_eq!(cidata_files(&seed), Some(files));
     seed[root_record + 6] ^= 1;
     assert_eq!(cidata_files(&seed), None);
+}
+
+#[cfg(test)]
+mod static_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn static_seed_rebinds_metadata_and_preserves_other_installer_bytes() {
+        let files = [b"a", b"b", b"c", b"d", b"e", b"f", b"g"].map(<[u8; 1]>::as_slice);
+        let mut seed = Vec::new();
+        Image::new(files).unwrap().write(&mut seed).unwrap();
+        assert!(rebind_seed(&seed, [0; 16]).is_err());
+        assert!(rebind_seed(b"invalid media", [23; 16]).is_err());
+
+        let rebound = rebind_seed(&seed, [23; 16]).unwrap();
+        let metadata = super::super::ubuntu::nocloud_meta([23; 16]);
+        let mut expected = files;
+        expected[5] = metadata.as_bytes();
+        assert_eq!(cidata_files(&rebound), Some(expected));
+        assert_eq!(cidata_files(&seed), Some(files));
+    }
+
+    #[test]
+    fn static_web_health_keeps_every_package_check_within_the_guest_script_bound() {
+        let base = UbuntuRecipe::default();
+        let names = (0..MAX_PACKAGES)
+            .map(|n| format!("package-{n:02}-{}", "x".repeat(45)))
+            .collect::<Vec<_>>();
+        let version = format!("1.0+{}", "a".repeat(120));
+        let artifact = ArtifactPin {
+            size: 1,
+            sha256: [1; 32],
+        };
+        let packages = names
+            .iter()
+            .map(|name| PoolPackage {
+                name,
+                version: &version,
+                relative_path: "pool/package.deb",
+                artifact,
+            })
+            .collect::<Vec<_>>();
+        let manifest = IsoPoolManifest {
+            iso: AssetPin {
+                length: 1,
+                sha256: UbuntuRecipe::ISO_SHA256,
+            },
+            signed_metadata: artifact,
+            packages: &packages,
+        };
+        let recipe = UbuntuWebRecipe {
+            base: &base,
+            manifest: &manifest,
+            digest: [1; 32],
+        };
+        let checks = recipe.detached_checks();
+        assert_eq!(checks[0], super::super::ubuntu::DETACHED_HEALTH);
+        assert!(checks.len() > 2);
+        let scripts = &checks[1..];
+        assert!(scripts.iter().all(|script| {
+            script.len() <= arx_guest::MAX_SCRIPT
+                && script.contains("verify_package()")
+                && script.contains("sha256sum --check --strict")
+        }));
+        for name in &names {
+            let check = format!("verify_package \"\" '{name}' '{version}'");
+            assert_eq!(
+                scripts
+                    .iter()
+                    .filter(|script| script.contains(&check))
+                    .count(),
+                1,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            scripts
+                .iter()
+                .map(|script| script.matches("verify_package \"\" '").count())
+                .sum::<usize>(),
+            MAX_PACKAGES
+        );
+    }
 }

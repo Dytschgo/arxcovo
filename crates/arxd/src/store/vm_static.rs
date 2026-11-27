@@ -16,6 +16,10 @@ CREATE TRIGGER vm_static_custody_update BEFORE UPDATE ON vm_static_custody
     BEGIN SELECT RAISE(ABORT,'immutable static custody'); END;
 ";
 
+// Dropping the table also drops its attached triggers.
+#[cfg(test)]
+pub(super) const DROP_V18: &str = "DROP TABLE vm_static_custody;";
+
 use crate::vm::static_web::{StaticName, StaticProvenance, StaticState};
 #[cfg(any(test, all(windows, target_arch = "x86_64")))]
 use crate::vm::{CandidateSlot, CopyFailure};

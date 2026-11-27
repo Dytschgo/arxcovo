@@ -248,15 +248,7 @@ fn provision(
     )?;
     configure_network(dns)?;
     if dns.is_some() {
-        // The base image masks these services. Do not enable them across
-        // boots. Only this checked static provisioning path starts them.
-        let units = ["containerd.service", "docker.socket", "docker.service"];
-        let mut unmask = vec!["unmask"];
-        unmask.extend(units);
-        call("/usr/bin/systemctl", &unmask)?;
-        let mut start = vec!["start"];
-        start.extend(units);
-        call("/usr/bin/systemctl", &start)?;
+        start_docker(run.as_fd())?;
     }
     let config = config(&name, &body, dns.is_some());
     replace_at(dir, "nginx.conf", config.as_bytes(), 0o600, None)?;
@@ -276,6 +268,48 @@ fn provision(
         return Err(invalid());
     }
     Ok([der(CA)?, der(CERT)?])
+}
+
+const DOCKER_UNITS: [&str; 3] = ["containerd.service", "docker.socket", "docker.service"];
+
+pub(super) fn install_docker_boot_gate(
+    units: &File,
+    run: BorrowedFd<'_>,
+    owner: u32,
+) -> io::Result<()> {
+    const CONDITION: &[u8] =
+        b"[Unit]\nConditionPathExists=/run/arx-static-origin/docker-admitted\n";
+
+    // Install the persistent conditions before removing any install-time
+    // masks. The admission marker is on the already-verified /run tmpfs,
+    // so a reboot or interruption cannot carry this boot's permission.
+    for unit in DOCKER_UNITS {
+        let drop_in = private_subdir(units.as_fd(), &format!("{unit}.d"), owner, true)?;
+        replace_at(
+            drop_in.as_fd(),
+            "90-arx-static-origin.conf",
+            CONDITION,
+            0o644,
+            None,
+        )?;
+    }
+    units.sync_all()?;
+    replace_at(run, "docker-admitted", b"admitted\n", 0o600, None)?;
+    Ok(())
+}
+
+fn start_docker(run: BorrowedFd<'_>) -> io::Result<()> {
+    const SYSTEMCTL: &str = "/usr/bin/systemctl";
+
+    let units = File::from(walk_owned_dirs("/etc/systemd/system", ROOT_UID)?);
+    install_docker_boot_gate(&units, run, ROOT_UID)?;
+    let mut unmask = vec!["unmask", "--no-reload"];
+    unmask.extend(DOCKER_UNITS);
+    call(SYSTEMCTL, &unmask)?;
+    call(SYSTEMCTL, &["daemon-reload"])?;
+    let mut start = vec!["start"];
+    start.extend(DOCKER_UNITS);
+    call(SYSTEMCTL, &start)
 }
 
 fn configure_network(dns: Option<std::net::Ipv4Addr>) -> io::Result<()> {

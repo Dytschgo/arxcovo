@@ -3312,6 +3312,7 @@ mod tests {
             )?
             .unwrap();
             compose::settle_backup_failed(db, &intent, "interrupted", true, false, NOW)?;
+            db.execute_batch(static_vm::DROP_V18)?;
             db.execute_batch(
                 "DROP TRIGGER vm_native_writer_reservation; DROP TABLE vm_native_writer;
                  DROP TRIGGER vm_native_artifact_identity;

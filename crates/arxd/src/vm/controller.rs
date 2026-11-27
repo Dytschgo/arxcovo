@@ -482,7 +482,10 @@ impl<C: Clock> VmController<C> {
 
     /// Settle the start and register the serial witness in one transaction.
     /// The boot owner still holds the process, media and verified origin.
-    #[allow(dead_code, reason = "native static boot owner is pending")]
+    #[cfg_attr(
+        not(any(test, all(windows, target_arch = "x86_64"))),
+        allow(dead_code, reason = "native static boot is supported on Windows x64")
+    )]
     pub(super) fn finish_compose_start(
         &self,
         worker: &PendingOperation,
@@ -1899,6 +1902,88 @@ impl Target {
 #[cfg(test)]
 mod static_compose_tests {
     use super::*;
+
+    #[test]
+    fn static_runtime_reaper_retries_failed_settlement_without_losing_claim() -> Result<()> {
+        use super::super::runtime::{Quiesced, StopDisposition};
+        use store::static_vm;
+
+        struct TestClock;
+
+        impl Clock for TestClock {
+            fn now(&self) -> ClockReading {
+                ClockReading {
+                    utc_ms: 1_800_000_000_000,
+                    monotonic: Instant::now(),
+                }
+            }
+        }
+
+        struct Released(Id, Id);
+
+        impl ReaperRuntime for Released {
+            fn quiesce(&self, _: &reaper::CleanupWork, _: Instant) -> Quiesced {
+                panic!("static recovery must not quiesce disposal work")
+            }
+            fn graceful_stop(&self, _: &reaper::CleanupWork, _: Instant) -> StopDisposition {
+                panic!("static recovery must not stop by stale process identity")
+            }
+            fn force_reap(&self, _: &reaper::CleanupWork, _: Instant) -> StopDisposition {
+                panic!("static recovery must not force reap")
+            }
+            fn static_released(&self, vm: Id, generation: Id, deadline: Instant) -> bool {
+                assert_eq!((vm, generation), (self.0, self.1));
+                Instant::now() < deadline
+            }
+        }
+
+        let (dir, db, target, generation) = store::backup_owner_fixture()?;
+        drop(db);
+        let controller = VmController::open(dir.path(), VmPolicy::default(), TestClock)?;
+        let db = controller.compose_store();
+        let claims = || db.read_only(|db| static_vm::recovery_claims(db));
+        let before = claims()?;
+        assert_eq!(before.len(), 1);
+        assert_eq!(
+            (before[0].vm, before[0].generation),
+            (target.vm, generation)
+        );
+        db.transact(|db| {
+            db.execute_batch(
+                "CREATE TEMP TRIGGER fixture_reject_static_recovery
+                 BEFORE UPDATE OF state ON vm_static_instances WHEN OLD.state=3 AND NEW.state=1
+                 BEGIN SELECT RAISE(ABORT,'fixture settlement error'); END;",
+            )?;
+            Ok(())
+        })?;
+
+        let released = Released(target.vm, generation);
+        assert!(controller.sweep_with(&released, &ClosedCustody)?);
+        assert_eq!(claims()?, before);
+        db.transact(|db| {
+            assert_eq!(
+                static_vm::owned_state(db, "alice", target.vm)?,
+                Some(StaticState::Recovering)
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT cleanup_confirmed FROM activity WHERE id=?1",
+                    [before[0].activity_id],
+                    |row| row.get::<_, Option<bool>>(0)
+                )?,
+                Some(false)
+            );
+            db.execute_batch("DROP TRIGGER fixture_reject_static_recovery;")?;
+            Ok(())
+        })?;
+        assert!(controller.sweep_with(&released, &ClosedCustody)?);
+        assert!(claims()?.is_empty());
+        db.read_only(|db| {
+            let (slots, _) = static_vm::active_pair(db, "alice", target.vm)?.unwrap();
+            assert_eq!(slots.disk.generation, generation);
+            Ok(())
+        })
+    }
 
     #[test]
     fn static_compose_template_is_ineligible_for_test_clone() -> Result<()> {

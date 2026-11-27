@@ -187,7 +187,7 @@ impl CustodyCheckpoints for Recorder<'_> {
 /// objects to its default owner instead, so the fixture expects that owner
 /// and gives it the private root. The returned data keeps the SID at the
 /// same offset as `TOKEN_USER`, as `sid_ptr` expects.
-fn default_owner_sid() -> (Vec<usize>, String) {
+pub(in crate::vm::windows::qualification) fn default_owner_sid() -> (Vec<usize>, String) {
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY).unwrap();
     let data = token_data(&token, TokenOwner).unwrap();
