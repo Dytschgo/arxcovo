@@ -16,6 +16,18 @@ leaf custody checks reimplement what arxd's read_secret requires: current-user o
 protected DACL granting only the current user, a single hard link, a user-scope DPAPI
 header (security.rs user_scope_dpapi) and ciphertext <= 16384 bytes.
 
+The tunnel vectors pin the sealer's documented contract: a strict subset of what arxd's
+TunnelCredential::load accepts. Escaped key spellings and the JSON-array form, which
+serde_json would also take, are refused on purpose; everything accepted is also accepted
+by arxd. Parity with arxd is by source comparison; no Rust test loads these leaves.
+
+The hidden -TestFault switch forces a corrupted read-back after the leaf exists (once
+after marking it read-only) to witness that the sealer deletes exactly that new leaf
+through its own handle and leaves nothing on disk.
+
+The transcript case uses -UseMinimalHeader and asserts the file holds no user, domain,
+machine name or SID.
+
 Not exercised here: the interactive Read-Host prompt, the elevated-token refusal and the
 transcription-policy registry refusal (they need a console, an elevated token or policy
 changes). Live Cloudflare publishing stays unverified on real hardware.
@@ -64,6 +76,68 @@ function New-PrivateDirectory([string]$Path, [string]$ExtraAces = '', [string]$D
     $security.SetSecurityDescriptorSddlForm("O:${sid}D:$DaclFlags(A;$AceFlags;FA;;;$sid)$ExtraAces")
     $null = [System.IO.FileSystemAclExtensions]::Create([System.IO.DirectoryInfo]::new($Path), $security)
 }
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+public static class SealTestNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct SECURITY_ATTRIBUTES { public int nLength; public IntPtr lpSecurityDescriptor; public int bInheritHandle; }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateDirectoryW(string name, ref SECURITY_ATTRIBUTES security);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string text, uint revision, out IntPtr descriptor, IntPtr size);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    static extern uint GetNamedSecurityInfoW(string name, int type, uint info, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl, out IntPtr descriptor);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr descriptor, uint revision, uint info, out IntPtr text, out uint length);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr LocalFree(IntPtr memory);
+
+    /// Creates a directory with an exact SDDL, including entries .NET's ACL classes cannot express.
+    public static bool CreateWithSddl(string path, string sddl)
+    {
+        IntPtr descriptor;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out descriptor, IntPtr.Zero)) return false;
+        try
+        {
+            SECURITY_ATTRIBUTES attributes = new SECURITY_ATTRIBUTES();
+            attributes.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+            attributes.lpSecurityDescriptor = descriptor;
+            return CreateDirectoryW(path, ref attributes);
+        }
+        finally { LocalFree(descriptor); }
+    }
+
+    /// Counts DACL entries by kind on a path; never returns the SDDL itself.
+    public static int[] DaclKinds(string path)
+    {
+        IntPtr descriptor;
+        if (GetNamedSecurityInfoW(path, 1, 4, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out descriptor) != 0) return null;
+        try
+        {
+            IntPtr text; uint length;
+            if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 4, out text, out length)) return null;
+            try
+            {
+                RawSecurityDescriptor sd = new RawSecurityDescriptor(Marshal.PtrToStringUni(text));
+                int basic = 0, callback = 0, other = 0;
+                foreach (GenericAce ace in sd.DiscretionaryAcl)
+                {
+                    if (ace.AceType == AceType.AccessAllowed) basic++;
+                    else if (ace.AceType == AceType.AccessAllowedCallback) callback++;
+                    else other++;
+                }
+                return new int[] { basic, callback, other };
+            }
+            finally { LocalFree(text); }
+        }
+        finally { LocalFree(descriptor); }
+    }
+}
+'@
 
 function Invoke-Sealer {
     param(
@@ -311,7 +385,10 @@ try {
         @{ Name = 'tunnel secret bad 43rd char'; Value = (New-TunnelJson $account $badSecret42 $tunnel); Code = 'tunnel-secret-not-canonical' },
         @{ Name = 'tunnel secret 43 bytes'; Value = (New-TunnelJson $account $secret.Substring(0, 43) $tunnel); Code = 'tunnel-secret-not-canonical' },
         @{ Name = 'tunnel secret missing ='; Value = (New-TunnelJson $account ($secret.Substring(0, 43) + 'A') $tunnel); Code = 'tunnel-secret-not-canonical' },
-        @{ Name = 'tunnel secret url-safe alphabet'; Value = (New-TunnelJson $account ('-' + $secret.Substring(1)) $tunnel); Code = 'tunnel-secret-not-canonical' }
+        @{ Name = 'tunnel secret url-safe alphabet'; Value = (New-TunnelJson $account ('-' + $secret.Substring(1)) $tunnel); Code = 'tunnel-secret-not-canonical' },
+        # Strict subset: serde_json would accept these two; the sealer refuses them by design.
+        @{ Name = 'tunnel escaped key spelling (strict subset)'; Value = '{"Account' + [char]92 + 'u0054ag":"' + $account + '","TunnelSecret":"' + $secret + '","TunnelID":"' + $tunnel + '"}'; Code = 'tunnel-json-escape' },
+        @{ Name = 'tunnel JSON-array form (strict subset)'; Value = '["' + $account + '","' + $secret + '","' + $tunnel + '",""]'; Code = 'tunnel-json-not-object' }
     )
     foreach ($case in $tunnelCases) {
         Test-Refusal -Name $case.Name -Arguments $tArgs -Stdin (Get-Ascii $case.Value) -Code $case.Code -Directory $negDir -Secrets $secrets
@@ -339,7 +416,7 @@ try {
     $transcriptDir = Join-Path $root 'transcript'
     New-PrivateDirectory $transcriptDir
     $transcriptFile = Join-Path $transcriptDir 'session.txt'
-    $command = "Start-Transcript -LiteralPath '$transcriptFile' | Out-Null; " +
+    $command = "Start-Transcript -LiteralPath '$transcriptFile' -UseMinimalHeader | Out-Null; " +
         "& '$sealer' -Mode Dns -TargetDirectory '$transcriptDir' -FromStdin; `$code = `$LASTEXITCODE; " +
         "Stop-Transcript | Out-Null; exit `$code"
     $result = Invoke-Sealer -Command $command -Stdin (Get-Ascii $token)
@@ -347,6 +424,13 @@ try {
     Write-Case 'active transcript -> transcript-active' (
         $result.Exit -eq 2 -and $result.Err.Contains('refused: transcript-active') -and @(Get-Leaves $transcriptDir).Count -eq 0 `
             -and -not $transcriptText.Contains($token) -and (Test-Clean $result $secrets))
+    $identityLeak = $false
+    foreach ($identity in @($env:USERNAME, $env:USERDOMAIN, $env:COMPUTERNAME, $userSid.Value)) {
+        if (-not [string]::IsNullOrEmpty($identity) -and $transcriptText.IndexOf($identity, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $identityLeak = $true
+        }
+    }
+    Write-Case 'test transcript holds no user, domain, machine name or SID' ($transcriptText.Length -gt 0 -and -not $identityLeak)
 
     # ---- custody and path fence --------------------------------------------------------------
     $outsideTemp = 'D:\Temp\arx-cf-sealer\outside-' + [guid]::NewGuid().ToString('N')
@@ -400,6 +484,32 @@ try {
             -and $unprotectedRules[0].IdentityReference.Equals($userSid) -and -not $unprotectedRules[0].IsInherited)
     Test-Refusal -Name 'owner-only directory with inheritance enabled' -Arguments @('-Mode', 'Dns', '-TargetDirectory', $unprotected, '-FromStdin') `
         -Stdin (Get-Ascii $token) -Code 'target-directory-not-private' -Directory $unprotected -Secrets $secrets
+
+    $callbackDir = Join-Path $root 'callback-ace'
+    $sid = $userSid.Value
+    $callbackMade = [SealTestNative]::CreateWithSddl($callbackDir,
+        "O:${sid}D:P(A;OICI;FA;;;$sid)(XA;OICI;FA;;;$sid;(Exists WIN://SYSAPPID))")
+    $aceKinds = if ($callbackMade) { [SealTestNative]::DaclKinds($callbackDir) } else { $null }
+    Write-Case 'callback fixture has one basic and one callback owner-only allow entry' (
+        $callbackMade -and $null -ne $aceKinds -and $aceKinds[0] -eq 1 -and $aceKinds[1] -eq 1 -and $aceKinds[2] -eq 0)
+    Test-Refusal -Name 'owner-only callback allow entry' -Arguments @('-Mode', 'Dns', '-TargetDirectory', $callbackDir, '-FromStdin') `
+        -Stdin (Get-Ascii $token) -Code 'target-directory-not-private' -Directory $callbackDir -Secrets $secrets
+
+    # ---- same-handle cleanup after creation ------------------------------------------------
+    $faultDir = Join-Path $root 'fault'
+    New-PrivateDirectory $faultDir
+    Test-Refusal -Name 'dns corrupted read-back after create' `
+        -Arguments @('-Mode', 'Dns', '-TargetDirectory', $faultDir, '-FromStdin', '-TestFault', 'CorruptReadback') `
+        -Stdin (Get-Ascii $token) -Code 'readback-mismatch' -Directory $faultDir -Secrets $secrets
+    Write-Case 'corrupted dns leaf deleted through its handle (directory empty)' (
+        @(Get-ChildItem -LiteralPath $faultDir -Force).Count -eq 0)
+    Test-Refusal -Name 'read-only tunnel leaf with corrupted read-back' `
+        -Arguments (@('-Mode', 'Tunnel', '-TargetDirectory', $faultDir, '-FromStdin', '-TestFault', 'ReadOnlyCorruptReadback') + $tunnelArgs) `
+        -Stdin (Get-Ascii $json) -Code 'readback-mismatch' -Directory $faultDir -Secrets $secrets
+    Write-Case 'read-only tunnel leaf deleted through its handle (directory empty)' (
+        @(Get-ChildItem -LiteralPath $faultDir -Force).Count -eq 0)
+    Test-Seal -Name 'dns after cleaned faults' -Directory $faultDir -Kind 'dns' -Payload (Get-Ascii $token) -Secrets $secrets `
+        -Arguments @('-Mode', 'Dns', '-TargetDirectory', $faultDir, '-FromStdin')
 
     $junctionTarget = Join-Path $root 'junction-target'
     New-PrivateDirectory $junctionTarget
