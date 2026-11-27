@@ -31,7 +31,7 @@ struct EnrollmentClass {
     class: Class,
 }
 
-fn require_enrollment(bytes: &[u8]) -> Result<(), NativeRefusal> {
+pub(super) fn require_enrollment(bytes: &[u8]) -> Result<(), NativeRefusal> {
     match serde_json::from_slice::<EnrollmentClass>(bytes) {
         Ok(EnrollmentClass {
             class: Class::Docker,

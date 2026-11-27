@@ -36,9 +36,12 @@ fn set_owner(path: &Path) {
 }
 
 fn measured(path: &Path) -> ExpectedVmStore {
-    let file = pin_directory(path).unwrap();
-    let id = full_directory_identity(&file).unwrap();
-    let name = held_volume_path(&file).unwrap();
+    fixture_directory_pin(&pin_directory(path).unwrap())
+}
+
+pub(crate) fn fixture_directory_pin(file: &std::fs::File) -> ExpectedVmStore {
+    let id = full_directory_identity(file).unwrap();
+    let name = held_volume_path(file).unwrap();
     let name = name.to_str().unwrap();
     ExpectedVmStore {
         volume_guid: name[..name.find(r"}\").unwrap() + 2]
@@ -355,6 +358,138 @@ fn aliases_ancestry_and_reparse_paths_are_refused() {
         alternate["test_vms"]["compose_secret_root"] = json!(path);
         assert!(roots.load(&alternate).is_err());
     }
+}
+
+#[test]
+fn static_compose_custody_verifies_four_disjoint_pins_before_opening_state() {
+    use crate::vm::runtime::NativeRefusal;
+
+    let roots = Roots::new();
+    let parent = roots.state.parent().unwrap();
+    let dossier = parent.join("dossier");
+    let backup = parent.join("backup");
+    for path in [&dossier, &backup] {
+        fs::create_dir(path).unwrap();
+        set_owner(path);
+    }
+    for path in [&roots.state, &roots.secrets, &dossier, &backup] {
+        icacls(path, &["/inheritance:d"]);
+    }
+    let seal = b"synthetic seal for custody only";
+    fs::write(dossier.join("qualification.json"), seal).unwrap();
+    let enrollment = parent.join("docker.json");
+    fs::write(&enrollment, br#"{"class":"docker"}"#).unwrap();
+    set_owner(&enrollment);
+    let backup_json = json!({
+        "root": backup,
+        "expected_root": measured(&backup),
+        "targets": [{
+            "vm_id": "aa".repeat(16), "project_id":"app", "volume":"data",
+            "database":"store.sqlite3", "max_bytes":8192
+        }]
+    });
+    let mut raw = roots.profile();
+    raw["test_vms"]["enabled"] = json!(true);
+    raw["test_vms"]["static_compose"] = json!({
+        "selection": {
+            "dossier": dossier,
+            "expected_dossier_root": measured(&dossier),
+            "enrollment": enrollment,
+            "seal_sha256": hex::encode(Sha256::digest(seal)),
+            "scope": "aa".repeat(32)
+        }
+    });
+    // Exercise the root holder on CI even if its temp volume is C:.
+    // The separate profile validation test checks the D: restriction.
+    let flat = |profile: &Value| {
+        let mut vm: TestVms = serde_json::from_value(profile["test_vms"].clone()).unwrap();
+        let mut static_profile = vm.static_compose.take().unwrap();
+        static_profile.backup = Some(serde_json::from_value(profile["backup"].clone()).unwrap());
+        let state = RootPin::acquire_enrolled(&roots.state, vm.expected_store.as_ref().unwrap())?;
+        let secret = ComposeRoot {
+            configured: roots.secrets.clone(),
+            pin: RootPin::acquire_enrolled(
+                &roots.secrets,
+                &vm.expected_compose_secret_root.as_ref().unwrap().0,
+            )?,
+        };
+        StaticComposeCustody::acquire(&static_profile, &roots.state, &state, Some(&secret))
+    };
+    raw["backup"] = backup_json;
+    let held = flat(&raw).unwrap();
+    held.verify().unwrap();
+    assert!(open_for_delete(&backup).is_err());
+    assert!(open_for_delete(&dossier).is_err());
+    drop(held);
+
+    for (pointer, value) in [
+        (
+            "/test_vms/expected_store/directory_file_id",
+            json!("00".repeat(16)),
+        ),
+        (
+            "/test_vms/expected_compose_secret_root/volume_serial",
+            json!("00".repeat(8)),
+        ),
+        (
+            "/test_vms/static_compose/selection/expected_dossier_root/directory_file_id",
+            json!("00".repeat(16)),
+        ),
+        (
+            "/test_vms/static_compose/selection/seal_sha256",
+            json!("11".repeat(32)),
+        ),
+        (
+            "/backup/expected_root/volume_guid",
+            json!(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\"),
+        ),
+    ] {
+        let mut wrong = raw.clone();
+        *wrong.pointer_mut(pointer).unwrap() = value;
+        assert!(flat(&wrong).is_err(), "{pointer}");
+    }
+    // Identical and nested physical roots must both fail with correct pins.
+    let nested = roots.secrets.join("nested");
+    fs::create_dir(&nested).unwrap();
+    set_owner(&nested);
+    icacls(&nested, &["/inheritance:d"]);
+    for overlap in [&roots.state, &roots.secrets, &dossier, &nested] {
+        let mut wrong = raw.clone();
+        wrong["backup"]["root"] = json!(overlap);
+        wrong["backup"]["expected_root"] = json!(measured(overlap));
+        assert!(flat(&wrong).is_err());
+    }
+    let junction = parent.join("dossier-link");
+    assert!(
+        Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&dossier)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut wrong = raw.clone();
+    wrong["test_vms"]["static_compose"]["selection"]["dossier"] = json!(junction);
+    assert!(flat(&wrong).is_err());
+    fs::remove_dir(&junction).unwrap();
+
+    icacls(&backup, &["/inheritance:e"]);
+    assert!(
+        flat(&raw).is_err(),
+        "private ACL must be protected from inheritance"
+    );
+
+    raw.as_object_mut().unwrap().remove("backup");
+    let vm = roots.load(&raw).unwrap();
+    assert_eq!(
+        vm.custody.select_static_dossier().err(),
+        Some(NativeRefusal::NetworkFenceUnverified),
+    );
+    vm.custody.verify().unwrap();
+    assert!(!roots.state.join("activity.sqlite3").exists());
 }
 
 const CANARY: &[u8] = b"synthetic compose custody fixture";
